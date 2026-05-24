@@ -1,0 +1,12 @@
+torch
+torchvision
+numpy
+pandas
+pydicom
+pylibjpeg
+pylibjpeg-libjpeg
+pylibjpeg-openjpeg
+opencv-python
+matplotlib
+pillow
+tqdm
