@@ -353,3 +353,58 @@ def _as_boxes(boxes: torch.Tensor | None) -> torch.Tensor:
     if boxes is None or boxes.numel() == 0:
         return torch.zeros((0, 4), dtype=torch.float32)
     return boxes.detach().cpu().to(dtype=torch.float32).reshape(-1, 4)
+
+
+def sample_box_centered_square_window(
+    *,
+    image_width: int,
+    image_height: int,
+    box_xyxy: torch.Tensor | list[float] | tuple[float, float, float, float],
+    all_mass_boxes: torch.Tensor,
+    options: dict[str, Any],
+    rng: np.random.Generator,
+) -> tuple[tuple[int, int, int, int], dict[str, Any]]:
+    """Sample an n x n crop centered near one specific annotation box.
+
+    This is mainly used by the export pipeline when you want, for example,
+    five random positive crops per mass annotation. The sampled crop is shifted
+    around the mass center by ``center_shift_fraction * crop_size`` and is
+    accepted only if it satisfies the same partial-annotation rules as the rest
+    of the crop code.
+    """
+    opts = make_crop_options(options)
+    n = int(opts["crop_size"])
+    max_tries = int(opts.get("max_random_tries", 80))
+    shift = float(opts.get("center_shift_fraction", 0.25)) * float(n)
+    box = torch.as_tensor(box_xyxy, dtype=torch.float32).reshape(4)
+    boxes = _as_boxes(all_mass_boxes)
+
+    cx0 = float((box[0] + box[2]) / 2.0)
+    cy0 = float((box[1] + box[3]) / 2.0)
+    last_window = _random_positive_window(
+        image_width=image_width,
+        image_height=image_height,
+        crop_size=n,
+        mass_boxes=box.reshape(1, 4),
+        center_on_mass=True,
+        center_shift_fraction=float(opts.get("center_shift_fraction", 0.25)),
+        rng=rng,
+    )
+    for _ in range(max_tries):
+        cx = cx0 + float(rng.uniform(-shift, shift))
+        cy = cy0 + float(rng.uniform(-shift, shift))
+        x0 = int(round(cx - n / 2.0))
+        y0 = int(round(cy - n / 2.0))
+        x0 = min(max(0, x0), max(0, int(image_width) - n))
+        y0 = min(max(0, y0), max(0, int(image_height) - n))
+        window = (x0, y0, x0 + n, y0 + n)
+        last_window = window
+        if window_has_positive_mass(window, boxes, opts):
+            return window, {"requested_positive": True, "accepted": True, "centered_on_annotation": True}
+
+    return last_window, {
+        "requested_positive": True,
+        "accepted": False,
+        "centered_on_annotation": True,
+        "fallback_after_tries": max_tries,
+    }

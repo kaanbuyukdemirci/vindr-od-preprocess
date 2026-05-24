@@ -879,3 +879,147 @@ It reports this for two cases:
 
 1. `single_mass_box`, each mass box independently.
 2. `all_mass_boxes_in_same_image`, one square crop that must contain all mass boxes from the same image.
+
+## Exporting Ultralytics, MMDetection, and baseline datasets
+
+The newest version adds a YAML-driven export pipeline. Edit:
+
+```text
+config/export_config.yaml
+```
+
+Then run:
+
+```text
+main.py
+```
+
+from the VSCode Run button.
+
+By default, the exporter reads VinDr-Mammo from:
+
+```yaml
+paths:
+  data_root: "G:/vindr"
+```
+
+and saves all processed datasets under:
+
+```yaml
+paths:
+  output_root: "G:/preprocessed-vindr"
+```
+
+The exporter creates:
+
+```text
+G:/preprocessed-vindr/
+  square_crops/          # n x n object-detection crops
+  baseline_uncropped/    # preprocessing only, no final n x n crop
+```
+
+For `square_crops`, the policy is:
+
+- train: random crops
+- val: deterministic sliding crops
+- test: deterministic sliding crops
+
+The default crop settings are:
+
+```yaml
+square_crops:
+  crop_size: 1024
+  stride: 512
+  random_crops_per_annotation: 5
+  positive_fraction: 0.80
+```
+
+Each dataset variant contains both annotation formats:
+
+```text
+ultralytics/vindr_mass.yaml
+mmdetection/annotations/instances_train.json
+mmdetection/annotations/instances_val.json
+mmdetection/annotations/instances_test.json
+```
+
+Images are saved once and shared by both formats to avoid wasting disk space. For a simple explanation of every YAML field and the saved folder structure, read:
+
+```text
+docs/EXPORT_FORMATS_AND_YAML.md
+```
+
+## Export update: metadata, histogram equalization, RGB images, and 16-bit preserved PNGs
+
+The export pipeline now saves model-ready RGB PNGs for Ultralytics/MMDetection, plus optional preserved 16-bit grayscale PNGs for inspection and data integrity.
+
+Recommended default:
+
+```yaml
+image:
+  normalize: "none"
+
+image_export:
+  rgb_scheme: "intensity_equalized_gradient"
+  intensity_equalized_gradient:
+    intensity_window: [1.0, 99.0]
+    gradient_source: "normal"
+    gradient_window: [1.0, 99.0]
+    gradient_ksize: 3
+
+histogram_equalization:
+  enabled: true
+  apply_to: "third_channel"
+
+preserved_16bit:
+  save: true
+  percentile_range: [0.1, 99.9]
+```
+
+The default RGB export uses three complementary channels: normal intensity, histogram-equalized intensity, and Sobel gradient magnitude. This gives the detector contrast and edge information while the separate `preserved_16bit/` output remains the true high-bit-depth preservation path.
+
+The exported folder contains:
+
+```text
+G:/preprocessed-vindr/
+  square_crops/
+    images/train, val, test                 # 8-bit RGB PNGs for YOLO/MMDetection
+    preserved_16bit/train, val, test        # optional 16-bit grayscale PNGs
+    labels/train, val, test                 # Ultralytics labels
+    ultralytics/vindr_mass.yaml
+    mmdetection/annotations/*.json          # COCO-style annotations
+    metadata/samples_metadata.jsonl         # full per-sample metadata
+    metadata/samples_metadata_flat.csv      # quick metadata table
+
+  baseline_uncropped/
+    images/train, val, test
+    preserved_16bit/train, val, test
+    labels/train, val, test
+    ultralytics/vindr_mass.yaml
+    mmdetection/annotations/*.json
+    metadata/samples_metadata.jsonl
+    metadata/samples_metadata_flat.csv
+
+  metadata/source_csv/                      # full copied source CSVs
+    breast-level_annotations.csv
+    finding_annotations.csv
+    metadata.csv
+```
+
+For training, use the RGB PNGs in `images/<split>`. The 16-bit files are preserved copies for debugging and analysis, not the default training input.
+
+
+## Important note about `positive_fraction`
+
+`positive_fraction: 0.80` is meant for the **training square-crop export**, not for the whole VinDr-Mammo dataset, not for the uncropped baseline, and not for validation/test deterministic sliding crops.
+
+With `balance_train_positive_fraction_globally: true`, the exporter tries to keep about 80% of training square crops mass-positive by creating positive random crops around mass annotations and adding only the needed number of clean crops. It does not automatically add one negative crop from every image without a mass, because that can make the final positive percentage much lower than 80%.
+
+Check the actual achieved percentage after export here:
+
+```text
+G:/preprocessed-vindr/square_crops/stats/summary.csv
+```
+
+The column to check is `positive_image_percent` for the `train` split.
+

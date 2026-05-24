@@ -10,3 +10,4 @@ opencv-python
 matplotlib
 pillow
 tqdm
+pyyaml

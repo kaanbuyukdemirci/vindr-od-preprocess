@@ -1,3 +1,4 @@
+from .export import export_from_config, load_export_config
 from .dataset import (
     SIZE_LARGE,
     SIZE_MEDIUM,
@@ -16,4 +17,6 @@ __all__ = [
     "SIZE_SMALL",
     "SIZE_MEDIUM",
     "SIZE_LARGE",
+    "export_from_config",
+    "load_export_config",
 ]

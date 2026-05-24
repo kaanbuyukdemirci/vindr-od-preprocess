@@ -343,3 +343,35 @@ Long operations use `tqdm` when `show_progress=True`. The main slow operations a
 - `dataset.show_mass_animation(save_gif=True, ...)`
 
 Set `show_progress=False` to disable progress bars. The project also caches processed-statistics dataframes inside the dataset object, so repeated calls reuse the first DICOM pass when possible.
+
+## Export API
+
+The export pipeline is in `src/vindr_mammo/export.py`.
+
+```python
+from vindr_mammo import load_export_config, export_from_config
+
+cfg = load_export_config("config/export_config.yaml")
+result = export_from_config(cfg)
+print(result.output_root)
+```
+
+Usually you do not need to call this manually. `main.py` does exactly this so you can run it from the VSCode Run button.
+
+The exporter creates two dataset variants:
+
+1. `square_crops`: final `n x n` crops for object detection. Train uses random crops. Val and test use deterministic sliding crops.
+2. `baseline_uncropped`: preprocessing only, no final `n x n` crop.
+
+Each variant contains:
+
+- `images/train`, `images/val`, `images/test`
+- `labels/train`, `labels/val`, `labels/test` for Ultralytics YOLO
+- `ultralytics/vindr_mass.yaml`
+- `mmdetection/annotations/instances_train.json`
+- `mmdetection/annotations/instances_val.json`
+- `mmdetection/annotations/instances_test.json`
+- `stats/samples.csv`
+- `stats/summary.csv`
+
+Important YAML fields are explained in `docs/EXPORT_FORMATS_AND_YAML.md`.

@@ -1,0 +1,138 @@
+# VinDr-Mammo export configuration
+# Edit this file, then run main.py from the VSCode Run button.
+
+paths:
+  # Folder containing metadata.csv, breast-level_annotations.csv,
+  # finding_annotations.csv, and images/<study_id>/<image_id>.dicom
+  data_root: "G:/vindr"
+
+  # All exported images, labels, COCO JSON files, stats, and metadata are saved here.
+  output_root: "G:/preprocessed-vindr"
+
+runtime:
+  show_progress: true
+
+image:
+  # "none" keeps the post-modality-LUT DICOM numeric values until export-time
+  # windowing. This is better when you also save preserved 16-bit PNGs.
+  # You can use "minmax" or "percentile" for quicker visual/debug exports.
+  normalize: "none"
+  percentile_range: [0.5, 99.5]
+  use_voi_lut: false
+
+preprocess:
+  # These are applied before both baseline and square-crop exports.
+  invert_to_black_background: true
+  crop_breast: true
+  mirror_right_to_left: true
+  crop_padding: 20
+  crop_threshold: null
+
+image_export:
+  # Training images saved under images/<split> are always RGB PNGs.
+  # Recommended current experiment: "intensity_equalized_gradient".
+  # Other options: "multi_window", "grayscale_rgb", "equalized_rgb", "bitpack16".
+  # bitpack16 is available for experiments but is not recommended for YOLO/MMDetection.
+  rgb_scheme: "intensity_equalized_gradient"
+
+  # For multi_window, each RGB channel is made from a different percentile window
+  # computed over foreground/breast pixels after preprocessing and square cropping.
+  # R: wide/global contrast, G: narrower tissue contrast, B: narrow lesion/local contrast.
+  multi_window_percentiles:
+    - [0.5, 99.5]
+    - [1.0, 99.0]
+    - [2.0, 98.0]
+
+  # Used by grayscale_rgb, equalized_rgb, and as a fallback for
+  # intensity_equalized_gradient.
+  single_window: [1.0, 99.0]
+
+  # Used when rgb_scheme = "intensity_equalized_gradient".
+  # R = normal intensity window, G = histogram-equalized version of R,
+  # B = Sobel gradient magnitude. This is a useful CNN representation,
+  # while preserved_16bit remains the true depth-preserving image.
+  intensity_equalized_gradient:
+    intensity_window: [1.0, 99.0]
+    gradient_source: "normal"     # "normal" or "equalized"
+    gradient_window: [1.0, 99.0]
+    gradient_ksize: 3
+
+histogram_equalization:
+  # Simple histogram equalization on the 8-bit training RGB image channels.
+  # For rgb_scheme="intensity_equalized_gradient", the second channel is always
+  # equalized by the scheme, so this global post-equalization is skipped.
+  enabled: true
+  # Options: "all_channels", "third_channel", "none".
+  apply_to: "third_channel"
+
+preserved_16bit:
+  # Saves a separate 16-bit grayscale PNG for each exported sample under
+  # preserved_16bit/<split>. Use this for data integrity/debugging, not YOLO input.
+  save: true
+  percentile_range: [0.1, 99.9]
+  use_foreground_mask: true
+
+metadata:
+  # Copies the full source CSVs and saves per-exported-sample metadata JSONL/CSV.
+  save_full_source_csvs: true
+  include_dicom_meta: true
+
+splits:
+  # VinDr-Mammo already has official training/test. This keeps official test as test,
+  # then splits official training studies into train and val.
+  val_fraction_from_training: 0.15
+  seed: 123
+
+export:
+  # true deletes G:/preprocessed-vindr before exporting. Keep false unless you are sure.
+  clean_output_root: false
+  save_square_crops: true
+  save_baseline_uncropped: true
+  save_empty_label_files: true
+
+square_crops:
+  # Final n x n object-detection crops. This is applied after the preprocessing above.
+  crop_size: 1024
+  stride: 512
+
+  # Training split uses random crops. Validation and test use deterministic sliding crops.
+  # random_crops_per_annotation=5 means each mass annotation creates five positive
+  # training crop attempts centered near that mass, with random shifts.
+  random_crops_per_annotation: 5
+
+  # If true, positive_fraction is interpreted as the approximate GLOBAL ratio
+  # of mass-positive training crops, not as a per-image rule. With this enabled,
+  # images with no mass do not automatically add one negative crop each, because
+  # that would drag the final positive percentage far below 80%.
+  balance_train_positive_fraction_globally: true
+  random_crops_per_negative_image_when_balancing: 0
+
+  # Used only when balance_train_positive_fraction_globally=false, or when an
+  # image has no mass and you explicitly want negative-only training crops.
+  random_crops_per_negative_image: 1
+
+  # Approximate requested positive crop percentage for the training square-crop
+  # export. The exact achieved value is written to square_crops/stats/summary.csv.
+  positive_fraction: 0.80
+  center_shift_fraction: 0.25
+  max_random_tries: 80
+  seed: 123
+
+  # Validation/test deterministic crop options.
+  deterministic_include_empty: true
+  deterministic_max_windows_per_image: null
+
+  # If a breast-cropped image is smaller than 1024 in either direction, pad it.
+  pad_if_needed: true
+  pad_value: 0.0
+
+crop_annotation_policy:
+  # false means a mass annotation is kept only when the complete box is inside the crop.
+  # true means cut boxes are clipped and kept when the visible fraction is high enough.
+  allow_partial_annotations: false
+  min_box_visibility: 0.30
+  reject_partial_windows: true
+  negative_max_box_visibility: 0.0
+
+dataset:
+  validate_paths: false
