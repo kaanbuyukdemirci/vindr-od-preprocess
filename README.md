@@ -1023,3 +1023,75 @@ G:/preprocessed-vindr/square_crops/stats/summary.csv
 
 The column to check is `positive_image_percent` for the `train` split.
 
+
+## How to confirm a long export finished
+
+After a successful export, check these final marker files:
+
+```text
+G:/preprocessed-vindr/EXPORT_DONE.txt
+G:/preprocessed-vindr/manifest.json
+```
+
+`EXPORT_DONE.txt` is a short human-readable report. `manifest.json` contains the same completion status plus per-stage timings, output counts, expected-file checks, and a copy of the configuration used for the run. These files are written only at the end of the export.
+
+## Fast visualizations from an existing export
+
+If the export already finished, do **not** rerun `main.py` just to make plots. Run:
+
+```bash
+python visualize_export.py
+```
+
+or open `visualize_export.py` in VSCode and press the Run button.
+
+This reads only the already exported files under `paths.output_root`, mainly:
+
+```text
+square_crops/stats/summary.csv
+square_crops/stats/samples.csv
+baseline_uncropped/stats/summary.csv
+baseline_uncropped/stats/samples.csv
+manifest.json, if present
+```
+
+It does **not** read DICOMs and does **not** regenerate crops, so it should be much faster than the full export.
+
+The plots are saved to:
+
+```text
+G:/preprocessed-vindr/visualizations/
+```
+
+The most useful output is:
+
+```text
+G:/preprocessed-vindr/visualizations/index.html
+```
+
+Open that file in a browser to see the generated plots. The folder also contains PNG files and combined CSV copies.
+
+Useful plots include:
+
+- number of exported images by split,
+- mass-positive image percentage by split,
+- number of mass boxes by split,
+- mass area percentage histograms,
+- image-size scatter plots,
+- crop-mode distribution,
+- view/laterality distribution,
+- RGB scheme and histogram-equalization summaries,
+- export stage duration plot when `manifest.json` exists.
+
+The visualization settings are controlled from `config/export_config.yaml`:
+
+```yaml
+visualizations:
+  output_dir: "G:/preprocessed-vindr/visualizations"
+  include_square_crops: true
+  include_baseline_uncropped: true
+  write_html_report: true
+  max_rows_per_samples_csv: null
+```
+
+Keep `max_rows_per_samples_csv: null` for exact plots. Set it to a number such as `5000` only if you want a very quick approximate preview.

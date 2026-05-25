@@ -333,3 +333,82 @@ G:/preprocessed-vindr/square_crops/stats/summary.csv
 
 The column to check is `positive_image_percent` for the `train` split.
 
+
+## Completion markers and timing manifest
+
+At the end of a successful export, the project writes two final files directly under the output root:
+
+```text
+G:/preprocessed-vindr/EXPORT_DONE.txt
+G:/preprocessed-vindr/manifest.json
+```
+
+These files are written only after the square-crop export, baseline export, labels, COCO JSON files, metadata, and summary files have been created. If the run crashes or is interrupted before the end, these files should be missing or stale.
+
+`EXPORT_DONE.txt` is a quick human-readable completion marker. It contains the start time, finish time, total duration, and per-stage durations.
+
+`manifest.json` is the machine-readable version. It contains:
+
+- `status`, usually `completed`
+- `started_at` and `finished_at`
+- `total_duration_seconds` and `total_duration_minutes`
+- `stage_timings`, with one timing entry for each major export stage
+- `file_counts`, including image, label, and preserved-16-bit PNG counts per dataset and split
+- `expected_files`, with existence and file size checks for important outputs
+- `summary`, the same high-level export summary returned by the Python function
+- `config_snapshot`, the resolved configuration used for the run
+
+A quick PowerShell check is:
+
+```powershell
+Get-Content "G:\preprocessed-vindr\EXPORT_DONE.txt"
+Get-Content "G:\preprocessed-vindr\manifest.json" -TotalCount 80
+```
+
+The resolved YAML configuration is saved in both of these locations:
+
+```text
+G:/preprocessed-vindr/metadata/export_config_resolved.yaml
+G:/preprocessed-vindr/metadata/source_csv/export_config_resolved.yaml
+```
+
+The duplicate under `source_csv` is intentional. It makes it easy to keep the copied source CSVs and the exact export configuration in the same folder.
+
+## Visualizing an already exported dataset
+
+After the export is complete, use `visualize_export.py` to make plots without reading DICOM files again:
+
+```bash
+python visualize_export.py
+```
+
+This script uses the CSV/JSON files already saved under `paths.output_root`. It is meant to be fast because it reads files like:
+
+```text
+square_crops/stats/summary.csv
+square_crops/stats/samples.csv
+baseline_uncropped/stats/summary.csv
+baseline_uncropped/stats/samples.csv
+manifest.json
+```
+
+It saves figures and an HTML report to:
+
+```text
+G:/preprocessed-vindr/visualizations/
+```
+
+Configure it in YAML:
+
+```yaml
+visualizations:
+  output_dir: "G:/preprocessed-vindr/visualizations"
+  include_square_crops: true
+  include_baseline_uncropped: true
+  write_html_report: true
+  max_rows_per_samples_csv: null
+```
+
+`max_rows_per_samples_csv: null` means use all rows. This is recommended for final plots. If the CSVs are very large and you only want a quick preview, use a number such as `5000`.
+
+The script creates plots for image counts, positive-image percentage, mass-box counts, mass-area distributions, image sizes, crop modes, view/laterality, RGB scheme, histogram equalization, and export stage timings when `manifest.json` exists.

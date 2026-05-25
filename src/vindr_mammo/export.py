@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import math
 import shutil
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -72,7 +74,44 @@ def export_from_config(config: dict[str, Any]) -> ExportResult:
     * Training images: configurable 8-bit RGB PNGs in ``images/<split>``.
     * Optional preserved images: 16-bit grayscale PNGs in ``preserved_16bit/<split>``.
     * Full metadata: original CSV copies plus JSONL/CSV metadata per exported sample.
+
+    At the very end, the exporter writes ``manifest.json`` and ``EXPORT_DONE.txt``.
+    If those files exist, the export reached the final completion step.
     """
+    run_started_at = _utc_now_iso()
+    total_start = time.perf_counter()
+    stage_timings: list[dict[str, Any]] = []
+
+    def timed_stage(name: str, func):
+        stage_started_at = _utc_now_iso()
+        stage_start = time.perf_counter()
+        try:
+            result = func()
+        except Exception as exc:
+            elapsed = time.perf_counter() - stage_start
+            stage_timings.append(
+                {
+                    "name": name,
+                    "started_at": stage_started_at,
+                    "finished_at": _utc_now_iso(),
+                    "duration_seconds": float(elapsed),
+                    "status": "failed",
+                    "error": repr(exc),
+                }
+            )
+            raise
+        elapsed = time.perf_counter() - stage_start
+        stage_timings.append(
+            {
+                "name": name,
+                "started_at": stage_started_at,
+                "finished_at": _utc_now_iso(),
+                "duration_seconds": float(elapsed),
+                "status": "ok",
+            }
+        )
+        return result
+
     paths = config.get("paths", {})
     data_root = Path(paths.get("data_root", r"G:/vindr"))
     output_root = Path(paths.get("output_root", r"G:/preprocessed-vindr"))
@@ -83,31 +122,41 @@ def export_from_config(config: dict[str, Any]) -> ExportResult:
     output_root.mkdir(parents=True, exist_ok=True)
 
     image_cfg = config.get("image", {})
-    dataset = VindrMammoDataset(
-        data_root=data_root,
-        index_level="image",
-        split=None,
-        read_image=True,
-        output_size=None,
-        normalize=image_cfg.get("normalize", "none"),
-        percentile_range=tuple(image_cfg.get("percentile_range", [0.5, 99.5])),
-        use_voi_lut=bool(image_cfg.get("use_voi_lut", False)),
-        return_dicom_meta=bool(config.get("metadata", {}).get("include_dicom_meta", True)),
-        validate_paths=bool(config.get("dataset", {}).get("validate_paths", False)),
-        preprocess_options=config.get("preprocess", {}),
-        crop_options={"enabled": False},
-        show_progress=bool(config.get("runtime", {}).get("show_progress", True)),
-    )
 
-    split_records, split_table = make_train_val_test_split(
-        dataset.image_records,
-        val_fraction=float(config.get("splits", {}).get("val_fraction_from_training", 0.15)),
-        seed=int(config.get("splits", {}).get("seed", 123)),
-    )
-    split_table.to_csv(output_root / "split_assignments.csv", index=False)
+    def build_dataset() -> VindrMammoDataset:
+        return VindrMammoDataset(
+            data_root=data_root,
+            index_level="image",
+            split=None,
+            read_image=True,
+            output_size=None,
+            normalize=image_cfg.get("normalize", "none"),
+            percentile_range=tuple(image_cfg.get("percentile_range", [0.5, 99.5])),
+            use_voi_lut=bool(image_cfg.get("use_voi_lut", False)),
+            return_dicom_meta=bool(config.get("metadata", {}).get("include_dicom_meta", True)),
+            validate_paths=bool(config.get("dataset", {}).get("validate_paths", False)),
+            preprocess_options=config.get("preprocess", {}),
+            crop_options={"enabled": False},
+            show_progress=bool(config.get("runtime", {}).get("show_progress", True)),
+        )
 
-    created_files: list[Path] = [output_root / "split_assignments.csv"]
-    created_files.extend(_write_global_metadata_files(output_root, dataset, config))
+    dataset = timed_stage("initialize_dataset", build_dataset)
+
+    def make_splits():
+        split_records_, split_table_ = make_train_val_test_split(
+            dataset.image_records,
+            val_fraction=float(config.get("splits", {}).get("val_fraction_from_training", 0.15)),
+            seed=int(config.get("splits", {}).get("seed", 123)),
+        )
+        split_path = output_root / "split_assignments.csv"
+        split_table_.to_csv(split_path, index=False)
+        return split_records_, split_table_, split_path
+
+    split_records, split_table, split_path = timed_stage("make_train_val_test_split", make_splits)
+
+    created_files: list[Path] = [split_path]
+    created_files.extend(timed_stage("write_source_metadata_and_config", lambda: _write_global_metadata_files(output_root, dataset, config)))
+
     summary: dict[str, Any] = {
         "num_source_images": len(dataset.image_records),
         "splits": {k: len(v) for k, v in split_records.items()},
@@ -116,18 +165,41 @@ def export_from_config(config: dict[str, Any]) -> ExportResult:
     }
 
     if bool(export_cfg.get("save_square_crops", True)):
-        crop_summary, crop_files = export_square_crop_datasets(dataset, split_records, config, output_root)
+        crop_summary, crop_files = timed_stage(
+            "export_square_crops",
+            lambda: export_square_crop_datasets(dataset, split_records, config, output_root),
+        )
         summary["square_crops"] = crop_summary
         created_files.extend(crop_files)
 
     if bool(export_cfg.get("save_baseline_uncropped", True)):
-        baseline_summary, baseline_files = export_baseline_dataset(dataset, split_records, config, output_root)
+        baseline_summary, baseline_files = timed_stage(
+            "export_baseline_uncropped",
+            lambda: export_baseline_dataset(dataset, split_records, config, output_root),
+        )
         summary["baseline_uncropped"] = baseline_summary
         created_files.extend(baseline_files)
 
-    with open(output_root / "export_summary.json", "w", encoding="utf-8") as f:
+    summary_path = output_root / "export_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(_json_safe(summary), f, indent=2)
-    created_files.append(output_root / "export_summary.json")
+    created_files.append(summary_path)
+
+    manifest, manifest_files = timed_stage(
+        "write_completion_manifest",
+        lambda: _write_completion_files(
+            output_root=output_root,
+            data_root=data_root,
+            config=config,
+            summary=summary,
+            created_files=created_files,
+            stage_timings=stage_timings,
+            started_at=run_started_at,
+            total_duration_seconds=float(time.perf_counter() - total_start),
+        ),
+    )
+    created_files.extend(manifest_files)
+    summary["manifest"] = manifest
     return ExportResult(output_root=output_root, created_files=created_files, summary=summary)
 
 
@@ -796,14 +868,22 @@ def _write_global_metadata_files(output_root: Path, dataset: VindrMammoDataset, 
         path = meta_root / name
         df.to_csv(path, index=False)
         created.append(path)
-    config_path = output_root / "metadata" / "export_config_resolved.yaml"
-    config_path.parent.mkdir(parents=True, exist_ok=True)
+    # Save the resolved config in both places. Earlier project versions saved it
+    # under ``metadata/export_config_resolved.yaml``; keeping a duplicate under
+    # ``metadata/source_csv/`` makes the completion checks less surprising.
+    config_paths = [
+        output_root / "metadata" / "export_config_resolved.yaml",
+        output_root / "metadata" / "source_csv" / "export_config_resolved.yaml",
+    ]
+    config_text = None
     if yaml is not None:
-        with open(config_path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(_json_safe(config), f, sort_keys=False)
+        config_text = yaml.safe_dump(_json_safe(config), sort_keys=False)
     else:
-        config_path.write_text(json.dumps(_json_safe(config), indent=2), encoding="utf-8")
-    created.append(config_path)
+        config_text = json.dumps(_json_safe(config), indent=2)
+    for config_path in config_paths:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(config_text, encoding="utf-8")
+        created.append(config_path)
     return created
 
 
@@ -1044,6 +1124,134 @@ def _flatten_metadata_row(row: dict[str, Any]) -> dict[str, Any]:
 # Summaries and small helpers
 # -----------------------------------------------------------------------------
 
+
+
+def _write_completion_files(
+    *,
+    output_root: Path,
+    data_root: Path,
+    config: dict[str, Any],
+    summary: dict[str, Any],
+    created_files: list[Path],
+    stage_timings: list[dict[str, Any]],
+    started_at: str,
+    total_duration_seconds: float,
+) -> tuple[dict[str, Any], list[Path]]:
+    """Write final completion markers after all export work succeeds.
+
+    ``manifest.json`` is structured and machine-readable. ``EXPORT_DONE.txt`` is
+    intentionally simple so you can quickly check completion from File Explorer,
+    PowerShell, or a text editor. These files are written only at the end of a
+    successful export run.
+    """
+    finished_at = _utc_now_iso()
+    file_counts = _collect_export_file_counts(output_root)
+    expected_files = _expected_completion_files(output_root, config)
+    expected_status = [
+        {"path": _path_as_posix(path), "exists": path.exists(), "size_bytes": path.stat().st_size if path.exists() else 0}
+        for path in expected_files
+    ]
+
+    manifest = {
+        "status": "completed",
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "total_duration_seconds": float(total_duration_seconds),
+        "total_duration_minutes": float(total_duration_seconds) / 60.0,
+        "data_root": _path_as_posix(data_root),
+        "output_root": _path_as_posix(output_root),
+        "summary": summary,
+        "stage_timings": stage_timings,
+        "file_counts": file_counts,
+        "expected_files": expected_status,
+        "created_files_count": len(created_files),
+        "created_files_tail": [_path_as_posix(p) for p in created_files[-50:]],
+        "config_snapshot": config,
+    }
+
+    manifest_path = output_root / "manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(_json_safe(manifest), f, indent=2, ensure_ascii=False)
+
+    done_path = output_root / "EXPORT_DONE.txt"
+    lines = [
+        "VinDr-Mammo export completed successfully.",
+        f"Started at: {started_at}",
+        f"Finished at: {finished_at}",
+        f"Total duration seconds: {total_duration_seconds:.3f}",
+        f"Total duration minutes: {total_duration_seconds / 60.0:.3f}",
+        f"Output root: {_path_as_posix(output_root)}",
+        "",
+        "Stage timings:",
+    ]
+    for t in stage_timings:
+        lines.append(f"  - {t.get('name')}: {float(t.get('duration_seconds', 0.0)):.3f} s [{t.get('status')}]")
+    lines.extend(["", "Key output counts:"])
+    for key, value in file_counts.items():
+        lines.append(f"  - {key}: {value}")
+    lines.append("")
+    lines.append("See manifest.json for full details.")
+    done_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    return manifest, [manifest_path, done_path]
+
+
+def _expected_completion_files(output_root: Path, config: dict[str, Any]) -> list[Path]:
+    """Return files that should exist after the configured export finishes."""
+    expected: list[Path] = [
+        output_root / "export_summary.json",
+        output_root / "split_assignments.csv",
+        output_root / "metadata" / "export_config_resolved.yaml",
+        output_root / "metadata" / "source_csv" / "export_config_resolved.yaml",
+    ]
+    export_cfg = config.get("export", {})
+    if bool(export_cfg.get("save_square_crops", True)):
+        expected.extend(
+            [
+                output_root / "square_crops" / "stats" / "summary.csv",
+                output_root / "square_crops" / "stats" / "samples.csv",
+                output_root / "square_crops" / "ultralytics" / "vindr_mass.yaml",
+                output_root / "square_crops" / "mmdetection" / "annotations" / "instances_train.json",
+                output_root / "square_crops" / "mmdetection" / "annotations" / "instances_val.json",
+                output_root / "square_crops" / "mmdetection" / "annotations" / "instances_test.json",
+            ]
+        )
+    if bool(export_cfg.get("save_baseline_uncropped", True)):
+        expected.extend(
+            [
+                output_root / "baseline_uncropped" / "stats" / "summary.csv",
+                output_root / "baseline_uncropped" / "stats" / "samples.csv",
+                output_root / "baseline_uncropped" / "ultralytics" / "vindr_mass.yaml",
+                output_root / "baseline_uncropped" / "mmdetection" / "annotations" / "instances_train.json",
+                output_root / "baseline_uncropped" / "mmdetection" / "annotations" / "instances_val.json",
+                output_root / "baseline_uncropped" / "mmdetection" / "annotations" / "instances_test.json",
+            ]
+        )
+    return expected
+
+
+def _collect_export_file_counts(output_root: Path) -> dict[str, int]:
+    """Collect lightweight output counts for quick sanity checks."""
+    counts: dict[str, int] = {}
+    for dataset_name in ["square_crops", "baseline_uncropped"]:
+        for split_name in ["train", "val", "test"]:
+            img_dir = output_root / dataset_name / "images" / split_name
+            label_dir = output_root / dataset_name / "labels" / split_name
+            preserved_dir = output_root / dataset_name / "preserved_16bit" / split_name
+            counts[f"{dataset_name}.{split_name}.images_png"] = _count_files(img_dir, "*.png")
+            counts[f"{dataset_name}.{split_name}.labels_txt"] = _count_files(label_dir, "*.txt")
+            counts[f"{dataset_name}.{split_name}.preserved_16bit_png"] = _count_files(preserved_dir, "*.png")
+    return counts
+
+
+def _count_files(path: Path, pattern: str) -> int:
+    if not path.exists():
+        return 0
+    return sum(1 for _ in path.glob(pattern))
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 def _summary_from_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     df = pd.DataFrame(rows)

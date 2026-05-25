@@ -136,3 +136,15 @@ crop_annotation_policy:
 
 dataset:
   validate_paths: false
+
+
+visualizations:
+  # Fast plots from the already exported CSV/JSON files. This does not read DICOMs
+  # and does not regenerate crops. Run visualize_export.py from the VSCode Run button.
+  output_dir: "G:/preprocessed-vindr/visualizations"
+  include_square_crops: true
+  include_baseline_uncropped: true
+  write_html_report: true
+
+  # Optional debug limit for huge samples.csv files. Keep null for exact plots.
+  max_rows_per_samples_csv: null

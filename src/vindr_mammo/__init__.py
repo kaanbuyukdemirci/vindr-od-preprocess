@@ -1,4 +1,5 @@
 from .export import export_from_config, load_export_config
+from .visualize import create_visualizations_from_export, visualize_export_from_config
 from .dataset import (
     SIZE_LARGE,
     SIZE_MEDIUM,
@@ -19,4 +20,6 @@ __all__ = [
     "SIZE_LARGE",
     "export_from_config",
     "load_export_config",
+    "create_visualizations_from_export",
+    "visualize_export_from_config",
 ]
