@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vindr-mammo-reader"
+version = "0.17.0"
+description = "VinDr-Mammo PyTorch dataset, preprocessing, export, and visualization tools for mass detection."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  {name = "Kaan Buyukdemirci"}
+]
+license = {text = "MIT"}
+keywords = ["mammography", "VinDr-Mammo", "object detection", "Ultralytics", "MMDetection", "PyTorch"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+dependencies = [
+  "torch",
+  "torchvision",
+  "numpy",
+  "pandas",
+  "pydicom",
+  "pylibjpeg",
+  "pylibjpeg-libjpeg",
+  "pylibjpeg-openjpeg",
+  "opencv-python",
+  "matplotlib",
+  "pillow",
+  "tqdm",
+  "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["build", "pytest", "ruff"]
+
+[project.scripts]
+vindr-mammo-export = "vindr_mammo.cli:export_main"
+vindr-mammo-visualize = "vindr_mammo.cli:visualize_main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100

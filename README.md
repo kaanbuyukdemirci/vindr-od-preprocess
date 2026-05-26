@@ -40,7 +40,20 @@ vindr-mammo/1.0.0/
 
 ## Installation
 
-Create and activate your environment, then install the requirements:
+This project is now installable as a normal Python package. For development, use editable mode from the project root:
+
+```bash
+pip install -e .
+```
+
+This reads `pyproject.toml`, installs the package from `src/vindr_mammo`, and creates two console commands:
+
+```bash
+vindr-mammo-export --config config/export_config.yaml
+vindr-mammo-visualize --config config/export_config.yaml
+```
+
+You can still install from the requirements file if you only want the dependencies:
 
 ```bash
 pip install -r requirements.txt
@@ -65,6 +78,26 @@ Option B: edit `.vscode/launch.json`:
 ```
 
 Then press the Run button on `main.py`.
+
+## Library and command-line usage
+
+After installing with `pip install -e .`, you can import the package from any Python script:
+
+```python
+from vindr_mammo import VindrMammoDataset, export_from_config, load_export_config
+
+cfg = load_export_config("config/export_config.yaml")
+result = export_from_config(cfg)
+```
+
+You can also run the two console commands created by `pyproject.toml`:
+
+```bash
+vindr-mammo-export --config config/export_config.yaml
+vindr-mammo-visualize --config config/export_config.yaml
+```
+
+`main.py` and `visualize_export.py` are kept as simple VSCode-friendly wrappers around those same command-line entry points.
 
 ## Basic usage
 
@@ -937,11 +970,31 @@ square_crops:
 Each dataset variant contains both annotation formats:
 
 ```text
-ultralytics/vindr_mass.yaml
+vindr_mass.yaml                         # recommended portable Ultralytics YAML
+ultralytics/vindr_mass.yaml             # compatibility copy, also portable
 mmdetection/annotations/instances_train.json
 mmdetection/annotations/instances_val.json
 mmdetection/annotations/instances_test.json
 ```
+
+The Ultralytics YAML files are now written without an absolute `path:` field. This avoids machine-specific paths such as `G:/...` or `/mnt/t9/...`. The recommended file is directly inside the dataset root, for example:
+
+```text
+G:/preprocessed-vindr/square_crops/vindr_mass.yaml
+/mnt/t9/preprocessed-vindr/square_crops/vindr_mass.yaml
+```
+
+Its content is:
+
+```yaml
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: mass
+```
+
+The compatibility copy in `ultralytics/vindr_mass.yaml` uses `../images/train`, `../images/val`, and `../images/test` because it lives one folder below the dataset root. Do not use `path: .` in that file.
 
 Images are saved once and shared by both formats to avoid wasting disk space. For a simple explanation of every YAML field and the saved folder structure, read:
 
@@ -986,7 +1039,8 @@ G:/preprocessed-vindr/
     images/train, val, test                 # 8-bit RGB PNGs for YOLO/MMDetection
     preserved_16bit/train, val, test        # optional 16-bit grayscale PNGs
     labels/train, val, test                 # Ultralytics labels
-    ultralytics/vindr_mass.yaml
+    vindr_mass.yaml                         # recommended portable YOLO YAML
+    ultralytics/vindr_mass.yaml             # compatibility portable YOLO YAML
     mmdetection/annotations/*.json          # COCO-style annotations
     metadata/samples_metadata.jsonl         # full per-sample metadata
     metadata/samples_metadata_flat.csv      # quick metadata table
@@ -995,6 +1049,7 @@ G:/preprocessed-vindr/
     images/train, val, test
     preserved_16bit/train, val, test
     labels/train, val, test
+    vindr_mass.yaml
     ultralytics/vindr_mass.yaml
     mmdetection/annotations/*.json
     metadata/samples_metadata.jsonl

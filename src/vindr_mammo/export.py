@@ -820,10 +820,23 @@ def _write_shared_export_files(
             json.dump(_json_safe(coco), f)
         created.append(ann_path)
 
-    yolo_yaml = root / "ultralytics" / "vindr_mass.yaml"
-    yolo_yaml.parent.mkdir(parents=True, exist_ok=True)
-    _write_ultralytics_yaml(yolo_yaml, root)
-    created.append(yolo_yaml)
+    # Write portable Ultralytics YAML files.
+    #
+    # 1) root/vindr_mass.yaml is the recommended file to pass to YOLO. It uses
+    #    paths relative to the dataset root and contains no Windows/Linux absolute
+    #    path.
+    # 2) root/ultralytics/vindr_mass.yaml is kept for backward compatibility, but
+    #    it must use ../images/... because it lives one folder below the dataset
+    #    root. Do not write ``path: .`` here: Ultralytics may resolve it against
+    #    the current working directory, which breaks portability.
+    root_yolo_yaml = root / "vindr_mass.yaml"
+    _write_ultralytics_yaml(root_yolo_yaml, train="images/train", val="images/val", test="images/test")
+    created.append(root_yolo_yaml)
+
+    legacy_yolo_yaml = root / "ultralytics" / "vindr_mass.yaml"
+    legacy_yolo_yaml.parent.mkdir(parents=True, exist_ok=True)
+    _write_ultralytics_yaml(legacy_yolo_yaml, train="../images/train", val="../images/val", test="../images/test")
+    created.append(legacy_yolo_yaml)
 
     mmdet_readme = root / "mmdetection" / "README_mmdetection_paths.txt"
     _write_mmdetection_note(mmdet_readme, root)
@@ -887,19 +900,34 @@ def _write_global_metadata_files(output_root: Path, dataset: VindrMammoDataset, 
     return created
 
 
-def _write_ultralytics_yaml(path: Path, root: Path) -> None:
+def _write_ultralytics_yaml(path: Path, *, train: str, val: str, test: str) -> None:
+    """Write a portable Ultralytics detection YAML.
+
+    The YAML intentionally does not include a ``path`` field. In recent
+    Ultralytics versions, a relative ``path: .`` can be resolved against the
+    process working directory instead of the YAML location. Omitting ``path``
+    and writing train/val/test relative to the YAML file's parent directory
+    avoids embedding OS-specific roots such as ``G:/`` or ``/mnt/t9``.
+    """
     content = {
-        "path": _path_as_posix(root),
-        "train": "images/train",
-        "val": "images/val",
-        "test": "images/test",
+        "train": train,
+        "val": val,
+        "test": test,
         "names": {0: "mass"},
     }
+    header = (
+        "# VinDr-Mammo mass detection dataset for Ultralytics YOLO.\n"
+        "# Portable YAML: no absolute Windows/Linux path and no `path: .`.\n"
+        "# The train/val/test paths are relative to this YAML file.\n"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
     if yaml is None:
         with open(path, "w", encoding="utf-8") as f:
-            f.write(f"path: {_path_as_posix(root)}\ntrain: images/train\nval: images/val\ntest: images/test\nnames:\n  0: mass\n")
+            f.write(header)
+            f.write(f"train: {train}\nval: {val}\ntest: {test}\nnames:\n  0: mass\n")
     else:
         with open(path, "w", encoding="utf-8") as f:
+            f.write(header)
             yaml.safe_dump(content, f, sort_keys=False)
 
 
@@ -1210,6 +1238,7 @@ def _expected_completion_files(output_root: Path, config: dict[str, Any]) -> lis
             [
                 output_root / "square_crops" / "stats" / "summary.csv",
                 output_root / "square_crops" / "stats" / "samples.csv",
+                output_root / "square_crops" / "vindr_mass.yaml",
                 output_root / "square_crops" / "ultralytics" / "vindr_mass.yaml",
                 output_root / "square_crops" / "mmdetection" / "annotations" / "instances_train.json",
                 output_root / "square_crops" / "mmdetection" / "annotations" / "instances_val.json",
@@ -1221,6 +1250,7 @@ def _expected_completion_files(output_root: Path, config: dict[str, Any]) -> lis
             [
                 output_root / "baseline_uncropped" / "stats" / "summary.csv",
                 output_root / "baseline_uncropped" / "stats" / "samples.csv",
+                output_root / "baseline_uncropped" / "vindr_mass.yaml",
                 output_root / "baseline_uncropped" / "ultralytics" / "vindr_mass.yaml",
                 output_root / "baseline_uncropped" / "mmdetection" / "annotations" / "instances_train.json",
                 output_root / "baseline_uncropped" / "mmdetection" / "annotations" / "instances_val.json",

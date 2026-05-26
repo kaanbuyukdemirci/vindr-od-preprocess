@@ -32,8 +32,9 @@ G:/preprocessed-vindr/
       train/
       val/
       test/
+    vindr_mass.yaml                  # recommended portable Ultralytics YAML
     ultralytics/
-      vindr_mass.yaml
+      vindr_mass.yaml                # compatibility copy, also portable
     mmdetection/
       annotations/
         instances_train.json
@@ -53,8 +54,9 @@ G:/preprocessed-vindr/
       train/
       val/
       test/
+    vindr_mass.yaml                  # recommended portable Ultralytics YAML
     ultralytics/
-      vindr_mass.yaml
+      vindr_mass.yaml                # compatibility copy, also portable
     mmdetection/
       annotations/
         instances_train.json
@@ -135,20 +137,51 @@ All coordinates are normalized to `[0, 1]`. The only class is:
 0: mass
 ```
 
-Train using the generated YAML, for example:
+Train using the generated root-level YAML, for example:
 
 ```python
 from ultralytics import YOLO
 
 model = YOLO("yolo11n.pt")
-model.train(data="G:/preprocessed-vindr/square_crops/ultralytics/vindr_mass.yaml", imgsz=1024)
+model.train(data="G:/preprocessed-vindr/square_crops/vindr_mass.yaml", imgsz=1024)
 ```
 
 For the baseline dataset, use:
 
 ```python
-model.train(data="G:/preprocessed-vindr/baseline_uncropped/ultralytics/vindr_mass.yaml", imgsz=1024)
+model.train(data="G:/preprocessed-vindr/baseline_uncropped/vindr_mass.yaml", imgsz=1024)
 ```
+
+On Linux, the same YAML works after moving the dataset because it contains only relative paths. Example:
+
+```bash
+yolo detect train \
+  model=yolo11n.pt \
+  data=/mnt/t9/preprocessed-vindr/square_crops/vindr_mass.yaml \
+  imgsz=1024
+```
+
+The root-level `vindr_mass.yaml` is written as:
+
+```yaml
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: mass
+```
+
+The compatibility copy under `ultralytics/vindr_mass.yaml` is written as:
+
+```yaml
+train: ../images/train
+val: ../images/val
+test: ../images/test
+names:
+  0: mass
+```
+
+Both files intentionally omit `path:`. Do not change them to `path: .`, because some Ultralytics versions may resolve that relative to the current working directory instead of the YAML directory.
 
 ## MMDetection output
 
