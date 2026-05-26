@@ -157,11 +157,17 @@ def export_from_config(config: dict[str, Any]) -> ExportResult:
     created_files: list[Path] = [split_path]
     created_files.extend(timed_stage("write_source_metadata_and_config", lambda: _write_global_metadata_files(output_root, dataset, config)))
 
+    crop_cfg_for_summary = config.get("square_crops", {})
     summary: dict[str, Any] = {
         "num_source_images": len(dataset.image_records),
         "splits": {k: len(v) for k, v in split_records.items()},
         "rgb_scheme": config.get("image_export", {}).get("rgb_scheme", "multi_window"),
         "histogram_equalization_enabled": bool(config.get("histogram_equalization", {}).get("enabled", True)),
+        "square_crop_modes": {
+            "train": crop_cfg_for_summary.get("train_crop_mode", "random"),
+            "val": crop_cfg_for_summary.get("val_crop_mode", "deterministic"),
+            "test": crop_cfg_for_summary.get("test_crop_mode", "deterministic"),
+        },
     }
 
     if bool(export_cfg.get("save_square_crops", True)):
@@ -259,7 +265,18 @@ def export_square_crop_datasets(
     config: dict[str, Any],
     output_root: Path,
 ) -> tuple[dict[str, Any], list[Path]]:
-    """Export n x n crop datasets with random train and deterministic val/test."""
+    """Export n x n crop datasets.
+
+    The crop mode for each split is controlled by ``square_crops`` config keys:
+
+    * ``train_crop_mode``: ``"random"`` or ``"deterministic"``.
+    * ``val_crop_mode``: usually ``"deterministic"``.
+    * ``test_crop_mode``: usually ``"deterministic"``.
+
+    Earlier versions always used random, mass-centered training crops and
+    deterministic validation/test crops. That can create a strong distribution
+    mismatch, so deterministic training crops are now supported directly.
+    """
     crop_root = output_root / "square_crops"
     crop_root.mkdir(parents=True, exist_ok=True)
     crop_cfg = dict(config.get("square_crops", {}))
@@ -380,7 +397,13 @@ def _windows_for_export_split(
     rng: np.random.Generator,
 ) -> list[tuple[tuple[int, int, int, int], dict[str, Any]]]:
     """Return crop windows for one image according to train/val/test policy."""
-    if split_name in {"val", "test"}:
+    split_mode = str(crop_cfg.get(f"{split_name}_crop_mode", "random" if split_name == "train" else "deterministic")).casefold().strip()
+    if split_mode not in {"random", "deterministic"}:
+        raise ValueError(
+            f"square_crops.{split_name}_crop_mode must be 'random' or 'deterministic', got {split_mode!r}."
+        )
+
+    if split_mode == "deterministic":
         windows = sliding_square_windows(
             width=image_width,
             height=image_height,
@@ -389,12 +412,12 @@ def _windows_for_export_split(
         )
         if not bool(crop_cfg.get("deterministic_include_empty", True)):
             windows = [w for w in windows if window_has_positive_mass(w, mass_boxes, crop_options)]
-        max_windows = crop_cfg.get("deterministic_max_windows_per_image")
+        max_windows = crop_cfg.get(f"{split_name}_deterministic_max_windows_per_image", crop_cfg.get("deterministic_max_windows_per_image"))
         if max_windows is not None:
             windows = windows[: int(max_windows)]
-        return [(w, {"crop_mode": "deterministic"}) for w in windows]
+        return [(w, {"crop_mode": "deterministic", "split_crop_mode": split_mode}) for w in windows]
 
-    # Training uses random crops. Positive crops are centered around annotations.
+    # Random mode. Positive crops are centered around annotations.
     boxes = mass_boxes.detach().cpu().to(torch.float32).reshape(-1, 4)
     windows: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
     crops_per_ann = int(crop_cfg.get("random_crops_per_annotation", 5))

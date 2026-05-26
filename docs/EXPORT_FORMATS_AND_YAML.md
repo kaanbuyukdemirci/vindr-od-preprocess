@@ -445,3 +445,43 @@ visualizations:
 `max_rows_per_samples_csv: null` means use all rows. This is recommended for final plots. If the CSVs are very large and you only want a quick preview, use a number such as `5000`.
 
 The script creates plots for image counts, positive-image percentage, mass-box counts, mass-area distributions, image sizes, crop modes, view/laterality, RGB scheme, histogram equalization, and export stage timings when `manifest.json` exists.
+
+## Deterministic training crop export
+
+The exporter now supports per-split crop modes under `square_crops`:
+
+```yaml
+square_crops:
+  crop_size: 1024
+  stride: 512
+  train_crop_mode: "deterministic"
+  val_crop_mode: "deterministic"
+  test_crop_mode: "deterministic"
+```
+
+Use this when you want the training distribution to match validation and test. Earlier exports used random, mass-centered crops for training and deterministic sliding windows for validation/test. That can make the model overfit to centered positive crops and fail on sliding-window validation.
+
+Supported values are:
+
+- `deterministic`: use sliding square windows with the configured `stride`.
+- `random`: use random/mass-centered crops. For train only, this also enables options like `random_crops_per_annotation`, `positive_fraction`, and `balance_train_positive_fraction_globally`.
+
+When `train_crop_mode: "deterministic"`, the random-crop balancing options remain in the YAML for convenience, but they are ignored.
+
+The recommended portable Ultralytics YAML is written at:
+
+```text
+<output_root>/square_crops/vindr_mass.yaml
+```
+
+It contains no absolute path and no `path: .` field:
+
+```yaml
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: mass
+```
+
+Pass this file directly to Ultralytics. The older compatibility YAML under `square_crops/ultralytics/vindr_mass.yaml` uses `../images/...` paths because it lives one folder below the dataset root.
