@@ -73,7 +73,7 @@ The crop controls include:
 - stride, default from `square_crops.stride`, usually `512`,
 - whether to show all crops or only crops with visible mass,
 - a slider defining positive crop visibility threshold,
-- whether to display partially clipped boxes,
+- whether to display partially clipped boxes, enabled by default for debugging,
 - minimum box visibility for keeping/drawing partial boxes.
 
 The positive-crop slider is independent of the final export settings. It is meant for visual exploration.
@@ -186,7 +186,7 @@ Examples:
 - select only `B` to inspect the edge or gradient channel,
 - select all channels to see the composite RGB crop.
 
-The optional **Show individual processed channels** checkbox displays R, G, and B as separate grayscale images under the main three-panel view.
+By default, all channels are visible and **Show individual processed channels** is enabled, so R, G, and B appear as separate grayscale images under the main three-panel view. This is only a GUI display choice and does not change exported data.
 
 ## Deterministic, stochastic, and foreground-ratio crop preview
 
@@ -213,9 +213,11 @@ square_crops:
 
 ## Compare-mode statistical similarity
 
-The old pixel-intensity histogram plot was removed because it was not very useful for deciding whether different images or vendors can be trained in one network. Compare mode now reports numeric similarity between selected slots. It compares summary features such as mean, standard deviation, percentiles, IQR, and entropy for the grayscale crop and processed R/G/B channels. It also reports Jensen-Shannon distance and an approximate 1-D Wasserstein distance on compact normalized intensity summaries.
+The old pixel-intensity histogram plot was removed because it was not very useful for deciding whether different images or vendors can be trained in one network. Compare mode now reports numeric similarity between selected slots. The main pairwise table now focuses on the final processed R/G/B outputs, because those are what the model receives after percentile normalization, histogram equalization, contralateral-channel substitution, and standardization.
 
-Lower values mean the selected images are more similar statistically. These metrics are not a clinical quality score and do not compare pixels spatially. They are meant as a practical data-consistency check across vendors and preprocessing choices.
+The raw `crop_*` statistics are still shown in a separate expander, but they describe the grayscale source crop before the R/G/B preprocessing pipeline. They can remain different even when the final R/G/B means and standard deviations are matched.
+
+Lower final-output distance values mean the selected examples are more similar statistically as model inputs. These metrics are not a clinical quality score and do not compare pixels spatially. They are meant as a practical data-consistency check across vendors and preprocessing choices.
 
 ## v27 additions
 
@@ -284,3 +286,8 @@ image_export:
 The pairing key is `study_id + view_position + opposite laterality`. If the opposite image is missing, the code falls back to the current crop and records the fallback in metadata so the GUI/export does not crash.
 
 The old `aggressive_upper_percentile_normalize` operation is no longer used in the default pipeline because it is equivalent to a normal `percentile_normalize` step with `percentiles: [70.0, 100.0]`. It is still supported as a legacy alias so older GUI-exported YAML files keep working.
+
+## v32 additions
+
+- Default GUI display now starts with all R/G/B channels visible, individual channel panels enabled, and partial box display enabled.
+- Compare-mode statistics now separates raw source-crop statistics from final processed R/G/B statistics. The main pairwise similarity metrics and combined distance focus on the final R/G/B model input, while raw crop distances are retained only as diagnostic columns.

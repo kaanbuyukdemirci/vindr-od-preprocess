@@ -489,7 +489,7 @@ def _display_controls() -> dict[str, Any]:
     )
     show_channel_panels = st.sidebar.checkbox(
         "Show individual processed channels",
-        value=False,
+        value=True,
         help="Show R, G, and B as separate grayscale panels below the main images.",
     )
     return {
@@ -539,7 +539,7 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         step=0.05,
         help="A crop is considered positive if at least one mass box has this fraction visible inside the crop.",
     )
-    allow_partial = st.sidebar.checkbox("Display partial boxes after clipping", value=bool(policy.get("allow_partial_annotations", False)))
+    allow_partial = st.sidebar.checkbox("Display partial boxes after clipping", value=bool(policy.get("allow_partial_annotations", True)))
     min_box_visibility = st.sidebar.slider("Minimum box visibility to draw/keep", 0.0, 1.0, float(policy.get("min_box_visibility", 0.30)), 0.05)
 
     random_preview_count = 20
@@ -955,16 +955,21 @@ def _render_comparison_mode(
 
 
 def _show_comparison_statistics(results: list[dict[str, Any]], pipeline: dict[str, Any]) -> None:
-    """Compare selected comparison slots using image/crop summary statistics.
+    """Compare selected comparison slots using final-output image statistics.
 
     The selected images are not spatially registered and may be different patients,
     views, and vendors. Therefore this section compares summary covariates and
-    1-D intensity summaries rather than pixel-wise similarity.
+    compact 1-D intensity summaries rather than pixel-wise similarity. The main
+    distance score now focuses on the final processed RGB output, because that is
+    what the model will see after the channel pipeline and standardization. Raw
+    grayscale crop statistics are still shown for diagnosis, but they are not used
+    in the main final-output distance.
     """
     st.markdown("### Statistics comparison across selected slots")
     st.caption(
-        "This compares selected crops/images by summary features and compact intensity-distribution distances. "
-        "It does not compare pixels spatially. Lower distances mean the selected samples look more similar statistically."
+        "This compares the final processed RGB outputs by summary statistics and compact "
+        "intensity-distribution distances. It does not compare pixels spatially. "
+        "Raw crop statistics are shown separately because they describe the source crop before the RGB preprocessing pipeline."
     )
 
     feature_rows = []
@@ -981,40 +986,53 @@ def _show_comparison_statistics(results: list[dict[str, Any]], pipeline: dict[st
         histograms[slot_name] = hists
 
     features_df = pd.DataFrame(feature_rows)
-    display_cols = [
-        "slot", "vendor", "split", "image_id", "laterality", "view", "num_masses",
-        "crop_mean", "crop_std", "crop_iqr", "crop_entropy", "R_mean", "G_mean", "B_mean",
-        "R_std", "G_std", "B_std", "foreground_fraction",
-    ]
-    show_cols = [c for c in display_cols if c in features_df.columns]
 
-    st.markdown("**Per-slot summary features**")
+    identity_cols = [
+        "slot", "vendor", "split", "image_id", "laterality", "view",
+        "num_masses", "foreground_fraction",
+    ]
+    output_cols = [
+        "R_mean", "G_mean", "B_mean", "R_std", "G_std", "B_std",
+        "R_iqr", "G_iqr", "B_iqr", "R_entropy", "G_entropy", "B_entropy",
+    ]
+    raw_cols = ["crop_mean", "crop_std", "crop_iqr", "crop_entropy", "crop_p1", "crop_p99"]
+
+    st.markdown("**Final processed RGB statistics, model input**")
+    show_cols = [c for c in identity_cols + output_cols if c in features_df.columns]
     st.dataframe(features_df[show_cols], use_container_width=True, hide_index=True)
+
+    with st.expander("Raw source crop statistics, before channel preprocessing", expanded=False):
+        raw_show_cols = [c for c in identity_cols + raw_cols if c in features_df.columns]
+        st.dataframe(features_df[raw_show_cols], use_container_width=True, hide_index=True)
+        st.caption(
+            "These crop_* values are intentionally different from R/G/B values. They come from the grayscale crop before "
+            "percentile normalization, histogram equalization, contralateral substitution, and standardization."
+        )
 
     metric_df = _pairwise_statistical_similarity(features_df, histograms)
     if metric_df.empty:
         return
 
-    st.markdown("**Pairwise statistical similarity**")
+    st.markdown("**Pairwise final-output statistical similarity**")
     st.dataframe(metric_df, use_container_width=True, hide_index=True)
 
-    best = metric_df.sort_values("combined_distance", ascending=True).iloc[0]
-    worst = metric_df.sort_values("combined_distance", ascending=False).iloc[0]
+    best = metric_df.sort_values("combined_final_rgb_distance", ascending=True).iloc[0]
+    worst = metric_df.sort_values("combined_final_rgb_distance", ascending=False).iloc[0]
     st.info(
-        f"Most similar pair by combined distance: {best['pair']} "
-        f"(combined={best['combined_distance']:.3f}). "
+        f"Most similar pair by final RGB distance: {best['pair']} "
+        f"(combined={best['combined_final_rgb_distance']:.3f}). "
         f"Most different pair: {worst['pair']} "
-        f"(combined={worst['combined_distance']:.3f})."
+        f"(combined={worst['combined_final_rgb_distance']:.3f})."
     )
     with st.expander("How to read these metrics", expanded=False):
         st.markdown(
-            "- **mean_abs_std_diff**: average absolute standardized difference over the selected summary features. "
-            "Lower is more similar. Roughly, values below 0.25 mean the selected examples are close on the measured statistics; "
-            "values above 1.0 mean at least several measured statistics differ strongly.\n"
-            "- **max_abs_std_diff**: largest single standardized feature difference. This tells you if one statistic is an outlier even when the average looks okay.\n"
-            "- **js_distance**: Jensen-Shannon distance between compact normalized intensity histograms. It is bounded and symmetric. Lower is more similar.\n"
-            "- **wasserstein_distance**: 1-D Earth-mover-style distance between compact normalized intensity histograms on [0, 1]. Lower is more similar.\n"
-            "- **combined_distance**: a practical average of standardized feature distance and the two distribution distances. Use it for sorting, not as a clinical metric."
+            "- **final_rgb_mean_abs_std_diff**: average absolute standardized difference over processed R/G/B summary features. "
+            "Lower is more similar. If your standardization is working, this should be small for R/G/B mean and std features.\n"
+            "- **final_rgb_max_abs_std_diff**: largest single standardized feature difference among processed R/G/B features. This catches one channel/statistic being off.\n"
+            "- **final_rgb_js_distance**: Jensen-Shannon distance between compact normalized final RGB intensity summaries. Lower is more similar.\n"
+            "- **final_rgb_wasserstein_distance**: 1-D Earth-mover-style distance between compact normalized final RGB summaries on [0, 1]. Lower is more similar.\n"
+            "- **combined_final_rgb_distance**: the main sorting score. It uses final processed RGB outputs only, not raw crop_* features.\n"
+            "- **raw_crop_mean_abs_std_diff**: diagnostic distance for the grayscale crop before preprocessing. It can stay high even when final RGB statistics are matched."
         )
 
 
@@ -1034,10 +1052,13 @@ def _comparison_features_for_sample(slot_name: str, result: dict[str, Any], proc
         "foreground_fraction": selected.get("foreground_fraction", np.nan),
     }
 
-    # Grayscale crop features use percentile-normalized values so the feature scale
-    # is comparable to the 8-bit processed RGB channels.
+    # Raw/source crop statistics are intentionally computed before the custom
+    # RGB channel pipeline. They help diagnose scanner/crop differences, but
+    # they are not the final model input if custom preprocessing is enabled.
     crop_norm = _normalize_percentile(crop, [1.0, 99.0])
     _add_feature_prefix(row, "crop", crop_norm)
+
+    # Final processed RGB features represent what the detector sees.
     for channel_idx, channel_name in enumerate(["R", "G", "B"]):
         ch = processed_rgb[..., channel_idx].astype(np.float32) / 255.0
         _add_feature_prefix(row, channel_name, ch)
@@ -1068,48 +1089,71 @@ def _add_feature_prefix(row: dict[str, Any], prefix: str, arr: np.ndarray) -> No
 
 
 def _pairwise_statistical_similarity(features_df: pd.DataFrame, histograms: dict[str, dict[str, np.ndarray]]) -> pd.DataFrame:
-    feature_cols = [
+    final_feature_cols = [
         c for c in features_df.columns
-        if any(c.startswith(prefix + "_") for prefix in ["crop", "R", "G", "B"])
+        if any(c.startswith(prefix + "_") for prefix in ["R", "G", "B"])
     ]
-    if len(features_df) < 2 or not feature_cols:
+    raw_crop_cols = [c for c in features_df.columns if c.startswith("crop_")]
+    if len(features_df) < 2 or not final_feature_cols:
         return pd.DataFrame()
 
-    feature_matrix = features_df[feature_cols].astype(float).to_numpy()
-    scale = np.nanstd(feature_matrix, axis=0)
-    alt_scale = np.nanmean(np.abs(feature_matrix - np.nanmean(feature_matrix, axis=0)), axis=0)
-    scale = np.where(np.isfinite(scale) & (scale > 1e-8), scale, alt_scale)
-    scale = np.where(np.isfinite(scale) & (scale > 1e-8), scale, 1.0)
+    final_matrix = features_df[final_feature_cols].astype(float).to_numpy()
+    final_scale = _stable_feature_scale(final_matrix)
+
+    crop_matrix = features_df[raw_crop_cols].astype(float).to_numpy() if raw_crop_cols else None
+    crop_scale = _stable_feature_scale(crop_matrix) if crop_matrix is not None else None
 
     rows = []
     slots = features_df["slot"].tolist()
     for i in range(len(features_df)):
         for j in range(i + 1, len(features_df)):
-            diff = np.abs((feature_matrix[i] - feature_matrix[j]) / scale)
-            diff = diff[np.isfinite(diff)]
-            mean_abs = float(np.mean(diff)) if diff.size else 0.0
-            max_abs = float(np.max(diff)) if diff.size else 0.0
+            final_diff = np.abs((final_matrix[i] - final_matrix[j]) / final_scale)
+            final_diff = final_diff[np.isfinite(final_diff)]
+            final_mean_abs = float(np.mean(final_diff)) if final_diff.size else 0.0
+            final_max_abs = float(np.max(final_diff)) if final_diff.size else 0.0
 
-            js_vals = []
-            w_vals = []
-            for name in ["crop", "R", "G", "B"]:
+            final_js_vals = []
+            final_w_vals = []
+            for name in ["R", "G", "B"]:
                 p = histograms[slots[i]][name]
                 q = histograms[slots[j]][name]
-                js_vals.append(_jensen_shannon_distance(p, q))
-                w_vals.append(_wasserstein_distance_from_histograms(p, q))
-            js_mean = float(np.mean(js_vals))
-            w_mean = float(np.mean(w_vals))
-            combined = float(np.mean([mean_abs, max_abs / 2.0, js_mean, w_mean]))
+                final_js_vals.append(_jensen_shannon_distance(p, q))
+                final_w_vals.append(_wasserstein_distance_from_histograms(p, q))
+            final_js_mean = float(np.mean(final_js_vals))
+            final_w_mean = float(np.mean(final_w_vals))
+            combined_final = float(np.mean([final_mean_abs, final_max_abs / 2.0, final_js_mean, final_w_mean]))
+
+            raw_mean_abs = np.nan
+            raw_js = np.nan
+            raw_w = np.nan
+            if crop_matrix is not None and crop_scale is not None:
+                crop_diff = np.abs((crop_matrix[i] - crop_matrix[j]) / crop_scale)
+                crop_diff = crop_diff[np.isfinite(crop_diff)]
+                raw_mean_abs = float(np.mean(crop_diff)) if crop_diff.size else 0.0
+                raw_js = _jensen_shannon_distance(histograms[slots[i]]["crop"], histograms[slots[j]]["crop"])
+                raw_w = _wasserstein_distance_from_histograms(histograms[slots[i]]["crop"], histograms[slots[j]]["crop"])
+
             rows.append({
                 "pair": f"{slots[i]} vs {slots[j]}",
                 "vendor_pair": f"{features_df.iloc[i].get('vendor', 'Unknown')} vs {features_df.iloc[j].get('vendor', 'Unknown')}",
-                "mean_abs_std_diff": mean_abs,
-                "max_abs_std_diff": max_abs,
-                "js_distance": js_mean,
-                "wasserstein_distance": w_mean,
-                "combined_distance": combined,
+                "final_rgb_mean_abs_std_diff": final_mean_abs,
+                "final_rgb_max_abs_std_diff": final_max_abs,
+                "final_rgb_js_distance": final_js_mean,
+                "final_rgb_wasserstein_distance": final_w_mean,
+                "combined_final_rgb_distance": combined_final,
+                "raw_crop_mean_abs_std_diff": raw_mean_abs,
+                "raw_crop_js_distance": raw_js,
+                "raw_crop_wasserstein_distance": raw_w,
             })
-    return pd.DataFrame(rows).sort_values("combined_distance", ascending=True).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values("combined_final_rgb_distance", ascending=True).reset_index(drop=True)
+
+
+def _stable_feature_scale(matrix: np.ndarray) -> np.ndarray:
+    scale = np.nanstd(matrix, axis=0)
+    alt_scale = np.nanmean(np.abs(matrix - np.nanmean(matrix, axis=0)), axis=0)
+    scale = np.where(np.isfinite(scale) & (scale > 1e-8), scale, alt_scale)
+    scale = np.where(np.isfinite(scale) & (scale > 1e-8), scale, 1.0)
+    return scale
 
 
 def _probability_histogram(arr: np.ndarray, bins: int = 64) -> np.ndarray:
