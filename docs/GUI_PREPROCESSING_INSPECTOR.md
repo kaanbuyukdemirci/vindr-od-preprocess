@@ -87,6 +87,7 @@ Available operations:
 - `percentile_normalize`: clip to percentile range and scale to `[0, 1]`,
 - `percentile_clip_only`: clip outliers without scaling at that step,
 - `zscore_clip`: standardize, clip by z-score, then scale,
+- `standardize_to_target`: dynamically compute `a` and `b` in `a*x + b` so the channel reaches a target mean and standard deviation,
 - `hist_equalize`: simple histogram equalization,
 - `clahe`: contrast-limited adaptive histogram equalization,
 - `gaussian_blur`: smoothing,
@@ -168,15 +169,6 @@ Use **Vendor / image comparison** mode to compare multiple images side by side. 
 - Very large DICOMs can still take a few seconds to load. Recently viewed images are cached by Streamlit.
 - If you change the YAML preprocessing settings, reload the app to ensure the cached dataset uses the new settings.
 
-## Histogram normalization
-
-The metadata/statistics expander shows pixel intensity histograms for the full grayscale image, selected crop, and processed RGB channels. For easier comparison, the GUI normalizes each histogram series independently:
-
-- the x-axis is min-max normalized to `[0, 1]` per image or channel;
-- the y-axis is relative frequency, not raw pixel count.
-
-This means a full mammogram and a 1024 x 1024 crop can be visually compared without the full image dominating only because it has more pixels.
-
 ## Vendor selector notes
 
 The GUI vendor selector is populated from `metadata.csv`. It now checks multiple common column names, including `Manufacturer`, `manufacturer`, `ManufacturerModelName`, `Manufacturer's Model Name`, and normalized variants such as `manufacturer_model_name`. It also falls back to common image identifier columns such as `image_id`, `SOPInstanceUID`, and filename/path stems.
@@ -235,3 +227,9 @@ Lower values mean the selected images are more similar statistically. These metr
 
 - Added a sidebar download button to export the current GUI preprocessing/crop/channel-pipeline settings as YAML.
 - Added exporter support for `image_export.rgb_scheme: custom_channel_pipeline`, so GUI-exported RGB pipelines can be used when generating new datasets.
+
+## v29 additions
+
+- Single-image and comparison-slot index controls are now placed beside their corresponding image/crop status text instead of appearing as a disconnected control below the selector.
+- Added `standardize_to_target` as a per-channel preprocessing step. It estimates the current channel mean and standard deviation, optionally using only a percentile-trimmed pixel range, then applies `y = a*x + b` with `a = target_std / current_std` and `b = target_mean - a * current_mean`.
+- The same `standardize_to_target` operation is supported by the exporter when using `image_export.rgb_scheme: custom_channel_pipeline`.

@@ -641,6 +641,7 @@ OP_NAMES = [
     "percentile_normalize",
     "percentile_clip_only",
     "zscore_clip",
+    "standardize_to_target",
     "hist_equalize",
     "clahe",
     "gaussian_blur",
@@ -688,6 +689,46 @@ def _op_parameter_controls(channel: str, step: int, op: str) -> dict[str, Any]:
     if op == "zscore_clip":
         limit = st.slider("Z-score clip", 0.5, 10.0, 3.0, 0.5, key=f"{prefix}_z")
         return {"z_limit": float(limit)}
+    if op == "standardize_to_target":
+        target_mean = st.slider(
+            "Target mean",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.50,
+            step=0.01,
+            key=f"{prefix}_target_mean",
+            help="After dynamic ax+b standardization, this is the desired channel mean on the 0 to 1 scale.",
+        )
+        target_std = st.slider(
+            "Target std",
+            min_value=0.001,
+            max_value=0.50,
+            value=0.20,
+            step=0.005,
+            key=f"{prefix}_target_std",
+            help="After dynamic ax+b standardization, this is the desired channel standard deviation on the 0 to 1 scale.",
+        )
+        stat_lo, stat_hi = st.slider(
+            "Statistic percentile range",
+            min_value=0.0,
+            max_value=100.0,
+            value=(1.0, 99.0),
+            step=0.5,
+            key=f"{prefix}_stat_win",
+            help="Mean and std are estimated from pixels inside this percentile range to reduce outlier influence.",
+        )
+        clip_output = st.checkbox(
+            "Clip standardized output to [0, 1]",
+            value=True,
+            key=f"{prefix}_clip_output",
+            help="Recommended for export, otherwise later 8-bit conversion may apply another percentile window.",
+        )
+        return {
+            "target_mean": float(target_mean),
+            "target_std": float(target_std),
+            "stat_percentiles": [float(stat_lo), float(stat_hi)],
+            "clip_output": bool(clip_output),
+        }
     if op == "clahe":
         clip = st.slider("CLAHE clip limit", 0.5, 8.0, 2.0, 0.5, key=f"{prefix}_clip")
         tile = st.select_slider("CLAHE tile size", options=[4, 8, 16, 32], value=8, key=f"{prefix}_tile")
@@ -739,21 +780,39 @@ def _render_single_mode(
 ) -> None:
     filtered = _record_filter_controls(records_df, prefix="single")
     st.subheader("Image selection")
-    st.write(f"Filtered images: **{len(filtered)}**")
     if filtered.empty:
+        st.write(f"Filtered images: **0**")
         st.warning("No images match the current filters.")
         return
 
-    selected_pos = st.number_input("Image index within filtered list", min_value=0, max_value=max(0, len(filtered) - 1), value=0, step=1)
+    img_info_col, img_idx_col = st.columns([2.0, 1.0], vertical_alignment="bottom")
+    img_info_col.write(f"Filtered images: **{len(filtered)}**")
+    selected_pos = img_idx_col.number_input(
+        "Image index",
+        min_value=0,
+        max_value=max(0, len(filtered) - 1),
+        value=0,
+        step=1,
+        key="single_image_index_inline",
+    )
     selected_row = filtered.iloc[int(selected_pos)]
     result = _prepare_sample(dataset, int(selected_row["record_index"]), crop_controls, crop_index=None)
     crops = result["crops"]
-    st.write(f"Crops available after crop filter: **{len(crops)}**")
     if not crops:
+        st.write(f"Crops available after crop filter: **0**")
         st.warning("This image has no crops under the current crop filter/positivity threshold.")
         return
 
-    crop_idx = st.number_input("Crop index", min_value=0, max_value=max(0, len(crops) - 1), value=0, step=1)
+    crop_info_col, crop_idx_col = st.columns([2.0, 1.0], vertical_alignment="bottom")
+    crop_info_col.write(f"Crops available after crop filter: **{len(crops)}**")
+    crop_idx = crop_idx_col.number_input(
+        "Crop index",
+        min_value=0,
+        max_value=max(0, len(crops) - 1),
+        value=0,
+        step=1,
+        key="single_crop_index_inline",
+    )
     result = _prepare_sample(dataset, int(selected_row["record_index"]), crop_controls, crop_index=int(crop_idx))
     _show_sample(result, pipeline, show_annotations=show_annotations, display_window=display_window, display_controls=display_controls)
 
@@ -775,21 +834,39 @@ def _render_comparison_mode(
     slot_cols = st.columns(n_slots)
     for slot_idx, col in enumerate(slot_cols):
         with col:
-            st.markdown(f"**Slot {slot_idx + 1}**")
             filtered = _record_filter_controls(records_df, prefix=f"cmp_{slot_idx}", compact=True)
-            st.caption(f"{len(filtered)} matching images")
+            header_col, img_idx_col = st.columns([1.15, 0.85], vertical_alignment="bottom")
+            header_col.markdown(f"**Slot {slot_idx + 1}**")
+            header_col.caption(f"{len(filtered)} matching images")
             if filtered.empty:
+                img_idx_col.caption("No image index")
                 results.append(None)
                 continue
-            img_idx = st.number_input("Image idx", 0, max(0, len(filtered) - 1), 0, 1, key=f"cmp_{slot_idx}_imgidx")
+            img_idx = img_idx_col.number_input(
+                "Image idx",
+                0,
+                max(0, len(filtered) - 1),
+                0,
+                1,
+                key=f"cmp_{slot_idx}_imgidx",
+            )
             row = filtered.iloc[int(img_idx)]
             tmp = _prepare_sample(dataset, int(row["record_index"]), crop_controls, crop_index=None)
             crop_count = len(tmp["crops"])
-            st.caption(f"{crop_count} crops")
+            crop_label_col, crop_idx_col = st.columns([1.15, 0.85], vertical_alignment="bottom")
+            crop_label_col.caption(f"{crop_count} crops")
             if crop_count == 0:
+                crop_idx_col.caption("No crop index")
                 results.append(None)
                 continue
-            cidx = st.number_input("Crop idx", 0, max(0, crop_count - 1), 0, 1, key=f"cmp_{slot_idx}_cropidx")
+            cidx = crop_idx_col.number_input(
+                "Crop idx",
+                0,
+                max(0, crop_count - 1),
+                0,
+                1,
+                key=f"cmp_{slot_idx}_cropidx",
+            )
             results.append(_prepare_sample(dataset, int(row["record_index"]), crop_controls, crop_index=int(cidx)))
 
     valid_results = [r for r in results if r is not None]
@@ -1381,6 +1458,8 @@ def _apply_operation(arr: np.ndarray, op: str, params: dict[str, Any]) -> np.nda
         limit = float(params.get("z_limit", 3.0))
         z = np.clip(z, -limit, limit)
         return ((z + limit) / max(2 * limit, 1e-12)).astype(np.float32)
+    if op == "standardize_to_target":
+        return _standardize_to_target(arr, params)
     if op == "hist_equalize":
         return _equalize(_float_to_uint8(arr)).astype(np.float32) / 255.0
     if op == "clahe":
@@ -1425,6 +1504,40 @@ def _apply_operation(arr: np.ndarray, op: str, params: dict[str, Any]) -> np.nda
         return 1.0 - _normalize_minmax(arr)
     return arr
 
+
+def _standardize_to_target(arr: np.ndarray, params: dict[str, Any]) -> np.ndarray:
+    """Dynamic affine standardization: y = a*x + b.
+
+    a and b are chosen from the current image/channel statistics so the output
+    has approximately the requested mean and standard deviation. By default,
+    the output is clipped to [0, 1] so the following uint8 conversion preserves
+    this chosen scale instead of applying another percentile remapping.
+    """
+    x = np.asarray(arr, dtype=np.float32)
+    finite = x[np.isfinite(x)]
+    if finite.size == 0:
+        return np.zeros_like(x, dtype=np.float32)
+
+    stat_percentiles = params.get("stat_percentiles", [1.0, 99.0])
+    try:
+        lo, hi = _safe_percentile(finite, stat_percentiles)
+        stat_pixels = finite[(finite >= lo) & (finite <= hi)]
+    except Exception:
+        stat_pixels = finite
+    if stat_pixels.size < 2:
+        stat_pixels = finite
+
+    current_mean = float(np.mean(stat_pixels))
+    current_std = float(np.std(stat_pixels))
+    target_mean = float(params.get("target_mean", 0.5))
+    target_std = max(float(params.get("target_std", 0.2)), 1e-8)
+    a = target_std / max(current_std, 1e-8)
+    b = target_mean - a * current_mean
+    y = (a * x + b).astype(np.float32)
+
+    if bool(params.get("clip_output", True)):
+        y = np.clip(y, 0.0, 1.0).astype(np.float32)
+    return y
 
 def _sobel(arr: np.ndarray, params: dict[str, Any]) -> np.ndarray:
     if cv2 is None:

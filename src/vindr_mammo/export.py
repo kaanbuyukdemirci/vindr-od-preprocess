@@ -811,6 +811,8 @@ def _apply_custom_channel_operation(
         limit = max(float(params.get("z_limit", 3.0)), 1e-6)
         z = np.clip((arr - mean) / max(std, 1e-12), -limit, limit)
         return ((z + limit) / (2.0 * limit)).astype(np.float32)
+    if op == "standardize_to_target":
+        return _standardize_to_target_custom(arr, params, mask)
     if op == "hist_equalize":
         return _equalize_uint8(_float_to_uint8_custom(arr), mask=mask).astype(np.float32) / 255.0
     if op == "clahe":
@@ -878,6 +880,45 @@ def _apply_custom_channel_operation(
         return 1.0 - _normalize_minmax_custom(arr, mask)
     return arr
 
+
+def _standardize_to_target_custom(
+    arr: np.ndarray,
+    params: dict[str, Any],
+    mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Dynamic affine standardization for exported custom-channel pipelines.
+
+    y = a*x + b, where a and b are computed from the current crop/channel so
+    the result has approximately the requested target mean and standard
+    deviation. Statistics are estimated from foreground/mask pixels when
+    available, then optionally trimmed by percentile range.
+    """
+    x = np.nan_to_num(np.asarray(arr, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    pixels = x[mask] if mask is not None and mask.any() else x[np.isfinite(x)]
+    if pixels.size == 0:
+        pixels = x[np.isfinite(x)]
+    if pixels.size == 0:
+        return np.zeros_like(x, dtype=np.float32)
+
+    stat_percentiles = params.get("stat_percentiles", [1.0, 99.0])
+    try:
+        lo, hi = _safe_percentile(pixels, stat_percentiles, None)
+        stat_pixels = pixels[(pixels >= lo) & (pixels <= hi)]
+    except Exception:
+        stat_pixels = pixels
+    if stat_pixels.size < 2:
+        stat_pixels = pixels
+
+    current_mean = float(np.mean(stat_pixels))
+    current_std = float(np.std(stat_pixels))
+    target_mean = float(params.get("target_mean", 0.5))
+    target_std = max(float(params.get("target_std", 0.2)), 1e-8)
+    a = target_std / max(current_std, 1e-8)
+    b = target_mean - a * current_mean
+    y = (a * x + b).astype(np.float32)
+    if bool(params.get("clip_output", True)):
+        y = np.clip(y, 0.0, 1.0).astype(np.float32)
+    return y
 
 def _normalize_minmax_custom(arr: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
     pixels = arr[mask] if mask is not None and mask.any() else arr[np.isfinite(arr)]
