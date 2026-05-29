@@ -1150,3 +1150,49 @@ visualizations:
 ```
 
 Keep `max_rows_per_samples_csv: null` for exact plots. Set it to a number such as `5000` only if you want a very quick approximate preview.
+
+
+## v3 dataset default: deterministic positive-only training crops
+
+The default `config/export_config.yaml` now creates a new dataset under:
+
+```text
+/mnt/t9/preprocessed-vindr-v3
+```
+
+This v3 dataset is designed for the experiment where the training split is generated deterministically, but empty train crops are excluded. In other words, the exporter first slides a `1024 x 1024` window with stride `512`, then keeps a train crop only if the final crop contains at least one mass bounding box according to `crop_annotation_policy`. Validation and test still use deterministic sliding windows with empty crops included, so they remain realistic evaluation sets.
+
+Relevant config section:
+
+```yaml
+square_crops:
+  crop_size: 1024
+  stride: 512
+
+  train_crop_mode: "deterministic"
+  val_crop_mode: "deterministic"
+  test_crop_mode: "deterministic"
+
+  deterministic_include_empty: true
+  train_deterministic_include_empty: false
+  val_deterministic_include_empty: true
+  test_deterministic_include_empty: true
+
+crop_annotation_policy:
+  allow_partial_annotations: false
+  reject_partial_windows: true
+```
+
+With `allow_partial_annotations: false`, a crop only counts as positive if the complete mass box is inside the crop. This avoids training on crops that cut through a lesion. If you later want to include partially visible masses, set `allow_partial_annotations: true` and choose `min_box_visibility`.
+
+The portable Ultralytics YAML is written at:
+
+```text
+/mnt/t9/preprocessed-vindr-v3/square_crops/vindr_mass.yaml
+```
+
+Use it with:
+
+```bash
+yolo detect train model=yolo11n.pt data=/mnt/t9/preprocessed-vindr-v3/square_crops/vindr_mass.yaml imgsz=1024
+```

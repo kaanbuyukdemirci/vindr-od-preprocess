@@ -168,6 +168,11 @@ def export_from_config(config: dict[str, Any]) -> ExportResult:
             "val": crop_cfg_for_summary.get("val_crop_mode", "deterministic"),
             "test": crop_cfg_for_summary.get("test_crop_mode", "deterministic"),
         },
+        "deterministic_include_empty": {
+            "train": crop_cfg_for_summary.get("train_deterministic_include_empty", crop_cfg_for_summary.get("deterministic_include_empty", True)),
+            "val": crop_cfg_for_summary.get("val_deterministic_include_empty", crop_cfg_for_summary.get("deterministic_include_empty", True)),
+            "test": crop_cfg_for_summary.get("test_deterministic_include_empty", crop_cfg_for_summary.get("deterministic_include_empty", True)),
+        },
     }
 
     if bool(export_cfg.get("save_square_crops", True)):
@@ -332,11 +337,17 @@ def export_square_crop_datasets(
                     window_xyxy=window,
                     options=common_crop_options,
                 )
+                boxes = crop_result.mass_boxes
+                # Safety guard for split-specific positive-only deterministic exports.
+                # Window selection should already have removed empty windows, but this
+                # protects against any future annotation-policy change.
+                if int(extra_info.get("deterministic_include_empty", 1)) == 0 and boxes.shape[0] == 0:
+                    continue
+
                 filename = _make_crop_filename(record, split_name, crop_number, window)
                 rel_img_path = Path("images") / split_name / filename
                 save_info = _save_export_images(crop_result.image, crop_root, rel_img_path, config)
 
-                boxes = crop_result.mass_boxes
                 labels_path = crop_root / "labels" / split_name / f"{Path(filename).stem}.txt"
                 _write_yolo_label_file(labels_path, boxes, width=crop_size, height=crop_size, save_empty=save_empty_labels)
 
@@ -410,12 +421,33 @@ def _windows_for_export_split(
             crop_size=int(crop_cfg.get("crop_size", 1024)),
             stride=int(crop_cfg.get("stride", 512)),
         )
-        if not bool(crop_cfg.get("deterministic_include_empty", True)):
+
+        # Split-specific empty-window control. This is useful for experiments such as
+        # v3, where training should be deterministic but positive-only, while
+        # validation/test should remain full sliding-window evaluations.
+        include_empty = bool(
+            crop_cfg.get(
+                f"{split_name}_deterministic_include_empty",
+                crop_cfg.get("deterministic_include_empty", True),
+            )
+        )
+        if not include_empty:
             windows = [w for w in windows if window_has_positive_mass(w, mass_boxes, crop_options)]
+
         max_windows = crop_cfg.get(f"{split_name}_deterministic_max_windows_per_image", crop_cfg.get("deterministic_max_windows_per_image"))
         if max_windows is not None:
             windows = windows[: int(max_windows)]
-        return [(w, {"crop_mode": "deterministic", "split_crop_mode": split_mode}) for w in windows]
+        return [
+            (
+                w,
+                {
+                    "crop_mode": "deterministic",
+                    "split_crop_mode": split_mode,
+                    "deterministic_include_empty": int(include_empty),
+                },
+            )
+            for w in windows
+        ]
 
     # Random mode. Positive crops are centered around annotations.
     boxes = mass_boxes.detach().cpu().to(torch.float32).reshape(-1, 4)

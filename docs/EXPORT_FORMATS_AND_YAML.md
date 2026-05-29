@@ -107,7 +107,8 @@ The most important parameters are:
 | `random_crops_per_negative_image` | Number of clean random crops for images with no mass annotations. |
 | `positive_fraction` | Approximate target positive/negative balance for training crops. For example, `0.80` means about 80 percent positive crops. |
 | `center_shift_fraction` | Random shift around the mass center, as a fraction of crop size. With `0.25` and `1024`, the center can shift up to about 256 pixels. |
-| `deterministic_include_empty` | If true, val/test deterministic crops include clean windows. This is usually better for realistic evaluation. |
+| `deterministic_include_empty` | Global default for deterministic splits. If true, deterministic crops include clean windows. |
+| `<split>_deterministic_include_empty` | Split-specific override, for example `train_deterministic_include_empty: false` keeps only positive deterministic train crops while val/test can still include empty windows. |
 
 ## Partial annotation policy
 
@@ -485,3 +486,41 @@ names:
 ```
 
 Pass this file directly to Ultralytics. The older compatibility YAML under `square_crops/ultralytics/vindr_mass.yaml` uses `../images/...` paths because it lives one folder below the dataset root.
+
+
+### v3 deterministic positive-only train dataset
+
+The default configuration now targets `/mnt/t9/preprocessed-vindr-v3`. The purpose is to create a deterministic training set but exclude empty training windows:
+
+```yaml
+paths:
+  output_root: "/mnt/t9/preprocessed-vindr-v3"
+
+square_crops:
+  crop_size: 1024
+  stride: 512
+  train_crop_mode: "deterministic"
+  val_crop_mode: "deterministic"
+  test_crop_mode: "deterministic"
+
+  deterministic_include_empty: true
+  train_deterministic_include_empty: false
+  val_deterministic_include_empty: true
+  test_deterministic_include_empty: true
+```
+
+This means:
+
+* Train: sliding-window crops only, but crops with zero mass boxes are not exported.
+* Val/test: full sliding-window crops, including empty crops, for realistic evaluation.
+* The exact train positive percentage should be close to 100 percent when `allow_partial_annotations: false`, because empty train crops are filtered before export.
+
+The positive/empty decision uses the final crop annotation policy. With the current default:
+
+```yaml
+crop_annotation_policy:
+  allow_partial_annotations: false
+  reject_partial_windows: true
+```
+
+the exporter keeps a deterministic train window only if at least one complete mass box is inside the crop and the crop does not cut through another mass box.

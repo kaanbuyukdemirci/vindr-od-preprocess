@@ -1,16 +1,21 @@
-# VinDr-Mammo export configuration for the second square-crop dataset.
-# Goal: remove the train-vs-val/test crop-distribution mismatch.
-# Train, validation, and test all use deterministic 1024x1024 sliding-window crops.
-# Run with: vindr-mammo-export --config config/export_config.yaml
+# VinDr-Mammo export configuration for the third square-crop dataset (-v3).
+# Goal:
+#   Train split: deterministic sliding-window crops, but keep ONLY positive crops.
+#                A positive crop means at least one mass bounding box remains after
+#                applying the crop annotation policy below.
+#   Val/test:    deterministic sliding-window crops with empty windows included,
+#                so evaluation still reflects the realistic detection task.
+# Run with one of:
+#   python main.py
+#   vindr-mammo-export --config config/export_config.yaml
 
 paths:
   # Folder containing metadata.csv, breast-level_annotations.csv,
   # finding_annotations.csv, and images/<study_id>/<image_id>.dicom
   data_root: "/mnt/t9/vindr"
 
-  # All exported images, labels, COCO JSON files, stats, and metadata are saved here.
-  # This is intentionally a new folder so the previous random-training dataset is preserved.
-  output_root: "/mnt/t9/preprocessed-vindr-v2"
+  # New output folder for this experiment. The -v3 suffix is intentional.
+  output_root: "/mnt/t9/preprocessed-vindr-v3"
 
 runtime:
   show_progress: true
@@ -22,7 +27,7 @@ image:
   use_voi_lut: false
 
 preprocess:
-  # Applied before baseline and square-crop export.
+  # Applied before square-crop export.
   invert_to_black_background: true
   crop_breast: true
   mirror_right_to_left: true
@@ -30,8 +35,7 @@ preprocess:
   crop_threshold: null
 
 image_export:
-  # Training images saved under images/<split> are RGB PNGs.
-  # Current experiment: R = intensity, G = equalized intensity, B = Sobel gradient.
+  # RGB training PNGs: R = intensity, G = equalized intensity, B = Sobel gradient.
   rgb_scheme: "intensity_equalized_gradient"
 
   # Used only when rgb_scheme = "multi_window".
@@ -77,11 +81,11 @@ export:
   clean_output_root: false
   save_square_crops: true
 
-  # Disable the baseline export for this dataset. The purpose of this run is to
-  # create a new square-crop dataset with matched train/val/test crop generation.
+  # Disable baseline export for this experiment. This run is only the -v3 crop dataset.
   save_baseline_uncropped: false
 
-  # Keep empty label files so image count equals label count for Ultralytics.
+  # Empty label files are still written for val/test empty crops. The train split
+  # should have no empty crops when train_deterministic_include_empty=false.
   save_empty_label_files: true
 
 square_crops:
@@ -89,18 +93,28 @@ square_crops:
   crop_size: 1024
   stride: 512
 
-  # Critical change from the previous dataset:
-  # all splits now use deterministic sliding windows.
-  # This makes train look like val/test and removes the mass-centered random-crop bias.
+  # All splits use deterministic sliding windows.
   train_crop_mode: "deterministic"
   val_crop_mode: "deterministic"
   test_crop_mode: "deterministic"
 
-  # Deterministic crop options used by train/val/test.
+  # Global default for deterministic crops. Leave true so val/test include all windows.
   deterministic_include_empty: true
-  deterministic_max_windows_per_image: null
 
-  # Random crop options below are ignored while train_crop_mode="deterministic".
+  # Critical v3 setting: train is deterministic, but positive-only.
+  # This removes deterministic train windows whose final crop contains no mass box.
+  train_deterministic_include_empty: false
+
+  # Keep validation/test realistic by including empty sliding windows.
+  val_deterministic_include_empty: true
+  test_deterministic_include_empty: true
+
+  deterministic_max_windows_per_image: null
+  train_deterministic_max_windows_per_image: null
+  val_deterministic_max_windows_per_image: null
+  test_deterministic_max_windows_per_image: null
+
+  # Random crop options below are ignored while all split crop modes are deterministic.
   # They are kept so you can switch train_crop_mode back to "random" later.
   random_crops_per_annotation: 5
   balance_train_positive_fraction_globally: true
@@ -116,11 +130,10 @@ square_crops:
   pad_value: 0.0
 
 crop_annotation_policy:
-  # Same policy as before for apples-to-apples comparison.
-  # false means a mass annotation is kept only when the complete box is inside the crop.
-  # If later you see many partial lesions becoming unlabeled negatives, try:
-  # allow_partial_annotations: true
-  # min_box_visibility: 0.30
+  # This policy defines whether a crop counts as containing a bounding box.
+  # Current default: a mass annotation is kept only if the full box is inside the crop.
+  # Therefore, train positive-only crops contain complete mass boxes and avoid crops
+  # that cut through a lesion.
   allow_partial_annotations: false
   min_box_visibility: 0.30
   reject_partial_windows: true
@@ -131,7 +144,7 @@ dataset:
 
 visualizations:
   # Fast plots from already-exported CSV/JSON files. No DICOM reread.
-  output_dir: "/mnt/t9/preprocessed-vindr-v2/visualizations"
+  output_dir: "/mnt/t9/preprocessed-vindr-v3/visualizations"
   include_square_crops: true
   include_baseline_uncropped: false
   write_html_report: true
