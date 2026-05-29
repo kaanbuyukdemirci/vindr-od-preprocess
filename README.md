@@ -1196,3 +1196,21 @@ Use it with:
 ```bash
 yolo detect train model=yolo11n.pt data=/mnt/t9/preprocessed-vindr-v3/square_crops/vindr_mass.yaml imgsz=1024
 ```
+
+
+## Interactive preprocessing inspector GUI
+
+This version includes a local Streamlit GUI for inspecting mammograms, square crops, mass boxes, vendors, and experimental RGB preprocessing pipelines before exporting a new dataset. Run it with:
+
+```bash
+pip install -e .
+vindr-mammo-gui --config config/export_config.yaml
+```
+
+or, from the repository root:
+
+```bash
+streamlit run inspect_preprocessing_app.py -- --config config/export_config.yaml
+```
+
+The GUI can filter by train/val/test, positive images only or all images, vendor/device, crop positivity threshold, and crop index. It displays the full grayscale image, the selected grayscale crop, and the processed RGB crop together with mass boxes, statistics, metadata, and histograms. See `docs/GUI_PREPROCESSING_INSPECTOR.md`.

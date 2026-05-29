@@ -75,3 +75,20 @@ def visualize_main(argv: list[str] | None = None) -> None:
         print("  ", path)
     print("\nSummary:")
     pprint(result.summary)
+
+
+def gui_main(argv: list[str] | None = None) -> None:
+    """Console entry point: ``vindr-mammo-gui``.
+
+    This starts the Streamlit preprocessing inspector. Pass an optional config:
+
+    ``vindr-mammo-gui --config config/export_config.yaml``
+    """
+    import sys
+    from streamlit.web import cli as stcli
+
+    parser = _build_parser("Open the interactive preprocessing inspector GUI.")
+    args = parser.parse_args(argv)
+    app_path = Path(__file__).resolve().parent / "gui_app.py"
+    sys.argv = ["streamlit", "run", str(app_path), "--", "--config", str(args.config)]
+    raise SystemExit(stcli.main())

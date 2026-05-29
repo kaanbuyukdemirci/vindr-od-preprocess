@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vindr-mammo-reader"
-version = "0.19.0"
+version = "0.20.0"
 description = "VinDr-Mammo PyTorch dataset, preprocessing, export, and visualization tools for mass detection."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -35,6 +35,7 @@ dependencies = [
   "pillow",
   "tqdm",
   "pyyaml",
+  "streamlit",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +44,7 @@ dev = ["build", "pytest", "ruff"]
 [project.scripts]
 vindr-mammo-export = "vindr_mammo.cli:export_main"
 vindr-mammo-visualize = "vindr_mammo.cli:visualize_main"
+vindr-mammo-gui = "vindr_mammo.cli:gui_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
