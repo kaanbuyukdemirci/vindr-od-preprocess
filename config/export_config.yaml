@@ -29,6 +29,8 @@ image:
 preprocess:
   # Applied before square-crop export.
   invert_to_black_background: true
+  # Set crop_breast=false when you want to keep the full detector image and
+  # use the deterministic foreground-ratio square-crop filter below instead.
   crop_breast: true
   mirror_right_to_left: true
   crop_padding: 20
@@ -113,6 +115,23 @@ square_crops:
   train_deterministic_max_windows_per_image: null
   val_deterministic_max_windows_per_image: null
   test_deterministic_max_windows_per_image: null
+
+  # Optional deterministic foreground-ratio filter. When enabled, each n x n
+  # deterministic crop is kept only if at least this fraction of its pixels looks
+  # like breast foreground. This is useful for experiments where preprocess.crop_breast
+  # is false, because it removes pure-background detector windows without first
+  # cropping the whole mammogram to the breast box.
+  deterministic_require_foreground: false
+  deterministic_min_foreground_fraction: 0.05
+  deterministic_foreground_threshold: null
+
+  # Optional split-specific overrides. Leave null to use the global values above.
+  train_deterministic_require_foreground: null
+  val_deterministic_require_foreground: null
+  test_deterministic_require_foreground: null
+  train_deterministic_min_foreground_fraction: null
+  val_deterministic_min_foreground_fraction: null
+  test_deterministic_min_foreground_fraction: null
 
   # Random crop options below are ignored while all split crop modes are deterministic.
   # They are kept so you can switch train_crop_mode back to "random" later.

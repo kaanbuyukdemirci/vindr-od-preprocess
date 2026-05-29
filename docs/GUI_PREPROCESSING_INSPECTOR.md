@@ -145,3 +145,39 @@ This means a full mammogram and a 1024 x 1024 crop can be visually compared with
 The GUI vendor selector is populated from `metadata.csv`. It now checks multiple common column names, including `Manufacturer`, `manufacturer`, `ManufacturerModelName`, `Manufacturer's Model Name`, and normalized variants such as `manufacturer_model_name`. It also falls back to common image identifier columns such as `image_id`, `SOPInstanceUID`, and filename/path stems.
 
 If no manufacturer/model metadata can be matched to the current image records, the selector will show `Unknown` and the Vendor counts expander will make that visible. This means the GUI is working, but the metadata file does not expose usable vendor columns or image identifiers for matching.
+
+## Channel visibility controls
+
+The sidebar includes **Visible RGB channels**. This only changes what the GUI displays. It does not change the underlying channel preprocessing pipeline.
+
+Examples:
+
+- select only `R` to inspect the normal intensity channel,
+- select only `G` to inspect the equalized/contrast channel,
+- select only `B` to inspect the edge or gradient channel,
+- select all channels to see the composite RGB crop.
+
+The optional **Show individual processed channels** checkbox displays R, G, and B as separate grayscale images under the main three-panel view.
+
+## Deterministic, stochastic, and foreground-ratio crop preview
+
+The GUI crop controls now support two crop proposal modes:
+
+- **deterministic sliding**: normal sliding-window crops using `crop_size` and `stride`,
+- **stochastic random**: random crops, optionally biased toward masses through the positive-fraction setting.
+
+The **Foreground-ratio crop filter** can be enabled in the sidebar. It computes a simple foreground/breast mask inside each candidate crop and rejects the crop if the foreground fraction is below the selected threshold. This is useful when you turn off `preprocess.crop_breast` and want square crops to remove pure detector background windows instead.
+
+For example:
+
+```yaml
+preprocess:
+  crop_breast: false
+
+square_crops:
+  deterministic_require_foreground: true
+  deterministic_min_foreground_fraction: 0.05
+  deterministic_foreground_threshold: null
+```
+
+`deterministic_foreground_threshold: null` uses the automatic threshold. Manual thresholding is available in the GUI for debugging.

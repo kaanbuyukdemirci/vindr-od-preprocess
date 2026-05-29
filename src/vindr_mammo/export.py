@@ -324,6 +324,7 @@ def export_square_crop_datasets(
                 split_name=split_name,
                 image_width=width,
                 image_height=height,
+                image_tensor=image,
                 mass_boxes=target["mass"]["boxes"],
                 crop_options=common_crop_options,
                 crop_cfg=crop_cfg,
@@ -397,11 +398,27 @@ def export_square_crop_datasets(
     return _summary_from_stats(stats_rows), created
 
 
+def _split_crop_cfg(crop_cfg: dict[str, Any], split_name: str, key: str, default: Any) -> Any:
+    """Read split-specific square_crops option with global fallback.
+
+    Example: for split_name="train" and key="deterministic_require_foreground",
+    first checks train_deterministic_require_foreground. If that key is missing
+    or explicitly null in YAML, it falls back to deterministic_require_foreground.
+    """
+    split_key = f"{split_name}_{key}"
+    if split_key in crop_cfg and crop_cfg.get(split_key) is not None:
+        return crop_cfg.get(split_key)
+    if key in crop_cfg and crop_cfg.get(key) is not None:
+        return crop_cfg.get(key)
+    return default
+
+
 def _windows_for_export_split(
     *,
     split_name: str,
     image_width: int,
     image_height: int,
+    image_tensor: torch.Tensor,
     mass_boxes: torch.Tensor,
     crop_options: dict[str, Any],
     crop_cfg: dict[str, Any],
@@ -434,6 +451,36 @@ def _windows_for_export_split(
         if not include_empty:
             windows = [w for w in windows if window_has_positive_mass(w, mass_boxes, crop_options)]
 
+        foreground_filter_enabled = bool(_split_crop_cfg(
+            crop_cfg,
+            split_name,
+            "deterministic_require_foreground",
+            False,
+        ))
+        min_foreground_fraction = float(_split_crop_cfg(
+            crop_cfg,
+            split_name,
+            "deterministic_min_foreground_fraction",
+            0.05,
+        ))
+        foreground_threshold = crop_cfg.get("deterministic_foreground_threshold", None)
+        foreground_fractions: dict[tuple[int, int, int, int], float] = {}
+        if foreground_filter_enabled:
+            image_np = image_tensor.detach().cpu().squeeze(0).numpy().astype(np.float32, copy=False)
+            kept_windows = []
+            for w in windows:
+                frac = _foreground_fraction_in_window(
+                    image_np,
+                    w,
+                    crop_size=int(crop_cfg.get("crop_size", 1024)),
+                    threshold=foreground_threshold,
+                    pad_value=float(crop_cfg.get("pad_value", 0.0)),
+                )
+                foreground_fractions[w] = frac
+                if frac >= min_foreground_fraction:
+                    kept_windows.append(w)
+            windows = kept_windows
+
         max_windows = crop_cfg.get(f"{split_name}_deterministic_max_windows_per_image", crop_cfg.get("deterministic_max_windows_per_image"))
         if max_windows is not None:
             windows = windows[: int(max_windows)]
@@ -444,6 +491,9 @@ def _windows_for_export_split(
                     "crop_mode": "deterministic",
                     "split_crop_mode": split_mode,
                     "deterministic_include_empty": int(include_empty),
+                    "foreground_filter_enabled": int(foreground_filter_enabled),
+                    "min_foreground_fraction": float(min_foreground_fraction),
+                    "foreground_fraction": foreground_fractions.get(w, None),
                 },
             )
             for w in windows
@@ -798,14 +848,46 @@ def _make_uint16_preserved(arr: np.ndarray, config: dict[str, Any]) -> tuple[np.
     return img16, {"preserved_16bit_lo": float(lo), "preserved_16bit_hi": float(hi)}
 
 
-def _foreground_mask(arr: np.ndarray) -> np.ndarray:
+def _foreground_fraction_in_window(
+    image: np.ndarray,
+    window_xyxy: tuple[int, int, int, int],
+    *,
+    crop_size: int,
+    threshold: float | None,
+    pad_value: float = 0.0,
+) -> float:
+    """Return fraction of an n x n crop that appears to be breast foreground.
+
+    This is intentionally simple and fast: it builds the same padded square crop
+    that the exporter will save, makes a foreground mask, and returns mask.mean().
+    Use it to reject pure-background deterministic windows when breast cropping is
+    disabled.
+    """
+    x0, y0, x1, y1 = [int(v) for v in window_xyxy]
+    h, w = image.shape
+    src_x0 = max(0, x0)
+    src_y0 = max(0, y0)
+    src_x1 = min(w, x1)
+    src_y1 = min(h, y1)
+    crop = np.full((int(crop_size), int(crop_size)), float(pad_value), dtype=np.float32)
+    patch = image[src_y0:src_y1, src_x0:src_x1]
+    if patch.size:
+        dst_x0 = max(0, -x0)
+        dst_y0 = max(0, -y0)
+        crop[dst_y0:dst_y0 + patch.shape[0], dst_x0:dst_x0 + patch.shape[1]] = patch
+    mask = _foreground_mask(crop, threshold=threshold)
+    return float(mask.mean()) if mask.size else 0.0
+
+
+def _foreground_mask(arr: np.ndarray, threshold: float | None = None) -> np.ndarray:
     finite = np.isfinite(arr)
     if not finite.any():
         return np.ones_like(arr, dtype=bool)
     vals = arr[finite]
-    lo, hi = np.percentile(vals, [1.0, 99.0])
-    threshold = max(float(lo + 0.03 * (hi - lo)), float(lo) + 1e-6)
-    mask = finite & (arr > threshold)
+    if threshold is None:
+        lo, hi = np.percentile(vals, [1.0, 99.0])
+        threshold = max(float(lo + 0.03 * (hi - lo)), float(lo) + 1e-6)
+    mask = finite & (arr > float(threshold))
     if mask.sum() < max(10, int(0.001 * arr.size)):
         mask = finite
     return mask
@@ -1132,6 +1214,9 @@ def _sample_stats_row(
                 "crop_mode": crop_info.get("crop_mode"),
                 "requested_positive": crop_info.get("requested_positive"),
                 "accepted": crop_info.get("accepted"),
+                "foreground_filter_enabled": crop_info.get("foreground_filter_enabled", ""),
+                "foreground_fraction": crop_info.get("foreground_fraction", ""),
+                "min_foreground_fraction": crop_info.get("min_foreground_fraction", ""),
             }
         )
     return row
@@ -1193,6 +1278,9 @@ def _flatten_metadata_row(row: dict[str, Any]) -> dict[str, Any]:
         "num_export_boxes": len(row.get("export_boxes_xyxy", []) or []),
         "crop_window_xyxy": crop.get("window_xyxy", ""),
         "crop_mode": crop.get("crop_mode", ""),
+        "foreground_filter_enabled": crop.get("foreground_filter_enabled", ""),
+        "foreground_fraction": crop.get("foreground_fraction", ""),
+        "min_foreground_fraction": crop.get("min_foreground_fraction", ""),
         "manufacturer": first_meta.get("Manufacturer", first_meta.get("manufacturer", dicom_meta.get("Manufacturer", ""))),
         "manufacturer_model_name": first_meta.get("ManufacturerModelName", first_meta.get("manufacturer_model_name", dicom_meta.get("ManufacturerModelName", ""))),
         "photometric_interpretation": dicom_meta.get("PhotometricInterpretation", ""),

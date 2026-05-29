@@ -27,6 +27,7 @@ except Exception as exc:  # pragma: no cover
 from .crops import (
     box_visibility_in_window,
     crop_image_and_boxes_to_window,
+    sample_random_square_window,
     sliding_square_windows,
 )
 from .dataset import VindrMammoDataset
@@ -62,6 +63,7 @@ def main() -> None:
         "Grayscale display window percentiles", 0.0, 100.0, (1.0, 99.0), 0.5,
         help="Only affects visualization in the GUI, not the underlying DICOM values.",
     )
+    display_controls = _display_controls()
 
     st.sidebar.divider()
     st.sidebar.subheader("RGB preprocessing pipeline")
@@ -69,9 +71,9 @@ def main() -> None:
     pipeline = _pipeline_controls()
 
     if mode == "Single image":
-        _render_single_mode(dataset, enriched, crop_controls, pipeline, show_annotations, display_window)
+        _render_single_mode(dataset, enriched, crop_controls, pipeline, show_annotations, display_window, display_controls)
     else:
-        _render_comparison_mode(dataset, enriched, crop_controls, pipeline, show_annotations, display_window)
+        _render_comparison_mode(dataset, enriched, crop_controls, pipeline, show_annotations, display_window, display_controls)
 
 
 # -----------------------------------------------------------------------------
@@ -316,13 +318,61 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     return cfg
 
 
+def _display_controls() -> dict[str, Any]:
+    st.sidebar.divider()
+    st.sidebar.subheader("Display/debug controls")
+    visible_channels = st.sidebar.multiselect(
+        "Visible RGB channels",
+        options=["R", "G", "B"],
+        default=["R", "G", "B"],
+        help=(
+            "Controls only the GUI display of the processed RGB crop. Hidden channels "
+            "are set to zero, which makes it easier to debug individual channel pipelines."
+        ),
+    )
+    show_channel_panels = st.sidebar.checkbox(
+        "Show individual processed channels",
+        value=False,
+        help="Show R, G, and B as separate grayscale panels below the main images.",
+    )
+    return {
+        "visible_channels": list(visible_channels),
+        "show_channel_panels": bool(show_channel_panels),
+    }
+
+
 def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     st.sidebar.divider()
     st.sidebar.subheader("Crop controls")
     crop_cfg = cfg.get("square_crops", {})
     policy = cfg.get("crop_annotation_policy", {})
-    crop_size = st.sidebar.number_input("Crop size n", min_value=128, max_value=4096, step=128, value=int(crop_cfg.get("crop_size", 1024)))
-    stride = st.sidebar.number_input("Stride", min_value=64, max_value=4096, step=64, value=int(crop_cfg.get("stride", 512)))
+
+    crop_size = st.sidebar.number_input(
+        "Crop size n",
+        min_value=128,
+        max_value=4096,
+        step=128,
+        value=int(crop_cfg.get("crop_size", 1024)),
+    )
+    stride = st.sidebar.number_input(
+        "Deterministic stride",
+        min_value=64,
+        max_value=4096,
+        step=64,
+        value=int(crop_cfg.get("stride", 512)),
+    )
+
+    crop_mode = st.sidebar.radio(
+        "Crop proposal mode",
+        ["deterministic sliding", "stochastic random"],
+        index=0,
+        help=(
+            "Deterministic uses the normal sliding-window grid. Stochastic samples random "
+            "windows and can be biased toward masses. This is for GUI inspection only unless "
+            "you also use the corresponding export config options."
+        ),
+    )
+
     only_mass_crops = st.sidebar.checkbox("Show only crops with visible mass", value=True)
     positivity_threshold = st.sidebar.slider(
         "Positive crop threshold, visible mass fraction",
@@ -334,23 +384,102 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     )
     allow_partial = st.sidebar.checkbox("Display partial boxes after clipping", value=bool(policy.get("allow_partial_annotations", False)))
     min_box_visibility = st.sidebar.slider("Minimum box visibility to draw/keep", 0.0, 1.0, float(policy.get("min_box_visibility", 0.30)), 0.05)
+
+    random_preview_count = 20
+    random_positive_fraction = 0.80
+    random_seed = int(crop_cfg.get("seed", 123))
+    center_shift_fraction = float(crop_cfg.get("center_shift_fraction", 0.25))
+    if crop_mode == "stochastic random":
+        with st.sidebar.expander("Stochastic crop options", expanded=True):
+            random_preview_count = st.number_input(
+                "Random crops to preview",
+                min_value=1,
+                max_value=500,
+                value=20,
+                step=1,
+            )
+            random_positive_fraction = st.slider(
+                "Random positive fraction",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(crop_cfg.get("positive_fraction", 0.80)),
+                step=0.05,
+                help="Probability of requesting a mass-positive random crop when the image has masses.",
+            )
+            center_shift_fraction = st.slider(
+                "Mass-center random shift fraction",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(crop_cfg.get("center_shift_fraction", 0.25)),
+                step=0.05,
+            )
+            random_seed = st.number_input("Random preview seed", min_value=0, max_value=999999, value=random_seed, step=1)
+
+    with st.sidebar.expander("Foreground-ratio crop filter", expanded=False):
+        require_foreground = st.checkbox(
+            "Require crop to contain breast foreground",
+            value=bool(crop_cfg.get("deterministic_require_foreground", False)),
+            help=(
+                "Reject crop windows whose foreground/breast-pixel fraction is below the threshold. "
+                "This is useful if you turn off the fixed breast crop and want square crops to remove pure background windows."
+            ),
+        )
+        min_foreground_fraction = st.slider(
+            "Minimum foreground fraction in crop",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(crop_cfg.get("deterministic_min_foreground_fraction", 0.05)),
+            step=0.01,
+        )
+        fg_threshold_mode = st.radio(
+            "Foreground threshold for square crops",
+            ["auto", "manual"],
+            index=0 if crop_cfg.get("deterministic_foreground_threshold", None) is None else 1,
+            horizontal=True,
+        )
+        if fg_threshold_mode == "manual":
+            foreground_threshold = st.number_input(
+                "Manual foreground threshold",
+                value=float(crop_cfg.get("deterministic_foreground_threshold", 0.0) or 0.0),
+                step=0.01,
+                format="%.6f",
+            )
+        else:
+            foreground_threshold = None
+        foreground_mask_preview = st.checkbox(
+            "Show foreground mask preview for selected crop",
+            value=False,
+            help="Shows which crop pixels counted as breast foreground.",
+        )
+
+    crop_options = {
+        "enabled": True,
+        "mode": "random" if crop_mode == "stochastic random" else "deterministic",
+        "crop_size": int(crop_size),
+        "stride": int(stride),
+        "allow_partial_annotations": bool(allow_partial),
+        "min_box_visibility": float(min_box_visibility),
+        "reject_partial_windows": not bool(allow_partial),
+        "negative_max_box_visibility": 0.0,
+        "pad_if_needed": True,
+        "pad_value": 0.0,
+        "positive_fraction": float(random_positive_fraction),
+        "center_shift_fraction": float(center_shift_fraction),
+        "max_random_tries": int(crop_cfg.get("max_random_tries", 80)),
+    }
     return {
         "crop_size": int(crop_size),
         "stride": int(stride),
+        "mode": "random" if crop_mode == "stochastic random" else "deterministic",
+        "random_preview_count": int(random_preview_count),
+        "random_seed": int(random_seed),
         "only_mass_crops": bool(only_mass_crops),
         "positivity_threshold": float(positivity_threshold),
-        "crop_options": {
-            "enabled": True,
-            "mode": "deterministic",
-            "crop_size": int(crop_size),
-            "stride": int(stride),
-            "allow_partial_annotations": bool(allow_partial),
-            "min_box_visibility": float(min_box_visibility),
-            "reject_partial_windows": not bool(allow_partial),
-            "negative_max_box_visibility": 0.0,
-            "pad_if_needed": True,
-            "pad_value": 0.0,
-        },
+        "require_foreground": bool(require_foreground),
+        "min_foreground_fraction": float(min_foreground_fraction),
+        "foreground_threshold": foreground_threshold,
+        "foreground_mask_preview": bool(foreground_mask_preview),
+        "crop_options": crop_options,
     }
 
 
@@ -453,6 +582,7 @@ def _render_single_mode(
     pipeline: dict[str, Any],
     show_annotations: bool,
     display_window: tuple[float, float],
+    display_controls: dict[str, Any],
 ) -> None:
     filtered = _record_filter_controls(records_df, prefix="single")
     st.subheader("Image selection")
@@ -472,7 +602,7 @@ def _render_single_mode(
 
     crop_idx = st.number_input("Crop index", min_value=0, max_value=max(0, len(crops) - 1), value=0, step=1)
     result = _prepare_sample(dataset, int(selected_row["record_index"]), crop_controls, crop_index=int(crop_idx))
-    _show_sample(result, pipeline, show_annotations=show_annotations, display_window=display_window)
+    _show_sample(result, pipeline, show_annotations=show_annotations, display_window=display_window, display_controls=display_controls)
 
 
 
@@ -483,6 +613,7 @@ def _render_comparison_mode(
     pipeline: dict[str, Any],
     show_annotations: bool,
     display_window: tuple[float, float],
+    display_controls: dict[str, Any],
 ) -> None:
     st.subheader("Vendor / image comparison")
     st.caption("All comparison slots use the same crop controls and RGB preprocessing pipeline from the sidebar.")
@@ -513,7 +644,7 @@ def _render_comparison_mode(
             continue
         st.divider()
         st.markdown(f"### Slot {i + 1}: {result['title']}")
-        _show_sample(result, pipeline, show_annotations=show_annotations, display_window=display_window, compact=True)
+        _show_sample(result, pipeline, show_annotations=show_annotations, display_window=display_window, display_controls=display_controls, compact=True)
 
 
 
@@ -615,7 +746,22 @@ def _prepare_sample(dataset: VindrMammoDataset, record_index: int, crop_controls
     boxes = torch.as_tensor(loaded["all_boxes"], dtype=torch.float32)
     mass_boxes = torch.as_tensor(loaded["mass_boxes"], dtype=torch.float32)
     height, width = image.shape
-    windows = sliding_square_windows(width, height, crop_controls["crop_size"], crop_controls["stride"])
+    if crop_controls.get("mode") == "random":
+        rng = np.random.default_rng(int(crop_controls.get("random_seed", 123)) + int(record_index))
+        windows = []
+        random_options = dict(crop_controls["crop_options"])
+        random_options["mode"] = "random"
+        for _ in range(int(crop_controls.get("random_preview_count", 20))):
+            w, _info = sample_random_square_window(
+                image_width=width,
+                image_height=height,
+                mass_boxes=mass_boxes,
+                options=random_options,
+                rng=rng,
+            )
+            windows.append(w)
+    else:
+        windows = sliding_square_windows(width, height, crop_controls["crop_size"], crop_controls["stride"])
 
     crops = []
     for w in windows:
@@ -626,12 +772,29 @@ def _prepare_sample(dataset: VindrMammoDataset, record_index: int, crop_controls
         is_positive = max_vis >= float(crop_controls["positivity_threshold"])
         if crop_controls["only_mass_crops"] and not is_positive:
             continue
-        crops.append({"window": w, "max_visibility": max_vis, "positive_by_slider": is_positive})
+        foreground_fraction = None
+        if bool(crop_controls.get("require_foreground", False)):
+            foreground_fraction = _foreground_fraction_in_window(
+                image,
+                w,
+                crop_size=int(crop_controls["crop_size"]),
+                threshold=crop_controls.get("foreground_threshold"),
+                pad_value=float(crop_controls["crop_options"].get("pad_value", 0.0)),
+            )
+            if foreground_fraction < float(crop_controls.get("min_foreground_fraction", 0.05)):
+                continue
+        crops.append({
+            "window": w,
+            "max_visibility": max_vis,
+            "positive_by_slider": is_positive,
+            "foreground_fraction": foreground_fraction,
+        })
 
     selected = None
     crop_image = None
     crop_boxes = np.zeros((0, 4), dtype=np.float32)
     crop_mass_boxes = np.zeros((0, 4), dtype=np.float32)
+    foreground_mask_crop = None
     if crops:
         selected = crops[int(crop_index or 0) % len(crops)]
         image_tensor = torch.from_numpy(np.ascontiguousarray(image)).unsqueeze(0)
@@ -645,6 +808,11 @@ def _prepare_sample(dataset: VindrMammoDataset, record_index: int, crop_controls
         crop_image = crop_result.image.detach().cpu().squeeze(0).numpy().astype(np.float32, copy=False)
         crop_boxes = crop_result.boxes.detach().cpu().numpy().astype(np.float32, copy=False)
         crop_mass_boxes = crop_result.mass_boxes.detach().cpu().numpy().astype(np.float32, copy=False)
+        if bool(crop_controls.get("foreground_mask_preview", False)):
+            foreground_mask_crop = _foreground_mask_for_crop(
+                crop_image,
+                threshold=crop_controls.get("foreground_threshold"),
+            )
 
     summary = loaded["target_summary"]
     title = (
@@ -660,6 +828,8 @@ def _prepare_sample(dataset: VindrMammoDataset, record_index: int, crop_controls
         "crop_image": crop_image,
         "crop_boxes": crop_boxes,
         "crop_mass_boxes": crop_mass_boxes,
+        "foreground_mask_crop": foreground_mask_crop,
+        "show_foreground_mask_preview": bool(crop_controls.get("foreground_mask_preview", False)),
         "record_index": int(record_index),
     }
 
@@ -675,6 +845,7 @@ def _show_sample(
     *,
     show_annotations: bool,
     display_window: tuple[float, float],
+    display_controls: dict[str, Any] | None = None,
     compact: bool = False,
 ) -> None:
     full = result["image"]
@@ -688,6 +859,9 @@ def _show_sample(
     window = selected.get("window")
 
     processed_rgb, processing_meta = apply_channel_pipeline(crop, pipeline)
+    display_controls = display_controls or {"visible_channels": ["R", "G", "B"], "show_channel_panels": False}
+    visible_channels = display_controls.get("visible_channels", ["R", "G", "B"]) or []
+    processed_rgb_display = _mask_rgb_channels(processed_rgb, visible_channels)
     crop_gray = _to_uint8_percentile(crop, display_window)
     full_gray = _to_uint8_percentile(full, display_window)
 
@@ -696,7 +870,7 @@ def _show_sample(
     if window is not None:
         full_draw = _draw_rect(full_draw, window, color=(80, 255, 80), thickness=max(2, full.shape[1] // 1000))
     crop_draw = _draw_boxes(_gray_to_rgb(crop_gray), crop_boxes, color=(255, 80, 80))
-    proc_draw = _draw_boxes(processed_rgb.copy(), crop_boxes, color=(255, 80, 80))
+    proc_draw = _draw_boxes(processed_rgb_display.copy(), crop_boxes, color=(255, 80, 80))
 
     st.write(result["title"])
     if window is not None:
@@ -705,7 +879,17 @@ def _show_sample(
     cols = st.columns(3)
     cols[0].image(full_draw, caption="Fixed-preprocessed grayscale image with selected crop window", use_container_width=True)
     cols[1].image(crop_draw, caption="Crop from fixed-preprocessed image", use_container_width=True)
-    cols[2].image(proc_draw, caption="Preprocessed RGB crop", use_container_width=True)
+    cols[2].image(proc_draw, caption=f"Preprocessed RGB crop, visible channels={''.join(visible_channels) or 'none'}", use_container_width=True)
+
+    if display_controls.get("show_channel_panels", False):
+        ch_cols = st.columns(3)
+        for i, name in enumerate(["R", "G", "B"]):
+            ch_cols[i].image(processed_rgb[..., i], caption=f"Processed {name} channel", use_container_width=True, clamp=True)
+
+    if (result.get("foreground_mask_crop") is not None) and result.get("show_foreground_mask_preview", False):
+        fg_cols = st.columns(2)
+        fg_cols[0].image(result["foreground_mask_crop"].astype(np.uint8) * 255, caption="Foreground mask used for crop filtering", use_container_width=True, clamp=True)
+        fg_cols[1].write({"foreground_fraction": result.get("selected_crop", {}).get("foreground_fraction")})
 
     with st.expander("Metadata and statistics", expanded=not compact):
         stat_df = _stats_table(full, crop, processed_rgb)
@@ -714,6 +898,14 @@ def _show_sample(
         fig = _histogram_figure(full, crop, processed_rgb)
         st.pyplot(fig, clear_figure=True)
 
+
+
+def _mask_rgb_channels(rgb: np.ndarray, visible_channels: list[str]) -> np.ndarray:
+    out = np.zeros_like(rgb)
+    for idx, name in enumerate(["R", "G", "B"]):
+        if name in visible_channels:
+            out[..., idx] = rgb[..., idx]
+    return out
 
 
 def _stats_table(full: np.ndarray, crop: np.ndarray, processed_rgb: np.ndarray) -> pd.DataFrame:
@@ -885,6 +1077,46 @@ def _laplacian(arr: np.ndarray, params: dict[str, Any]) -> np.ndarray:
         k = _odd_int(params.get("ksize", 3))
         lap = np.abs(cv2.Laplacian(u8, cv2.CV_32F, ksize=k))
     return _normalize_percentile(lap.astype(np.float32), params.get("percentiles", [1.0, 99.0]))
+
+
+
+def _foreground_fraction_in_window(
+    image: np.ndarray,
+    window_xyxy: tuple[int, int, int, int],
+    *,
+    crop_size: int,
+    threshold: float | None,
+    pad_value: float = 0.0,
+) -> float:
+    x0, y0, x1, y1 = [int(v) for v in window_xyxy]
+    h, w = image.shape
+    src_x0 = max(0, x0)
+    src_y0 = max(0, y0)
+    src_x1 = min(w, x1)
+    src_y1 = min(h, y1)
+    crop = np.full((int(crop_size), int(crop_size)), float(pad_value), dtype=np.float32)
+    patch = image[src_y0:src_y1, src_x0:src_x1]
+    if patch.size:
+        dst_x0 = max(0, -x0)
+        dst_y0 = max(0, -y0)
+        crop[dst_y0:dst_y0 + patch.shape[0], dst_x0:dst_x0 + patch.shape[1]] = patch
+    mask = _foreground_mask_for_crop(crop, threshold=threshold)
+    return float(mask.mean()) if mask.size else 0.0
+
+
+def _foreground_mask_for_crop(arr: np.ndarray, *, threshold: float | None) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float32)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return np.zeros(arr.shape, dtype=bool)
+    if threshold is None:
+        vals = arr[finite]
+        lo, hi = np.percentile(vals, [1.0, 99.0])
+        threshold = max(float(lo + 0.03 * (hi - lo)), float(lo) + 1e-6)
+    mask = finite & (arr > float(threshold))
+    if mask.sum() < max(10, int(0.001 * arr.size)):
+        mask = finite
+    return mask
 
 
 # -----------------------------------------------------------------------------

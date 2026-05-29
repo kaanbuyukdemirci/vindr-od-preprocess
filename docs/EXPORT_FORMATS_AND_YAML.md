@@ -524,3 +524,43 @@ crop_annotation_policy:
 ```
 
 the exporter keeps a deterministic train window only if at least one complete mass box is inside the crop and the crop does not cut through another mass box.
+
+### Deterministic foreground-ratio crop filter
+
+The exporter can now filter deterministic sliding-window crops by the amount of breast foreground inside the crop. This is different from `preprocess.crop_breast`:
+
+- `preprocess.crop_breast: true` crops the whole mammogram to the detected breast box before square-crop generation.
+- `deterministic_require_foreground: true` keeps the full preprocessed image, creates normal sliding windows, and rejects individual windows if too little of that crop is breast foreground.
+
+This is useful for experiments where you want to disable the global breast crop and let the square-crop stage decide which windows contain enough breast tissue:
+
+```yaml
+preprocess:
+  invert_to_black_background: true
+  crop_breast: false
+  mirror_right_to_left: true
+
+square_crops:
+  train_crop_mode: "deterministic"
+  val_crop_mode: "deterministic"
+  test_crop_mode: "deterministic"
+
+  deterministic_require_foreground: true
+  deterministic_min_foreground_fraction: 0.05
+  deterministic_foreground_threshold: null
+```
+
+You can override the foreground filter per split by setting:
+
+```yaml
+square_crops:
+  train_deterministic_require_foreground: true
+  val_deterministic_require_foreground: true
+  test_deterministic_require_foreground: true
+
+  train_deterministic_min_foreground_fraction: 0.05
+  val_deterministic_min_foreground_fraction: 0.05
+  test_deterministic_min_foreground_fraction: 0.05
+```
+
+The exporter stores `foreground_filter_enabled`, `foreground_fraction`, and `min_foreground_fraction` in `samples.csv` and per-sample metadata so you can audit which crops passed the filter.

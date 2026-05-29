@@ -1214,3 +1214,27 @@ streamlit run inspect_preprocessing_app.py -- --config config/export_config.yaml
 ```
 
 The GUI can filter by train/val/test, positive images only or all images, vendor/device, crop positivity threshold, and crop index. It displays the full grayscale image, the selected grayscale crop, and the processed RGB crop together with mass boxes, statistics, metadata, and histograms. See `docs/GUI_PREPROCESSING_INSPECTOR.md`.
+
+## v26 GUI and crop-filter update
+
+The preprocessing inspector GUI now includes:
+
+- visible-channel controls for R/G/B debugging,
+- optional individual R/G/B channel panels,
+- deterministic sliding crop preview,
+- stochastic random crop preview,
+- a foreground-ratio crop filter that can reject square crops with too little breast foreground.
+
+The same foreground-ratio filter is available in the exporter under `square_crops`:
+
+```yaml
+preprocess:
+  crop_breast: false
+
+square_crops:
+  deterministic_require_foreground: true
+  deterministic_min_foreground_fraction: 0.05
+  deterministic_foreground_threshold: null
+```
+
+Use the GUI first to tune `deterministic_min_foreground_fraction`, then export a dataset with the same settings.
