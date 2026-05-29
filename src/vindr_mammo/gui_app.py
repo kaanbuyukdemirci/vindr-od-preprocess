@@ -639,6 +639,11 @@ def _render_comparison_mode(
             cidx = st.number_input("Crop idx", 0, max(0, crop_count - 1), 0, 1, key=f"cmp_{slot_idx}_cropidx")
             results.append(_prepare_sample(dataset, int(row["record_index"]), crop_controls, crop_index=int(cidx)))
 
+    valid_results = [r for r in results if r is not None]
+    if len(valid_results) >= 2:
+        st.divider()
+        _show_comparison_statistics(valid_results, pipeline)
+
     for i, result in enumerate(results):
         if result is None:
             continue
@@ -646,6 +651,203 @@ def _render_comparison_mode(
         st.markdown(f"### Slot {i + 1}: {result['title']}")
         _show_sample(result, pipeline, show_annotations=show_annotations, display_window=display_window, display_controls=display_controls, compact=True)
 
+
+
+# -----------------------------------------------------------------------------
+# Compare selected images by statistics, not pixel alignment
+# -----------------------------------------------------------------------------
+
+
+def _show_comparison_statistics(results: list[dict[str, Any]], pipeline: dict[str, Any]) -> None:
+    """Compare selected comparison slots using image/crop summary statistics.
+
+    The selected images are not spatially registered and may be different patients,
+    views, and vendors. Therefore this section compares summary covariates and
+    1-D intensity summaries rather than pixel-wise similarity.
+    """
+    st.markdown("### Statistics comparison across selected slots")
+    st.caption(
+        "This compares selected crops/images by summary features and compact intensity-distribution distances. "
+        "It does not compare pixels spatially. Lower distances mean the selected samples look more similar statistically."
+    )
+
+    feature_rows = []
+    histograms: dict[str, dict[str, np.ndarray]] = {}
+    for i, result in enumerate(results):
+        slot_name = f"slot_{i + 1}"
+        processed_rgb, _meta = apply_channel_pipeline(result["crop_image"], pipeline)
+        row, hists = _comparison_features_for_sample(slot_name, result, processed_rgb)
+        feature_rows.append(row)
+        histograms[slot_name] = hists
+
+    features_df = pd.DataFrame(feature_rows)
+    display_cols = [
+        "slot", "vendor", "split", "image_id", "laterality", "view", "num_masses",
+        "crop_mean", "crop_std", "crop_iqr", "crop_entropy", "R_mean", "G_mean", "B_mean",
+        "R_std", "G_std", "B_std", "foreground_fraction",
+    ]
+    show_cols = [c for c in display_cols if c in features_df.columns]
+
+    st.markdown("**Per-slot summary features**")
+    st.dataframe(features_df[show_cols], use_container_width=True, hide_index=True)
+
+    metric_df = _pairwise_statistical_similarity(features_df, histograms)
+    if metric_df.empty:
+        return
+
+    st.markdown("**Pairwise statistical similarity**")
+    st.dataframe(metric_df, use_container_width=True, hide_index=True)
+
+    best = metric_df.sort_values("combined_distance", ascending=True).iloc[0]
+    worst = metric_df.sort_values("combined_distance", ascending=False).iloc[0]
+    st.info(
+        f"Most similar pair by combined distance: {best['pair']} "
+        f"(combined={best['combined_distance']:.3f}). "
+        f"Most different pair: {worst['pair']} "
+        f"(combined={worst['combined_distance']:.3f})."
+    )
+    with st.expander("How to read these metrics", expanded=False):
+        st.markdown(
+            "- **mean_abs_std_diff**: average absolute standardized difference over the selected summary features. "
+            "Lower is more similar. Roughly, values below 0.25 mean the selected examples are close on the measured statistics; "
+            "values above 1.0 mean at least several measured statistics differ strongly.\n"
+            "- **max_abs_std_diff**: largest single standardized feature difference. This tells you if one statistic is an outlier even when the average looks okay.\n"
+            "- **js_distance**: Jensen-Shannon distance between compact normalized intensity histograms. It is bounded and symmetric. Lower is more similar.\n"
+            "- **wasserstein_distance**: 1-D Earth-mover-style distance between compact normalized intensity histograms on [0, 1]. Lower is more similar.\n"
+            "- **combined_distance**: a practical average of standardized feature distance and the two distribution distances. Use it for sorting, not as a clinical metric."
+        )
+
+
+def _comparison_features_for_sample(slot_name: str, result: dict[str, Any], processed_rgb: np.ndarray) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+    crop = np.asarray(result["crop_image"], dtype=np.float32)
+    summary = result.get("target_summary", {}) or {}
+    selected = result.get("selected_crop", {}) or {}
+
+    row: dict[str, Any] = {
+        "slot": slot_name,
+        "vendor": _vendor_from_summary(summary),
+        "split": summary.get("split"),
+        "image_id": summary.get("image_id"),
+        "laterality": summary.get("laterality"),
+        "view": summary.get("view_position"),
+        "num_masses": int(summary.get("num_masses", 0) or 0),
+        "foreground_fraction": selected.get("foreground_fraction", np.nan),
+    }
+
+    # Grayscale crop features use percentile-normalized values so the feature scale
+    # is comparable to the 8-bit processed RGB channels.
+    crop_norm = _normalize_percentile(crop, [1.0, 99.0])
+    _add_feature_prefix(row, "crop", crop_norm)
+    for channel_idx, channel_name in enumerate(["R", "G", "B"]):
+        ch = processed_rgb[..., channel_idx].astype(np.float32) / 255.0
+        _add_feature_prefix(row, channel_name, ch)
+
+    hists = {"crop": _probability_histogram(crop_norm)}
+    for channel_idx, channel_name in enumerate(["R", "G", "B"]):
+        hists[channel_name] = _probability_histogram(processed_rgb[..., channel_idx].astype(np.float32) / 255.0)
+    return row, hists
+
+
+def _add_feature_prefix(row: dict[str, Any], prefix: str, arr: np.ndarray) -> None:
+    finite = np.asarray(arr, dtype=np.float32)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        finite = np.array([0.0], dtype=np.float32)
+    p1, p5, p25, p50, p75, p95, p99 = np.percentile(finite, [1, 5, 25, 50, 75, 95, 99])
+    row[f"{prefix}_mean"] = float(np.mean(finite))
+    row[f"{prefix}_std"] = float(np.std(finite))
+    row[f"{prefix}_p1"] = float(p1)
+    row[f"{prefix}_p5"] = float(p5)
+    row[f"{prefix}_p25"] = float(p25)
+    row[f"{prefix}_p50"] = float(p50)
+    row[f"{prefix}_p75"] = float(p75)
+    row[f"{prefix}_p95"] = float(p95)
+    row[f"{prefix}_p99"] = float(p99)
+    row[f"{prefix}_iqr"] = float(p75 - p25)
+    row[f"{prefix}_entropy"] = float(_normalized_entropy(finite))
+
+
+def _pairwise_statistical_similarity(features_df: pd.DataFrame, histograms: dict[str, dict[str, np.ndarray]]) -> pd.DataFrame:
+    feature_cols = [
+        c for c in features_df.columns
+        if any(c.startswith(prefix + "_") for prefix in ["crop", "R", "G", "B"])
+    ]
+    if len(features_df) < 2 or not feature_cols:
+        return pd.DataFrame()
+
+    feature_matrix = features_df[feature_cols].astype(float).to_numpy()
+    scale = np.nanstd(feature_matrix, axis=0)
+    alt_scale = np.nanmean(np.abs(feature_matrix - np.nanmean(feature_matrix, axis=0)), axis=0)
+    scale = np.where(np.isfinite(scale) & (scale > 1e-8), scale, alt_scale)
+    scale = np.where(np.isfinite(scale) & (scale > 1e-8), scale, 1.0)
+
+    rows = []
+    slots = features_df["slot"].tolist()
+    for i in range(len(features_df)):
+        for j in range(i + 1, len(features_df)):
+            diff = np.abs((feature_matrix[i] - feature_matrix[j]) / scale)
+            diff = diff[np.isfinite(diff)]
+            mean_abs = float(np.mean(diff)) if diff.size else 0.0
+            max_abs = float(np.max(diff)) if diff.size else 0.0
+
+            js_vals = []
+            w_vals = []
+            for name in ["crop", "R", "G", "B"]:
+                p = histograms[slots[i]][name]
+                q = histograms[slots[j]][name]
+                js_vals.append(_jensen_shannon_distance(p, q))
+                w_vals.append(_wasserstein_distance_from_histograms(p, q))
+            js_mean = float(np.mean(js_vals))
+            w_mean = float(np.mean(w_vals))
+            combined = float(np.mean([mean_abs, max_abs / 2.0, js_mean, w_mean]))
+            rows.append({
+                "pair": f"{slots[i]} vs {slots[j]}",
+                "vendor_pair": f"{features_df.iloc[i].get('vendor', 'Unknown')} vs {features_df.iloc[j].get('vendor', 'Unknown')}",
+                "mean_abs_std_diff": mean_abs,
+                "max_abs_std_diff": max_abs,
+                "js_distance": js_mean,
+                "wasserstein_distance": w_mean,
+                "combined_distance": combined,
+            })
+    return pd.DataFrame(rows).sort_values("combined_distance", ascending=True).reset_index(drop=True)
+
+
+def _probability_histogram(arr: np.ndarray, bins: int = 64) -> np.ndarray:
+    vals = _sample_pixels(np.asarray(arr, dtype=np.float32))
+    if vals.size == 0:
+        vals = np.array([0.0], dtype=np.float32)
+    vals = np.clip(_normalize_minmax(vals), 0.0, 1.0)
+    hist, _ = np.histogram(vals, bins=int(bins), range=(0.0, 1.0))
+    hist = hist.astype(np.float64) + 1e-12
+    return hist / hist.sum()
+
+
+def _jensen_shannon_distance(p: np.ndarray, q: np.ndarray) -> float:
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    p = p / max(float(p.sum()), 1e-12)
+    q = q / max(float(q.sum()), 1e-12)
+    m = 0.5 * (p + q)
+    kl_pm = np.sum(np.where(p > 0, p * np.log2(p / np.maximum(m, 1e-12)), 0.0))
+    kl_qm = np.sum(np.where(q > 0, q * np.log2(q / np.maximum(m, 1e-12)), 0.0))
+    return float(np.sqrt(max(0.0, 0.5 * (kl_pm + kl_qm))))
+
+
+def _wasserstein_distance_from_histograms(p: np.ndarray, q: np.ndarray) -> float:
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    p = p / max(float(p.sum()), 1e-12)
+    q = q / max(float(q.sum()), 1e-12)
+    # Approximate 1-D Wasserstein distance on a fixed [0, 1] support by the area
+    # between cumulative distribution functions.
+    bin_width = 1.0 / max(len(p), 1)
+    return float(np.sum(np.abs(np.cumsum(p) - np.cumsum(q))) * bin_width)
+
+
+def _normalized_entropy(values: np.ndarray) -> float:
+    hist = _probability_histogram(values, bins=64)
+    entropy = -float(np.sum(hist * np.log2(np.maximum(hist, 1e-12))))
+    return entropy / math.log2(max(len(hist), 2))
 
 
 def _record_filter_controls(records_df: pd.DataFrame, *, prefix: str, compact: bool = False) -> pd.DataFrame:
@@ -884,7 +1086,16 @@ def _show_sample(
     if display_controls.get("show_channel_panels", False):
         ch_cols = st.columns(3)
         for i, name in enumerate(["R", "G", "B"]):
-            ch_cols[i].image(processed_rgb[..., i], caption=f"Processed {name} channel", use_container_width=True, clamp=True)
+            channel_u8 = processed_rgb[..., i]
+            channel_draw = _gray_to_rgb(channel_u8)
+            if show_annotations:
+                channel_draw = _draw_boxes(channel_draw, crop_boxes, color=(255, 80, 80))
+            ch_cols[i].image(
+                channel_draw,
+                caption=f"Processed {name} channel" + (" with boxes" if show_annotations else ""),
+                use_container_width=True,
+                clamp=True,
+            )
 
     if (result.get("foreground_mask_crop") is not None) and result.get("show_foreground_mask_preview", False):
         fg_cols = st.columns(2)
@@ -895,8 +1106,10 @@ def _show_sample(
         stat_df = _stats_table(full, crop, processed_rgb)
         st.dataframe(stat_df, use_container_width=True)
         st.json(_compact_metadata(result["target_summary"], processing_meta))
-        fig = _histogram_figure(full, crop, processed_rgb)
-        st.pyplot(fig, clear_figure=True)
+        st.caption(
+            "The old pixel-intensity distribution plot was removed. Use compare mode for "
+            "numeric distribution distances and standardized statistic differences."
+        )
 
 
 
@@ -922,17 +1135,24 @@ def _stats_row(name: str, arr: np.ndarray) -> dict[str, Any]:
     finite = arr[np.isfinite(arr)]
     if finite.size == 0:
         finite = np.array([0.0])
+    p1, p5, p25, p50, p75, p95, p99 = np.percentile(finite, [1, 5, 25, 50, 75, 95, 99])
     return {
         "image": name,
         "shape": "x".join(map(str, arr.shape)),
         "dtype": str(arr.dtype),
         "min": float(np.min(finite)),
-        "p1": float(np.percentile(finite, 1)),
-        "p50": float(np.percentile(finite, 50)),
-        "p99": float(np.percentile(finite, 99)),
+        "p1": float(p1),
+        "p5": float(p5),
+        "p25": float(p25),
+        "p50": float(p50),
+        "p75": float(p75),
+        "p95": float(p95),
+        "p99": float(p99),
         "max": float(np.max(finite)),
         "mean": float(np.mean(finite)),
         "std": float(np.std(finite)),
+        "iqr": float(p75 - p25),
+        "entropy": float(_normalized_entropy(finite)),
     }
 
 

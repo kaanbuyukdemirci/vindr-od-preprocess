@@ -1213,7 +1213,7 @@ or, from the repository root:
 streamlit run inspect_preprocessing_app.py -- --config config/export_config.yaml
 ```
 
-The GUI can filter by train/val/test, positive images only or all images, vendor/device, crop positivity threshold, and crop index. It displays the full grayscale image, the selected grayscale crop, and the processed RGB crop together with mass boxes, statistics, metadata, and histograms. See `docs/GUI_PREPROCESSING_INSPECTOR.md`.
+The GUI can filter by train/val/test, positive images only or all images, vendor/device, crop positivity threshold, and crop index. It displays the full grayscale image, the selected grayscale crop, and the processed RGB crop together with mass boxes, statistics, metadata, optional per-channel panels with mass boxes, and compare-mode statistical similarity metrics. The old histogram plot was removed because it was not very informative for this workflow. See `docs/GUI_PREPROCESSING_INSPECTOR.md`.
 
 ## v26 GUI and crop-filter update
 
@@ -1238,3 +1238,7 @@ square_crops:
 ```
 
 Use the GUI first to tune `deterministic_min_foreground_fraction`, then export a dataset with the same settings.
+
+## v27 GUI comparison update
+
+The preprocessing inspector now overlays mass annotations on the individual processed R/G/B channel panels when annotation display is enabled. Compare mode also includes a statistics-comparison section before the image panels. It compares selected samples using summary feature differences, Jensen-Shannon distance on compact intensity summaries, and an approximate 1-D Wasserstein distance. The pixel-intensity distribution plot was removed from the metadata panel.

@@ -13,7 +13,7 @@ Mass detection performance was sensitive to the training crop distribution and t
 - positive-crop definitions based on visible mass fraction,
 - mass boxes before and after crop clipping,
 - custom RGB preprocessing pipelines,
-- intensity statistics and histograms.
+- intensity statistics and compare-mode statistical similarity metrics.
 
 The GUI reads the original VinDr-Mammo DICOMs and the CSV annotations. It does not train a model and does not export a dataset.
 
@@ -119,7 +119,7 @@ The statistics expander shows:
 - DICOM and metadata fields when available,
 - fixed preprocessing info,
 - selected RGB pipeline JSON,
-- histograms for the full grayscale image, grayscale crop, and R/G/B channels.
+- summary statistics for the full grayscale image, grayscale crop, and R/G/B channels.
 
 ## Comparison mode
 
@@ -181,3 +181,15 @@ square_crops:
 ```
 
 `deterministic_foreground_threshold: null` uses the automatic threshold. Manual thresholding is available in the GUI for debugging.
+
+## Compare-mode statistical similarity
+
+The old pixel-intensity histogram plot was removed because it was not very useful for deciding whether different images or vendors can be trained in one network. Compare mode now reports numeric similarity between selected slots. It compares summary features such as mean, standard deviation, percentiles, IQR, and entropy for the grayscale crop and processed R/G/B channels. It also reports Jensen-Shannon distance and an approximate 1-D Wasserstein distance on compact normalized intensity summaries.
+
+Lower values mean the selected images are more similar statistically. These metrics are not a clinical quality score and do not compare pixels spatially. They are meant as a practical data-consistency check across vendors and preprocessing choices.
+
+## v27 additions
+
+- Individual processed R/G/B channel panels now show mass annotation boxes when `Show mass annotations` is enabled.
+- Compare mode now includes a `Statistics comparison across selected slots` section.
+- The pixel-intensity histogram plot was removed from the metadata panel.
