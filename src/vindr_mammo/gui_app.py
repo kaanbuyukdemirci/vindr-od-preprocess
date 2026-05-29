@@ -436,8 +436,11 @@ def _render_comparison_mode(
 
 
 def _record_filter_controls(records_df: pd.DataFrame, *, prefix: str, compact: bool = False) -> pd.DataFrame:
-    container = st if not compact else st.container()
-    with container:
+    # Always create an actual Streamlit container object. The `streamlit` module
+    # itself is not a context manager, so `with st:` raises
+    # TypeError: 'module' object does not support the context manager protocol.
+    ui_container = st.container(border=bool(compact))
+    with ui_container:
         split_options = ["all", "train", "val", "test"]
         split_choice = st.selectbox("Split", split_options, index=0, key=f"{prefix}_split")
         positive_choice = st.radio("Images", ["positive only", "all images"], index=0, horizontal=True, key=f"{prefix}_positive")
