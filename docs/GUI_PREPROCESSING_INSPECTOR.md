@@ -107,7 +107,44 @@ G = percentile-normalized intensity + histogram equalization
 B = percentile-normalized intensity + Sobel gradient
 ```
 
-This GUI does not automatically modify `export_config.yaml`. Once you find settings you like, copy the corresponding logic into the export code/config or ask ChatGPT to update the exporter.
+Use **Export current preprocessing YAML** in the sidebar to download the current fixed preprocessing settings, crop controls, visible-channel settings, and per-channel RGB pipeline. The downloaded file includes an `export_config_patch` section that can be copied into `export_config.yaml`. The exporter also supports `image_export.rgb_scheme: custom_channel_pipeline`, so GUI-exported R/G/B pipelines can be used for dataset generation.
+
+
+## Export current preprocessing YAML
+
+The sidebar includes **Export current preprocessing YAML**. The download contains:
+
+- `fixed_preprocessing_before_crops`: MONOCHROME1 inversion, breast crop, mirroring, crop padding, and threshold settings,
+- `crop_preview_settings`: deterministic/stochastic crop settings, positivity threshold, and foreground-ratio filter settings,
+- `display_debug_settings`: currently visible RGB channels and channel-panel display state,
+- `rgb_channel_pipeline`: the exact ordered operations selected for R, G, and B,
+- `export_config_patch`: a compact block intended for copy-paste into `export_config.yaml`.
+
+If you paste the custom RGB pipeline into the main export config, use:
+
+```yaml
+image_export:
+  rgb_scheme: custom_channel_pipeline
+  custom_channel_pipeline:
+    R:
+      - op: percentile_normalize
+        params:
+          percentiles: [1.0, 99.0]
+    G:
+      - op: percentile_normalize
+        params:
+          percentiles: [1.0, 99.0]
+      - op: hist_equalize
+        params: {}
+    B:
+      - op: percentile_normalize
+        params:
+          percentiles: [1.0, 99.0]
+      - op: sobel_gradient
+        params:
+          ksize: 3
+          percentiles: [1.0, 99.0]
+```
 
 ## Metadata and statistics
 
@@ -193,3 +230,8 @@ Lower values mean the selected images are more similar statistically. These metr
 - Individual processed R/G/B channel panels now show mass annotation boxes when `Show mass annotations` is enabled.
 - Compare mode now includes a `Statistics comparison across selected slots` section.
 - The pixel-intensity histogram plot was removed from the metadata panel.
+
+## v28 additions
+
+- Added a sidebar download button to export the current GUI preprocessing/crop/channel-pipeline settings as YAML.
+- Added exporter support for `image_export.rgb_scheme: custom_channel_pipeline`, so GUI-exported RGB pipelines can be used when generating new datasets.

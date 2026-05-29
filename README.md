@@ -1242,3 +1242,7 @@ Use the GUI first to tune `deterministic_min_foreground_fraction`, then export a
 ## v27 GUI comparison update
 
 The preprocessing inspector now overlays mass annotations on the individual processed R/G/B channel panels when annotation display is enabled. Compare mode also includes a statistics-comparison section before the image panels. It compares selected samples using summary feature differences, Jensen-Shannon distance on compact intensity summaries, and an approximate 1-D Wasserstein distance. The pixel-intensity distribution plot was removed from the metadata panel.
+
+### GUI preprocessing YAML export
+
+The preprocessing inspector GUI now includes an **Export current preprocessing YAML** panel. It downloads the current fixed preprocessing settings, crop preview settings, channel visibility settings, and R/G/B preprocessing pipelines. The exported YAML includes an `export_config_patch` block. The exporter supports `image_export.rgb_scheme: custom_channel_pipeline` for using GUI-designed R/G/B pipelines during dataset export.

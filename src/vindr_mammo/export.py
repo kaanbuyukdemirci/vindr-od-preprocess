@@ -702,6 +702,10 @@ def _make_rgb_image(arr: np.ndarray, config: dict[str, Any]) -> tuple[np.ndarray
         channels, ieg_meta = _make_intensity_equalized_gradient_rgb(arr, img_cfg, mask)
         meta.update(ieg_meta)
 
+    elif scheme in {"custom_channel_pipeline", "gui_channel_pipeline"}:
+        channels, custom_meta = _make_custom_channel_pipeline_rgb(arr, img_cfg, mask)
+        meta.update(custom_meta)
+
     elif scheme == "bitpack16":
         # Not recommended for CNN training. Kept only as an explicit experimental option.
         img16, pmeta = _make_uint16_preserved(arr, config)
@@ -728,10 +732,10 @@ def _make_rgb_image(arr: np.ndarray, config: dict[str, Any]) -> tuple[np.ndarray
         raise ValueError(
             "Unknown image_export.rgb_scheme. Expected one of: "
             "multi_window, grayscale_rgb, equalized_rgb, "
-            "intensity_equalized_gradient, bitpack16."
+            "intensity_equalized_gradient, custom_channel_pipeline, bitpack16."
         )
 
-    if bool(eq_cfg.get("enabled", True)) and scheme not in {"equalized_rgb", "bitpack16", "intensity_equalized_gradient", "ieg", "normal_equalized_gradient"}:
+    if bool(eq_cfg.get("enabled", True)) and scheme not in {"equalized_rgb", "bitpack16", "intensity_equalized_gradient", "ieg", "normal_equalized_gradient", "custom_channel_pipeline", "gui_channel_pipeline"}:
         apply_to = str(eq_cfg.get("apply_to", "all_channels")).casefold().strip()
         if apply_to == "all_channels":
             channels = [_equalize_uint8(ch, mask=mask) for ch in channels]
@@ -745,6 +749,164 @@ def _make_rgb_image(arr: np.ndarray, config: dict[str, Any]) -> tuple[np.ndarray
 
     rgb = np.stack(channels, axis=-1).astype(np.uint8, copy=False)
     return rgb, meta
+
+
+
+def _make_custom_channel_pipeline_rgb(
+    arr: np.ndarray,
+    img_cfg: dict[str, Any],
+    mask: np.ndarray,
+) -> tuple[list[np.ndarray], dict[str, Any]]:
+    """Create RGB channels using a GUI-exported per-channel operation pipeline.
+
+    The preprocessing inspector exports this structure under
+    image_export.custom_channel_pipeline. Each channel starts from the same
+    fixed-preprocessed grayscale crop and applies its own ordered operation list.
+    """
+    pipeline = img_cfg.get("custom_channel_pipeline", {}) or {}
+    channels: list[np.ndarray] = []
+    meta: dict[str, Any] = {
+        "rgb_scheme": "custom_channel_pipeline",
+        "custom_channel_pipeline": pipeline,
+        "rgb_channel_0": "custom_R_pipeline",
+        "rgb_channel_1": "custom_G_pipeline",
+        "rgb_channel_2": "custom_B_pipeline",
+    }
+    for channel in ["R", "G", "B"]:
+        work = np.asarray(arr, dtype=np.float32).copy()
+        applied: list[dict[str, Any]] = []
+        for step in list(pipeline.get(channel, []) or []):
+            if not isinstance(step, dict):
+                continue
+            op = str(step.get("op", "none")).casefold().strip()
+            params = step.get("params", {}) or {}
+            if op in {"none", "", "null"}:
+                continue
+            work = _apply_custom_channel_operation(work, op, params, mask)
+            applied.append({"op": op, "params": params})
+        channels.append(_float_to_uint8_custom(work))
+        meta[f"custom_{channel}_steps"] = applied
+    return channels, meta
+
+
+def _apply_custom_channel_operation(
+    arr: np.ndarray,
+    op: str,
+    params: dict[str, Any],
+    mask: np.ndarray,
+) -> np.ndarray:
+    arr = np.nan_to_num(np.asarray(arr, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    if op == "percentile_normalize":
+        lo, hi = _safe_percentile(arr, params.get("percentiles", [1.0, 99.0]), mask)
+        return ((np.clip(arr, lo, hi) - lo) / max(hi - lo, 1e-12)).astype(np.float32)
+    if op == "percentile_clip_only":
+        lo, hi = _safe_percentile(arr, params.get("percentiles", [1.0, 99.0]), mask)
+        return np.clip(arr, lo, hi).astype(np.float32)
+    if op == "zscore_clip":
+        pixels = arr[mask] if mask is not None and mask.any() else arr[np.isfinite(arr)]
+        if pixels.size == 0:
+            pixels = arr[np.isfinite(arr)]
+        mean = float(np.mean(pixels)) if pixels.size else 0.0
+        std = float(np.std(pixels)) if pixels.size else 1.0
+        limit = max(float(params.get("z_limit", 3.0)), 1e-6)
+        z = np.clip((arr - mean) / max(std, 1e-12), -limit, limit)
+        return ((z + limit) / (2.0 * limit)).astype(np.float32)
+    if op == "hist_equalize":
+        return _equalize_uint8(_float_to_uint8_custom(arr), mask=mask).astype(np.float32) / 255.0
+    if op == "clahe":
+        img = _float_to_uint8_custom(arr)
+        if cv2 is None:
+            return _equalize_uint8(img, mask=mask).astype(np.float32) / 255.0
+        clip_limit = float(params.get("clip_limit", 2.0))
+        tile = int(params.get("tile_grid_size", 8))
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile, tile))
+        return clahe.apply(img).astype(np.float32) / 255.0
+    if op == "gaussian_blur":
+        if cv2 is None:
+            return arr
+        k = _odd_int_custom(params.get("ksize", 5))
+        sigma = float(params.get("sigma", 1.0))
+        return cv2.GaussianBlur(arr.astype(np.float32), (k, k), sigmaX=sigma).astype(np.float32)
+    if op == "median_blur":
+        if cv2 is None:
+            return arr
+        k = _odd_int_custom(params.get("ksize", 3))
+        return cv2.medianBlur(_float_to_uint8_custom(arr), k).astype(np.float32) / 255.0
+    if op == "sharpen":
+        if cv2 is None:
+            return arr
+        amount = float(params.get("amount", 1.0))
+        kernel = np.array([[0, -1, 0], [-1, 4 + amount, -1], [0, -1, 0]], dtype=np.float32)
+        kernel /= max(float(kernel.sum()), 1e-6)
+        return cv2.filter2D(arr.astype(np.float32), -1, kernel).astype(np.float32)
+    if op == "unsharp_mask":
+        if cv2 is None:
+            return arr
+        amount = float(params.get("amount", 1.5))
+        sigma = float(params.get("sigma", 2.0))
+        blurred = cv2.GaussianBlur(arr.astype(np.float32), (0, 0), sigmaX=sigma)
+        return (arr + amount * (arr - blurred)).astype(np.float32)
+    if op == "sobel_gradient":
+        ksize = _odd_int_custom(params.get("ksize", 3))
+        if cv2 is not None:
+            gx = cv2.Sobel(arr.astype(np.float32), cv2.CV_32F, 1, 0, ksize=ksize)
+            gy = cv2.Sobel(arr.astype(np.float32), cv2.CV_32F, 0, 1, ksize=ksize)
+            mag = cv2.magnitude(gx, gy).astype(np.float32)
+        else:
+            gy, gx = np.gradient(arr.astype(np.float32))
+            mag = np.sqrt(gx * gx + gy * gy).astype(np.float32)
+        lo, hi = _safe_percentile(mag, params.get("percentiles", [1.0, 99.0]), mask)
+        return ((np.clip(mag, lo, hi) - lo) / max(hi - lo, 1e-12)).astype(np.float32)
+    if op == "laplacian":
+        if cv2 is not None:
+            lap = np.abs(cv2.Laplacian(arr.astype(np.float32), cv2.CV_32F, ksize=_odd_int_custom(params.get("ksize", 3))))
+        else:
+            gy, gx = np.gradient(arr.astype(np.float32))
+            gyy, _ = np.gradient(gy)
+            _, gxx = np.gradient(gx)
+            lap = np.abs(gxx + gyy).astype(np.float32)
+        lo, hi = _safe_percentile(lap, params.get("percentiles", [1.0, 99.0]), mask)
+        return ((np.clip(lap, lo, hi) - lo) / max(hi - lo, 1e-12)).astype(np.float32)
+    if op == "gamma":
+        gamma = max(float(params.get("gamma", 1.0)), 1e-6)
+        return np.power(np.clip(_normalize_minmax_custom(arr, mask), 0.0, 1.0), gamma).astype(np.float32)
+    if op == "log":
+        gain = float(params.get("gain", 5.0))
+        x = np.clip(_normalize_minmax_custom(arr, mask), 0.0, 1.0)
+        return (np.log1p(gain * x) / np.log1p(gain)).astype(np.float32)
+    if op == "invert":
+        return 1.0 - _normalize_minmax_custom(arr, mask)
+    return arr
+
+
+def _normalize_minmax_custom(arr: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    pixels = arr[mask] if mask is not None and mask.any() else arr[np.isfinite(arr)]
+    if pixels.size == 0:
+        return np.zeros_like(arr, dtype=np.float32)
+    lo, hi = float(np.min(pixels)), float(np.max(pixels))
+    if hi <= lo:
+        return np.zeros_like(arr, dtype=np.float32)
+    return ((arr - lo) / (hi - lo)).astype(np.float32)
+
+
+def _float_to_uint8_custom(arr: np.ndarray) -> np.ndarray:
+    arr = np.nan_to_num(np.asarray(arr, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return np.zeros(arr.shape, dtype=np.uint8)
+    if float(np.min(finite)) >= 0.0 and float(np.max(finite)) <= 1.0:
+        return np.round(np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
+    lo, hi = _safe_percentile(arr, [1.0, 99.0], None)
+    return _to_uint8_window(arr, lo, hi)
+
+
+def _odd_int_custom(value: Any) -> int:
+    k = int(value)
+    if k < 1:
+        k = 1
+    if k % 2 == 0:
+        k += 1
+    return k
 
 
 def _make_intensity_equalized_gradient_rgb(

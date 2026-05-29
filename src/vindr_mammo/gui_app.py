@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import yaml
 
 try:
     import cv2
@@ -69,11 +70,163 @@ def main() -> None:
     st.sidebar.subheader("RGB preprocessing pipeline")
     st.sidebar.caption("Build the output RGB crop channel by channel.")
     pipeline = _pipeline_controls()
+    _export_current_preprocessing_yaml_panel(
+        config_path=config_path,
+        cfg=cfg,
+        crop_controls=crop_controls,
+        display_controls=display_controls,
+        pipeline=pipeline,
+    )
 
     if mode == "Single image":
         _render_single_mode(dataset, enriched, crop_controls, pipeline, show_annotations, display_window, display_controls)
     else:
         _render_comparison_mode(dataset, enriched, crop_controls, pipeline, show_annotations, display_window, display_controls)
+
+
+
+# -----------------------------------------------------------------------------
+# Current GUI configuration export
+# -----------------------------------------------------------------------------
+
+
+def _export_current_preprocessing_yaml_panel(
+    *,
+    config_path: Path,
+    cfg: dict[str, Any],
+    crop_controls: dict[str, Any],
+    display_controls: dict[str, Any],
+    pipeline: dict[str, Any],
+) -> None:
+    """Expose a one-click YAML export of the current GUI preprocessing setup."""
+    payload = _current_preprocessing_yaml_payload(
+        config_path=config_path,
+        cfg=cfg,
+        crop_controls=crop_controls,
+        display_controls=display_controls,
+        pipeline=pipeline,
+    )
+    yaml_text = yaml.safe_dump(
+        _make_yaml_safe(payload),
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+        width=120,
+    )
+
+    st.sidebar.divider()
+    with st.sidebar.expander("Export current preprocessing YAML", expanded=False):
+        st.caption(
+            "Downloads the current fixed preprocessing, crop controls, channel visibility, "
+            "and per-channel RGB pipeline. This is intended as a reproducible experiment record "
+            "and as a patch you can copy into export_config.yaml."
+        )
+        st.download_button(
+            label="Download current preprocessing YAML",
+            data=yaml_text,
+            file_name="vindr_current_preprocessing_gui.yaml",
+            mime="application/x-yaml",
+            use_container_width=True,
+        )
+        if st.checkbox("Show YAML preview", value=False, key="show_current_preprocessing_yaml_preview"):
+            st.text_area(
+                "YAML preview",
+                value=yaml_text,
+                height=360,
+                key="current_preprocessing_yaml_preview_text",
+            )
+
+
+def _current_preprocessing_yaml_payload(
+    *,
+    config_path: Path,
+    cfg: dict[str, Any],
+    crop_controls: dict[str, Any],
+    display_controls: dict[str, Any],
+    pipeline: dict[str, Any],
+) -> dict[str, Any]:
+    crop_options = dict(crop_controls.get("crop_options", {}) or {})
+    return {
+        "format": "vindr_mammo_preprocessing_gui_export_v1",
+        "source_config": str(config_path),
+        "note": (
+            "This file was exported from the preprocessing inspector GUI. "
+            "It records the current interactive preprocessing/crop/RGB settings."
+        ),
+        "fixed_preprocessing_before_crops": dict(cfg.get("preprocess", {}) or {}),
+        "crop_preview_settings": {
+            "mode": crop_controls.get("mode"),
+            "crop_size": crop_controls.get("crop_size"),
+            "stride": crop_controls.get("stride"),
+            "only_mass_crops": crop_controls.get("only_mass_crops"),
+            "positive_crop_visible_mass_fraction": crop_controls.get("positivity_threshold"),
+            "require_foreground": crop_controls.get("require_foreground"),
+            "min_foreground_fraction": crop_controls.get("min_foreground_fraction"),
+            "foreground_threshold": crop_controls.get("foreground_threshold"),
+            "random_preview_count": crop_controls.get("random_preview_count"),
+            "random_seed": crop_controls.get("random_seed"),
+            "random_positive_fraction": crop_options.get("positive_fraction"),
+            "center_shift_fraction": crop_options.get("center_shift_fraction"),
+            "allow_partial_annotations": crop_options.get("allow_partial_annotations"),
+            "min_box_visibility": crop_options.get("min_box_visibility"),
+        },
+        "display_debug_settings": {
+            "visible_rgb_channels": list(display_controls.get("visible_channels", ["R", "G", "B"]) or []),
+            "show_individual_processed_channels": bool(display_controls.get("show_channel_panels", False)),
+        },
+        "rgb_channel_pipeline": {
+            "description": "Each channel starts from the selected fixed-preprocessed grayscale crop, then applies these steps in order.",
+            "R": list(pipeline.get("R", [])),
+            "G": list(pipeline.get("G", [])),
+            "B": list(pipeline.get("B", [])),
+        },
+        "export_config_patch": {
+            "preprocess": dict(cfg.get("preprocess", {}) or {}),
+            "crop_annotation_policy": {
+                "allow_partial_annotations": crop_options.get("allow_partial_annotations"),
+                "min_box_visibility": crop_options.get("min_box_visibility"),
+                "reject_partial_windows": crop_options.get("reject_partial_windows"),
+                "negative_max_box_visibility": crop_options.get("negative_max_box_visibility"),
+            },
+            "square_crops": {
+                "crop_size": crop_controls.get("crop_size"),
+                "stride": crop_controls.get("stride"),
+                "deterministic_require_foreground": crop_controls.get("require_foreground"),
+                "deterministic_min_foreground_fraction": crop_controls.get("min_foreground_fraction"),
+                "deterministic_foreground_threshold": crop_controls.get("foreground_threshold"),
+                "positive_fraction": crop_options.get("positive_fraction"),
+                "center_shift_fraction": crop_options.get("center_shift_fraction"),
+            },
+            "image_export": {
+                "rgb_scheme": "custom_channel_pipeline",
+                "custom_channel_pipeline": {
+                    "R": list(pipeline.get("R", [])),
+                    "G": list(pipeline.get("G", [])),
+                    "B": list(pipeline.get("B", [])),
+                },
+            },
+        },
+    }
+
+
+def _make_yaml_safe(value: Any) -> Any:
+    """Convert NumPy/Pandas/Path objects to plain YAML-safe Python objects."""
+    if isinstance(value, dict):
+        return {str(k): _make_yaml_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_make_yaml_safe(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return value
 
 
 # -----------------------------------------------------------------------------
