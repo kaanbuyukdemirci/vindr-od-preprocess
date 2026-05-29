@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import shutil
+from collections import OrderedDict
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -313,12 +314,32 @@ def export_square_crop_datasets(
     metadata_rows: list[dict[str, Any]] = []
     image_id_counter = 1
     ann_id_counter = 1
+    # Keep a tiny cache only. A full VinDr export can contain thousands of large
+    # mammograms, so caching every tensor would consume too much RAM. The small
+    # cache still avoids immediate rereads when paired views are processed near
+    # each other.
+    preprocessed_cache: OrderedDict[str, tuple[torch.Tensor, dict[str, Any]]] = OrderedDict()
+    max_preprocessed_cache_items = int(crop_cfg.get("contralateral_preprocessed_cache_items", 8))
+    contralateral_lookup = _build_contralateral_record_lookup(dataset.image_records)
+    needs_contralateral = _config_uses_contralateral_source(config)
+
+    def get_preprocessed(record_: dict[str, Any]) -> tuple[torch.Tensor, dict[str, Any]]:
+        key = str(record_.get("image_id", ""))
+        if key in preprocessed_cache:
+            preprocessed_cache.move_to_end(key)
+            return preprocessed_cache[key]
+        value = dataset._read_preprocessed_record_no_square(record_)
+        preprocessed_cache[key] = value
+        preprocessed_cache.move_to_end(key)
+        while len(preprocessed_cache) > max(1, max_preprocessed_cache_items):
+            preprocessed_cache.popitem(last=False)
+        return value
 
     for split_name in ["train", "val", "test"]:
         records = split_records.get(split_name, [])
         iterator = _progress(records, show_progress, f"Export square crops {split_name}", unit="img")
         for record in iterator:
-            image, target = dataset._read_preprocessed_record_no_square(record)
+            image, target = get_preprocessed(record)
             height, width = int(image.shape[-2]), int(image.shape[-1])
             windows = _windows_for_export_split(
                 split_name=split_name,
@@ -347,7 +368,16 @@ def export_square_crop_datasets(
 
                 filename = _make_crop_filename(record, split_name, crop_number, window)
                 rel_img_path = Path("images") / split_name / filename
-                save_info = _save_export_images(crop_result.image, crop_root, rel_img_path, config)
+                source_arrays = None
+                if needs_contralateral:
+                    source_arrays = _contralateral_source_arrays_for_window(
+                        record=record,
+                        window=window,
+                        crop_options=common_crop_options,
+                        contralateral_lookup=contralateral_lookup,
+                        get_preprocessed=get_preprocessed,
+                    )
+                save_info = _save_export_images(crop_result.image, crop_root, rel_img_path, config, source_arrays=source_arrays)
 
                 labels_path = crop_root / "labels" / split_name / f"{Path(filename).stem}.txt"
                 _write_yolo_label_file(labels_path, boxes, width=crop_size, height=crop_size, save_empty=save_empty_labels)
@@ -549,6 +579,60 @@ def _windows_for_export_split(
     return windows
 
 
+def _opposite_laterality(value: Any) -> str | None:
+    text = str(value or "").strip().upper()
+    if text.startswith("L"):
+        return "R"
+    if text.startswith("R"):
+        return "L"
+    return None
+
+
+def _build_contralateral_record_lookup(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for record in records:
+        study = str(record.get("study_id", ""))
+        view = str(record.get("view_position", "")).upper().strip()
+        lat = str(record.get("laterality", "")).upper().strip()[:1]
+        if study and view and lat in {"L", "R"}:
+            by_key[(study, view, lat)] = record
+
+    lookup: dict[str, dict[str, Any]] = {}
+    for record in records:
+        image_id = str(record.get("image_id", ""))
+        study = str(record.get("study_id", ""))
+        view = str(record.get("view_position", "")).upper().strip()
+        opposite = _opposite_laterality(record.get("laterality"))
+        if image_id and opposite:
+            paired = by_key.get((study, view, opposite))
+            if paired is not None:
+                lookup[image_id] = paired
+    return lookup
+
+
+def _contralateral_source_arrays_for_window(
+    *,
+    record: dict[str, Any],
+    window: tuple[int, int, int, int],
+    crop_options: dict[str, Any],
+    contralateral_lookup: dict[str, dict[str, Any]],
+    get_preprocessed,
+) -> dict[str, np.ndarray]:
+    paired_record = contralateral_lookup.get(str(record.get("image_id", "")))
+    if paired_record is None:
+        return {}
+    paired_image, _paired_target = get_preprocessed(paired_record)
+    empty_boxes = torch.zeros((0, 4), dtype=torch.float32)
+    paired_crop = crop_image_and_boxes_to_window(
+        paired_image,
+        boxes=empty_boxes,
+        mass_boxes=empty_boxes,
+        window_xyxy=window,
+        options=crop_options,
+    )
+    return {"contralateral_same_view_crop": _tensor_to_float2d(paired_crop.image)}
+
+
 def export_baseline_dataset(
     dataset: VindrMammoDataset,
     split_records: dict[str, list[dict[str, Any]]],
@@ -566,6 +650,26 @@ def export_baseline_dataset(
     metadata_rows: list[dict[str, Any]] = []
     image_id_counter = 1
     ann_id_counter = 1
+    # Keep a tiny cache only. A full VinDr export can contain thousands of large
+    # mammograms, so caching every tensor would consume too much RAM. The small
+    # cache still avoids immediate rereads when paired views are processed near
+    # each other.
+    preprocessed_cache: OrderedDict[str, tuple[torch.Tensor, dict[str, Any]]] = OrderedDict()
+    max_preprocessed_cache_items = int(crop_cfg.get("contralateral_preprocessed_cache_items", 8))
+    contralateral_lookup = _build_contralateral_record_lookup(dataset.image_records)
+    needs_contralateral = _config_uses_contralateral_source(config)
+
+    def get_preprocessed(record_: dict[str, Any]) -> tuple[torch.Tensor, dict[str, Any]]:
+        key = str(record_.get("image_id", ""))
+        if key in preprocessed_cache:
+            preprocessed_cache.move_to_end(key)
+            return preprocessed_cache[key]
+        value = dataset._read_preprocessed_record_no_square(record_)
+        preprocessed_cache[key] = value
+        preprocessed_cache.move_to_end(key)
+        while len(preprocessed_cache) > max(1, max_preprocessed_cache_items):
+            preprocessed_cache.popitem(last=False)
+        return value
 
     for split_name in ["train", "val", "test"]:
         records = split_records.get(split_name, [])
@@ -632,7 +736,14 @@ def export_baseline_dataset(
 # -----------------------------------------------------------------------------
 
 
-def _save_export_images(image: torch.Tensor, root: Path, rel_img_path: Path, config: dict[str, Any]) -> dict[str, Any]:
+def _save_export_images(
+    image: torch.Tensor,
+    root: Path,
+    rel_img_path: Path,
+    config: dict[str, Any],
+    *,
+    source_arrays: dict[str, np.ndarray] | None = None,
+) -> dict[str, Any]:
     """Save the model-training RGB image and, optionally, a preserved 16-bit PNG."""
     img_cfg = config.get("image_export", {})
     preserved_cfg = config.get("preserved_16bit", {})
@@ -641,7 +752,7 @@ def _save_export_images(image: torch.Tensor, root: Path, rel_img_path: Path, con
     train_path.parent.mkdir(parents=True, exist_ok=True)
 
     arr = _tensor_to_float2d(image)
-    rgb, rgb_meta = _make_rgb_image(arr, config)
+    rgb, rgb_meta = _make_rgb_image(arr, config, source_arrays=source_arrays)
     Image.fromarray(rgb, mode="RGB").save(train_path)
 
     out: dict[str, Any] = {
@@ -673,7 +784,12 @@ def _tensor_to_float2d(image: torch.Tensor) -> np.ndarray:
     return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def _make_rgb_image(arr: np.ndarray, config: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]]:
+def _make_rgb_image(
+    arr: np.ndarray,
+    config: dict[str, Any],
+    *,
+    source_arrays: dict[str, np.ndarray] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
     """Return an 8-bit RGB image according to ``image_export.rgb_scheme``.
 
     Recommended default: ``multi_window``. It creates three visually meaningful
@@ -703,7 +819,7 @@ def _make_rgb_image(arr: np.ndarray, config: dict[str, Any]) -> tuple[np.ndarray
         meta.update(ieg_meta)
 
     elif scheme in {"custom_channel_pipeline", "gui_channel_pipeline"}:
-        channels, custom_meta = _make_custom_channel_pipeline_rgb(arr, img_cfg, mask)
+        channels, custom_meta = _make_custom_channel_pipeline_rgb(arr, img_cfg, mask, source_arrays=source_arrays)
         meta.update(custom_meta)
 
     elif scheme == "bitpack16":
@@ -752,10 +868,35 @@ def _make_rgb_image(arr: np.ndarray, config: dict[str, Any]) -> tuple[np.ndarray
 
 
 
+def _custom_channel_source(pipeline: dict[str, Any], channel: str) -> str:
+    value = pipeline.get(channel, {})
+    if isinstance(value, dict):
+        return str(value.get("source", "current_crop"))
+    return "current_crop"
+
+
+def _custom_channel_steps(pipeline: dict[str, Any], channel: str) -> list[dict[str, Any]]:
+    value = pipeline.get(channel, [])
+    if isinstance(value, dict):
+        return list(value.get("steps", []) or [])
+    return list(value or [])
+
+
+def _config_uses_contralateral_source(config: dict[str, Any]) -> bool:
+    img_cfg = config.get("image_export", {}) or {}
+    scheme = str(img_cfg.get("rgb_scheme", "multi_window")).casefold().strip()
+    if scheme not in {"custom_channel_pipeline", "gui_channel_pipeline"}:
+        return False
+    pipeline = img_cfg.get("custom_channel_pipeline", {}) or {}
+    return any(_custom_channel_source(pipeline, ch) == "contralateral_same_view_crop" for ch in ["R", "G", "B"])
+
+
 def _make_custom_channel_pipeline_rgb(
     arr: np.ndarray,
     img_cfg: dict[str, Any],
     mask: np.ndarray,
+    *,
+    source_arrays: dict[str, np.ndarray] | None = None,
 ) -> tuple[list[np.ndarray], dict[str, Any]]:
     """Create RGB channels using a GUI-exported per-channel operation pipeline.
 
@@ -772,10 +913,20 @@ def _make_custom_channel_pipeline_rgb(
         "rgb_channel_1": "custom_G_pipeline",
         "rgb_channel_2": "custom_B_pipeline",
     }
+    source_arrays = dict(source_arrays or {})
+    source_arrays.setdefault("current_crop", arr)
     for channel in ["R", "G", "B"]:
-        work = np.asarray(arr, dtype=np.float32).copy()
+        source_name = _custom_channel_source(pipeline, channel)
+        if source_name not in source_arrays or source_arrays.get(source_name) is None:
+            work = np.asarray(arr, dtype=np.float32).copy()
+            source_used = "current_crop"
+            source_fallback = True
+        else:
+            work = np.asarray(source_arrays[source_name], dtype=np.float32).copy()
+            source_used = source_name
+            source_fallback = False
         applied: list[dict[str, Any]] = []
-        for step in list(pipeline.get(channel, []) or []):
+        for step in _custom_channel_steps(pipeline, channel):
             if not isinstance(step, dict):
                 continue
             op = str(step.get("op", "none")).casefold().strip()
@@ -785,6 +936,9 @@ def _make_custom_channel_pipeline_rgb(
             work = _apply_custom_channel_operation(work, op, params, mask)
             applied.append({"op": op, "params": params})
         channels.append(_float_to_uint8_custom(work))
+        meta[f"custom_{channel}_source_requested"] = source_name
+        meta[f"custom_{channel}_source_used"] = source_used
+        meta[f"custom_{channel}_source_fallback"] = int(source_fallback)
         meta[f"custom_{channel}_steps"] = applied
     return channels, meta
 
@@ -813,6 +967,9 @@ def _apply_custom_channel_operation(
         return ((z + limit) / (2.0 * limit)).astype(np.float32)
     if op == "standardize_to_target":
         return _standardize_to_target_custom(arr, params, mask)
+    if op == "aggressive_upper_percentile_normalize":
+        lo, hi = _safe_percentile(arr, params.get("percentiles", [70.0, 100.0]), mask)
+        return ((np.clip(arr, lo, hi) - lo) / max(hi - lo, 1e-12)).astype(np.float32)
     if op == "hist_equalize":
         return _equalize_uint8(_float_to_uint8_custom(arr), mask=mask).astype(np.float32) / 255.0
     if op == "clahe":
@@ -1103,7 +1260,11 @@ def _safe_percentile(arr: np.ndarray, percentiles: Iterable[float], mask: np.nda
     pixels = arr[mask] if mask is not None and mask.any() else arr[np.isfinite(arr)]
     if pixels.size == 0:
         return 0.0, 1.0
-    lo, hi = np.percentile(pixels, [float(p[0]), float(p[1])])
+    p0, p1 = float(p[0]), float(p[1])
+    # Allow user-facing fractional notation: [0.7, 1.0] means [70, 100] percentiles.
+    if 0.0 <= p0 <= 1.0 and 0.0 <= p1 <= 1.0:
+        p0, p1 = 100.0 * p0, 100.0 * p1
+    lo, hi = np.percentile(pixels, [p0, p1])
     lo = float(lo)
     hi = float(hi)
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:

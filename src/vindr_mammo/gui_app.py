@@ -175,10 +175,14 @@ def _current_preprocessing_yaml_payload(
             "show_individual_processed_channels": bool(display_controls.get("show_channel_panels", False)),
         },
         "rgb_channel_pipeline": {
-            "description": "Each channel starts from the selected fixed-preprocessed grayscale crop, then applies these steps in order.",
-            "R": list(pipeline.get("R", [])),
-            "G": list(pipeline.get("G", [])),
-            "B": list(pipeline.get("B", [])),
+            "description": (
+                "Each channel has a source crop plus an ordered operation list. "
+                "source=current_crop uses the selected crop. "
+                "source=contralateral_same_view_crop uses the same xyxy window from the opposite breast with the same view."
+            ),
+            "R": _pipeline_channel_payload(pipeline, "R"),
+            "G": _pipeline_channel_payload(pipeline, "G"),
+            "B": _pipeline_channel_payload(pipeline, "B"),
         },
         "export_config_patch": {
             "preprocess": dict(cfg.get("preprocess", {}) or {}),
@@ -200,9 +204,9 @@ def _current_preprocessing_yaml_payload(
             "image_export": {
                 "rgb_scheme": "custom_channel_pipeline",
                 "custom_channel_pipeline": {
-                    "R": list(pipeline.get("R", [])),
-                    "G": list(pipeline.get("G", [])),
-                    "B": list(pipeline.get("B", [])),
+                    "R": _pipeline_channel_payload(pipeline, "R"),
+                    "G": _pipeline_channel_payload(pipeline, "G"),
+                    "B": _pipeline_channel_payload(pipeline, "B"),
                 },
             },
         },
@@ -657,15 +661,43 @@ OP_NAMES = [
 
 
 def _pipeline_controls() -> dict[str, Any]:
+    default_channel_sources = {
+        "R": "current_crop",
+        "G": "current_crop",
+        "B": "contralateral_same_view_crop",
+    }
     default_channel_steps = {
-        "R": ["percentile_normalize"],
-        "G": ["percentile_normalize", "hist_equalize"],
-        "B": ["percentile_normalize", "sobel_gradient"],
+        "R": ["percentile_normalize", "hist_equalize", "standardize_to_target"],
+        "G": ["percentile_normalize", "hist_equalize", "percentile_normalize", "hist_equalize", "standardize_to_target"],
+        "B": ["percentile_normalize", "hist_equalize", "standardize_to_target"],
+    }
+    source_options = {
+        "current_crop": "current crop",
+        "contralateral_same_view_crop": "opposite breast, same view, same xyxy crop",
     }
     pipeline: dict[str, Any] = {}
     for channel in ["R", "G", "B"]:
         with st.sidebar.expander(f"{channel} channel", expanded=(channel == "R")):
-            n_steps = st.number_input(f"Number of steps ({channel})", min_value=0, max_value=8, value=len(default_channel_steps[channel]), key=f"{channel}_n_steps")
+            default_source = default_channel_sources[channel]
+            source_label = st.selectbox(
+                f"Source ({channel})",
+                options=list(source_options.values()),
+                index=list(source_options.keys()).index(default_source),
+                key=f"{channel}_source",
+                help=(
+                    "Use the selected crop, or use the same crop coordinates from the opposite breast "
+                    "with the same view position in the same study. The opposite-breast source is computed "
+                    "after fixed preprocessing, so MONOCHROME1 correction and optional mirroring are applied first."
+                ),
+            )
+            source = {v: k for k, v in source_options.items()}[source_label]
+            n_steps = st.number_input(
+                f"Number of steps ({channel})",
+                min_value=0,
+                max_value=10,
+                value=len(default_channel_steps[channel]),
+                key=f"{channel}_n_steps",
+            )
             steps = []
             for i in range(int(n_steps)):
                 default_op = default_channel_steps[channel][i] if i < len(default_channel_steps[channel]) else "none"
@@ -677,14 +709,48 @@ def _pipeline_controls() -> dict[str, Any]:
                 )
                 params = _op_parameter_controls(channel, i, op)
                 steps.append({"op": op, "params": params})
-            pipeline[channel] = steps
+            pipeline[channel] = {"source": source, "steps": steps}
     return pipeline
 
+
+def _pipeline_channel_payload(pipeline: dict[str, Any], channel: str) -> dict[str, Any]:
+    value = pipeline.get(channel, {})
+    if isinstance(value, dict):
+        return {
+            "source": str(value.get("source", "current_crop")),
+            "steps": list(value.get("steps", []) or []),
+        }
+    return {"source": "current_crop", "steps": list(value or [])}
+
+
+def _channel_source(pipeline: dict[str, Any], channel: str) -> str:
+    value = pipeline.get(channel, {})
+    if isinstance(value, dict):
+        return str(value.get("source", "current_crop"))
+    return "current_crop"
+
+
+def _channel_steps(pipeline: dict[str, Any], channel: str) -> list[dict[str, Any]]:
+    value = pipeline.get(channel, [])
+    if isinstance(value, dict):
+        return list(value.get("steps", []) or [])
+    return list(value or [])
+
+
+def _pipeline_uses_contralateral(pipeline: dict[str, Any]) -> bool:
+    return any(_channel_source(pipeline, ch) == "contralateral_same_view_crop" for ch in ["R", "G", "B"])
 
 def _op_parameter_controls(channel: str, step: int, op: str) -> dict[str, Any]:
     prefix = f"{channel}_{step}_{op}"
     if op in {"percentile_normalize", "percentile_clip_only"}:
-        lo, hi = st.slider("Percentile window", 0.0, 100.0, (1.0, 99.0), 0.5, key=f"{prefix}_win")
+        default_window = (70.0, 100.0) if channel == "G" and step == 2 and op == "percentile_normalize" else (1.0, 99.0)
+        help_text = (
+            "This is a normal percentile stretch. For the default G channel, the second percentile_normalize "
+            "uses [70, 100] to emphasize bright/high-density regions, replacing the old redundant "
+            "aggressive_upper_percentile_normalize operation."
+            if default_window == (70.0, 100.0) else None
+        )
+        lo, hi = st.slider("Percentile window", 0.0, 100.0, default_window, 0.5, key=f"{prefix}_win", help=help_text)
         return {"percentiles": [float(lo), float(hi)]}
     if op == "zscore_clip":
         limit = st.slider("Z-score clip", 0.5, 10.0, 3.0, 0.5, key=f"{prefix}_z")
@@ -796,7 +862,7 @@ def _render_single_mode(
         key="single_image_index_inline",
     )
     selected_row = filtered.iloc[int(selected_pos)]
-    result = _prepare_sample(dataset, int(selected_row["record_index"]), crop_controls, crop_index=None)
+    result = _prepare_sample(dataset, int(selected_row["record_index"]), crop_controls, crop_index=None, need_contralateral=False)
     crops = result["crops"]
     if not crops:
         st.write(f"Crops available after crop filter: **0**")
@@ -813,7 +879,7 @@ def _render_single_mode(
         step=1,
         key="single_crop_index_inline",
     )
-    result = _prepare_sample(dataset, int(selected_row["record_index"]), crop_controls, crop_index=int(crop_idx))
+    result = _prepare_sample(dataset, int(selected_row["record_index"]), crop_controls, crop_index=int(crop_idx), need_contralateral=_pipeline_uses_contralateral(pipeline))
     _show_sample(result, pipeline, show_annotations=show_annotations, display_window=display_window, display_controls=display_controls)
 
 
@@ -851,7 +917,7 @@ def _render_comparison_mode(
                 key=f"cmp_{slot_idx}_imgidx",
             )
             row = filtered.iloc[int(img_idx)]
-            tmp = _prepare_sample(dataset, int(row["record_index"]), crop_controls, crop_index=None)
+            tmp = _prepare_sample(dataset, int(row["record_index"]), crop_controls, crop_index=None, need_contralateral=False)
             crop_count = len(tmp["crops"])
             crop_label_col, crop_idx_col = st.columns([1.15, 0.85], vertical_alignment="bottom")
             crop_label_col.caption(f"{crop_count} crops")
@@ -867,7 +933,7 @@ def _render_comparison_mode(
                 1,
                 key=f"cmp_{slot_idx}_cropidx",
             )
-            results.append(_prepare_sample(dataset, int(row["record_index"]), crop_controls, crop_index=int(cidx)))
+            results.append(_prepare_sample(dataset, int(row["record_index"]), crop_controls, crop_index=int(cidx), need_contralateral=_pipeline_uses_contralateral(pipeline)))
 
     valid_results = [r for r in results if r is not None]
     if len(valid_results) >= 2:
@@ -905,7 +971,11 @@ def _show_comparison_statistics(results: list[dict[str, Any]], pipeline: dict[st
     histograms: dict[str, dict[str, np.ndarray]] = {}
     for i, result in enumerate(results):
         slot_name = f"slot_{i + 1}"
-        processed_rgb, _meta = apply_channel_pipeline(result["crop_image"], pipeline)
+        processed_rgb, _meta = apply_channel_pipeline(
+            result["crop_image"],
+            pipeline,
+            source_crops=_source_crops_from_result(result),
+        )
         row, hists = _comparison_features_for_sample(slot_name, result, processed_rgb)
         feature_rows.append(row)
         histograms[slot_name] = hists
@@ -1127,6 +1197,39 @@ def _record_filter_controls(records_df: pd.DataFrame, *, prefix: str, compact: b
 
 
 # -----------------------------------------------------------------------------
+# Contralateral pairing
+# -----------------------------------------------------------------------------
+
+
+def _opposite_laterality(value: Any) -> str | None:
+    text = str(value or "").strip().upper()
+    if text.startswith("L"):
+        return "R"
+    if text.startswith("R"):
+        return "L"
+    return None
+
+
+def _find_contralateral_record_index(dataset: VindrMammoDataset, record: dict[str, Any]) -> int | None:
+    opposite = _opposite_laterality(record.get("laterality"))
+    if opposite is None:
+        return None
+    study_id = str(record.get("study_id", ""))
+    view = str(record.get("view_position", "")).upper().strip()
+    current_image_id = str(record.get("image_id", ""))
+    for idx, candidate in enumerate(dataset.image_records):
+        if str(candidate.get("image_id", "")) == current_image_id:
+            continue
+        if str(candidate.get("study_id", "")) != study_id:
+            continue
+        if str(candidate.get("view_position", "")).upper().strip() != view:
+            continue
+        if str(candidate.get("laterality", "")).upper().strip().startswith(opposite):
+            return int(idx)
+    return None
+
+
+# -----------------------------------------------------------------------------
 # Sample preparation
 # -----------------------------------------------------------------------------
 
@@ -1172,7 +1275,14 @@ def _dataset_cache_key(dataset: VindrMammoDataset) -> str:
     }, sort_keys=True, default=_json_default)
 
 
-def _prepare_sample(dataset: VindrMammoDataset, record_index: int, crop_controls: dict[str, Any], crop_index: int | None) -> dict[str, Any]:
+def _prepare_sample(
+    dataset: VindrMammoDataset,
+    record_index: int,
+    crop_controls: dict[str, Any],
+    crop_index: int | None,
+    *,
+    need_contralateral: bool = False,
+) -> dict[str, Any]:
     loaded = _read_preprocessed_cached(dataset, _dataset_cache_key(dataset), int(record_index))
     image = loaded["image"]
     boxes = torch.as_tensor(loaded["all_boxes"], dtype=torch.float32)
@@ -1246,6 +1356,36 @@ def _prepare_sample(dataset: VindrMammoDataset, record_index: int, crop_controls
                 threshold=crop_controls.get("foreground_threshold"),
             )
 
+    contralateral_crop_image = None
+    contralateral_info: dict[str, Any] = {"requested": bool(need_contralateral), "found": False}
+    if need_contralateral and selected is not None and crop_image is not None:
+        contralateral_index = _find_contralateral_record_index(dataset, loaded["record"])
+        contralateral_info["record_index"] = contralateral_index
+        if contralateral_index is not None:
+            paired = _read_preprocessed_cached(dataset, _dataset_cache_key(dataset), int(contralateral_index))
+            paired_image = paired["image"]
+            image_tensor = torch.from_numpy(np.ascontiguousarray(paired_image)).unsqueeze(0)
+            empty_boxes = torch.zeros((0, 4), dtype=torch.float32)
+            paired_crop_result = crop_image_and_boxes_to_window(
+                image_tensor,
+                boxes=empty_boxes,
+                mass_boxes=empty_boxes,
+                window_xyxy=selected["window"],
+                options=crop_controls["crop_options"],
+            )
+            contralateral_crop_image = paired_crop_result.image.detach().cpu().squeeze(0).numpy().astype(np.float32, copy=False)
+            paired_summary = paired.get("target_summary", {}) or {}
+            contralateral_info.update({
+                "found": True,
+                "image_id": paired_summary.get("image_id"),
+                "laterality": paired_summary.get("laterality"),
+                "view_position": paired_summary.get("view_position"),
+            })
+        else:
+            # Keep the display/export robust. The metadata makes the fallback explicit.
+            contralateral_crop_image = crop_image.copy()
+            contralateral_info["fallback"] = "current_crop"
+
     summary = loaded["target_summary"]
     title = (
         f"image_id={summary.get('image_id')} | study={summary.get('study_id')} | "
@@ -1262,6 +1402,8 @@ def _prepare_sample(dataset: VindrMammoDataset, record_index: int, crop_controls
         "crop_mass_boxes": crop_mass_boxes,
         "foreground_mask_crop": foreground_mask_crop,
         "show_foreground_mask_preview": bool(crop_controls.get("foreground_mask_preview", False)),
+        "contralateral_crop_image": contralateral_crop_image,
+        "contralateral_info": contralateral_info,
         "record_index": int(record_index),
     }
 
@@ -1290,7 +1432,7 @@ def _show_sample(
     selected = result["selected_crop"] or {}
     window = selected.get("window")
 
-    processed_rgb, processing_meta = apply_channel_pipeline(crop, pipeline)
+    processed_rgb, processing_meta = apply_channel_pipeline(crop, pipeline, source_crops=_source_crops_from_result(result))
     display_controls = display_controls or {"visible_channels": ["R", "G", "B"], "show_channel_panels": False}
     visible_channels = display_controls.get("visible_channels", ["R", "G", "B"]) or []
     processed_rgb_display = _mask_rgb_channels(processed_rgb, visible_channels)
@@ -1425,13 +1567,39 @@ def _plot_normalized_hist(ax, arr: np.ndarray, *, bins: np.ndarray, alpha: float
 # -----------------------------------------------------------------------------
 
 
-def apply_channel_pipeline(crop_float: np.ndarray, pipeline: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]]:
+def _source_crops_from_result(result: dict[str, Any]) -> dict[str, np.ndarray]:
+    crop = result.get("crop_image")
+    contralateral = result.get("contralateral_crop_image")
+    out: dict[str, np.ndarray] = {"current_crop": crop}
+    if contralateral is not None:
+        out["contralateral_same_view_crop"] = contralateral
+    return out
+
+
+def apply_channel_pipeline(
+    crop_float: np.ndarray,
+    pipeline: dict[str, Any],
+    *,
+    source_crops: dict[str, np.ndarray] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    source_crops = dict(source_crops or {})
+    source_crops.setdefault("current_crop", crop_float)
     channels = []
     meta = {"channels": {}}
     for channel in ["R", "G", "B"]:
-        arr = np.asarray(crop_float, dtype=np.float32).copy()
+        source_name = _channel_source(pipeline, channel)
+        if source_name not in source_crops or source_crops.get(source_name) is None:
+            # Robust fallback: if the paired opposite breast is missing, keep the GUI/export usable.
+            source_name_used = "current_crop"
+            arr = np.asarray(source_crops["current_crop"], dtype=np.float32).copy()
+            source_fallback = True
+        else:
+            source_name_used = source_name
+            arr = np.asarray(source_crops[source_name], dtype=np.float32).copy()
+            source_fallback = False
+
         applied = []
-        for step in pipeline.get(channel, []):
+        for step in _channel_steps(pipeline, channel):
             op = step.get("op", "none")
             params = step.get("params", {}) or {}
             if op == "none":
@@ -1440,9 +1608,13 @@ def apply_channel_pipeline(crop_float: np.ndarray, pipeline: dict[str, Any]) -> 
             applied.append({"op": op, "params": params})
         ch = _float_to_uint8(arr)
         channels.append(ch)
-        meta["channels"][channel] = applied
+        meta["channels"][channel] = {
+            "source_requested": source_name,
+            "source_used": source_name_used,
+            "source_fallback": source_fallback,
+            "steps": applied,
+        }
     return np.stack(channels, axis=-1).astype(np.uint8, copy=False), meta
-
 
 def _apply_operation(arr: np.ndarray, op: str, params: dict[str, Any]) -> np.ndarray:
     arr = np.nan_to_num(np.asarray(arr, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
@@ -1460,6 +1632,8 @@ def _apply_operation(arr: np.ndarray, op: str, params: dict[str, Any]) -> np.nda
         return ((z + limit) / max(2 * limit, 1e-12)).astype(np.float32)
     if op == "standardize_to_target":
         return _standardize_to_target(arr, params)
+    if op == "aggressive_upper_percentile_normalize":
+        return _normalize_percentile(arr, params.get("percentiles", [70.0, 100.0]))
     if op == "hist_equalize":
         return _equalize(_float_to_uint8(arr)).astype(np.float32) / 255.0
     if op == "clahe":
@@ -1634,7 +1808,11 @@ def _safe_percentile(arr: np.ndarray, percentiles: list[float] | tuple[float, fl
     finite = arr[np.isfinite(arr)]
     if finite.size == 0:
         return 0.0, 1.0
-    lo, hi = np.percentile(finite, [float(percentiles[0]), float(percentiles[1])])
+    p0, p1 = float(percentiles[0]), float(percentiles[1])
+    # Allow user-facing fractional notation: [0.7, 1.0] means [70, 100] percentiles.
+    if 0.0 <= p0 <= 1.0 and 0.0 <= p1 <= 1.0:
+        p0, p1 = 100.0 * p0, 100.0 * p1
+    lo, hi = np.percentile(finite, [p0, p1])
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
         lo, hi = float(np.min(finite)), float(np.max(finite))
     if hi <= lo:

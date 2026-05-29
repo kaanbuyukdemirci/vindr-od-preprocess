@@ -233,3 +233,54 @@ Lower values mean the selected images are more similar statistically. These metr
 - Single-image and comparison-slot index controls are now placed beside their corresponding image/crop status text instead of appearing as a disconnected control below the selector.
 - Added `standardize_to_target` as a per-channel preprocessing step. It estimates the current channel mean and standard deviation, optionally using only a percentile-trimmed pixel range, then applies `y = a*x + b` with `a = target_std / current_std` and `b = target_mean - a * current_mean`.
 - The same `standardize_to_target` operation is supported by the exporter when using `image_export.rgb_scheme: custom_channel_pipeline`.
+
+
+## Contralateral same-view channel source
+
+Version 0.30 adds a channel source called `contralateral_same_view_crop`. This is not a normal filter. It changes where a channel starts from:
+
+- `current_crop`: the selected crop from the current image,
+- `contralateral_same_view_crop`: the same `[xmin, ymin, xmax, ymax]` crop window from the opposite breast in the same study and the same view position.
+
+The default GUI/export pipeline is now:
+
+```yaml
+image_export:
+  rgb_scheme: custom_channel_pipeline
+  custom_channel_pipeline:
+    R:
+      source: current_crop
+      steps:
+        - op: percentile_normalize
+          params: {percentiles: [1.0, 99.0]}
+        - op: hist_equalize
+          params: {}
+        - op: standardize_to_target
+          params: {target_mean: 0.5, target_std: 0.2, stat_percentiles: [1.0, 99.0], clip_output: true}
+    G:
+      source: current_crop
+      steps:
+        - op: percentile_normalize
+          params: {percentiles: [1.0, 99.0]}
+        - op: hist_equalize
+          params: {}
+        - op: percentile_normalize
+          params: {percentiles: [70.0, 100.0]}
+        - op: hist_equalize
+          params: {}
+        - op: standardize_to_target
+          params: {target_mean: 0.5, target_std: 0.2, stat_percentiles: [1.0, 99.0], clip_output: true}
+    B:
+      source: contralateral_same_view_crop
+      steps:
+        - op: percentile_normalize
+          params: {percentiles: [1.0, 99.0]}
+        - op: hist_equalize
+          params: {}
+        - op: standardize_to_target
+          params: {target_mean: 0.5, target_std: 0.2, stat_percentiles: [1.0, 99.0], clip_output: true}
+```
+
+The pairing key is `study_id + view_position + opposite laterality`. If the opposite image is missing, the code falls back to the current crop and records the fallback in metadata so the GUI/export does not crash.
+
+The old `aggressive_upper_percentile_normalize` operation is no longer used in the default pipeline because it is equivalent to a normal `percentile_normalize` step with `percentiles: [70.0, 100.0]`. It is still supported as a legacy alias so older GUI-exported YAML files keep working.

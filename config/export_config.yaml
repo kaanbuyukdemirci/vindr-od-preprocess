@@ -1,169 +1,175 @@
-# VinDr-Mammo export configuration for the third square-crop dataset (-v3).
-# Goal:
-#   Train split: deterministic sliding-window crops, but keep ONLY positive crops.
-#                A positive crop means at least one mass bounding box remains after
-#                applying the crop annotation policy below.
-#   Val/test:    deterministic sliding-window crops with empty windows included,
-#                so evaluation still reflects the realistic detection task.
-# Run with one of:
-#   python main.py
-#   vindr-mammo-export --config config/export_config.yaml
+# VinDr-Mammo export configuration for the contralateral-channel experiment.
+# Default RGB scheme:
+#   R = current crop: percentile normalization -> histogram equalization -> standardization
+#   G = current crop: percentile normalization -> histogram equalization -> upper-percentile normalization -> histogram equalization -> standardization
+#   B = opposite breast, same view, same xyxy crop: percentile normalization -> histogram equalization -> standardization
+# Notes:
+#   The opposite-breast channel is paired by study_id + view_position + opposite laterality.
+#   Fixed preprocessing is applied before pairing/cropping, including MONOCHROME1 correction and optional mirroring.
 
 paths:
-  # Folder containing metadata.csv, breast-level_annotations.csv,
-  # finding_annotations.csv, and images/<study_id>/<image_id>.dicom
-  data_root: "/mnt/t9/vindr"
-
-  # New output folder for this experiment. The -v3 suffix is intentional.
-  output_root: "/mnt/t9/preprocessed-vindr-v3"
-
+  data_root: /mnt/t9/vindr
+  output_root: /mnt/t9/preprocessed-vindr-v3
 runtime:
   show_progress: true
-
 image:
-  # Keep numeric DICOM values until export-time windowing.
-  normalize: "none"
-  percentile_range: [0.5, 99.5]
+  normalize: none
+  percentile_range:
+  - 0.5
+  - 99.5
   use_voi_lut: false
-
 preprocess:
-  # Applied before square-crop export.
   invert_to_black_background: true
-  # Set crop_breast=false when you want to keep the full detector image and
-  # use the deterministic foreground-ratio square-crop filter below instead.
   crop_breast: true
   mirror_right_to_left: true
   crop_padding: 20
   crop_threshold: null
-
 image_export:
-  # RGB training PNGs: R = intensity, G = equalized intensity, B = Sobel gradient.
-  rgb_scheme: "intensity_equalized_gradient"
-
-  # Used only when rgb_scheme = "multi_window".
+  rgb_scheme: custom_channel_pipeline
   multi_window_percentiles:
-    - [0.5, 99.5]
-    - [1.0, 99.0]
-    - [2.0, 98.0]
-
-  # Used by grayscale_rgb, equalized_rgb, and fallback paths.
-  single_window: [1.0, 99.0]
-
-  # Used when rgb_scheme = "intensity_equalized_gradient".
+  - - 0.5
+    - 99.5
+  - - 1.0
+    - 99.0
+  - - 2.0
+    - 98.0
+  single_window:
+  - 1.0
+  - 99.0
   intensity_equalized_gradient:
-    intensity_window: [1.0, 99.0]
-    gradient_source: "normal"     # "normal" or "equalized"
-    gradient_window: [1.0, 99.0]
+    intensity_window:
+    - 1.0
+    - 99.0
+    gradient_source: normal
+    gradient_window:
+    - 1.0
+    - 99.0
     gradient_ksize: 3
-
+  custom_channel_pipeline:
+    R:
+      source: current_crop
+      steps:
+      - op: percentile_normalize
+        params:
+          percentiles:
+          - 1.0
+          - 99.0
+      - op: hist_equalize
+        params: {}
+      - op: standardize_to_target
+        params:
+          target_mean: 0.5
+          target_std: 0.2
+          stat_percentiles:
+          - 1.0
+          - 99.0
+          clip_output: true
+    G:
+      source: current_crop
+      steps:
+      - op: percentile_normalize
+        params:
+          percentiles:
+          - 1.0
+          - 99.0
+      - op: hist_equalize
+        params: {}
+      - op: percentile_normalize
+        params:
+          percentiles:
+          - 70.0
+          - 100.0
+      - op: hist_equalize
+        params: {}
+      - op: standardize_to_target
+        params:
+          target_mean: 0.5
+          target_std: 0.2
+          stat_percentiles:
+          - 1.0
+          - 99.0
+          clip_output: true
+    B:
+      source: contralateral_same_view_crop
+      steps:
+      - op: percentile_normalize
+        params:
+          percentiles:
+          - 1.0
+          - 99.0
+      - op: hist_equalize
+        params: {}
+      - op: standardize_to_target
+        params:
+          target_mean: 0.5
+          target_std: 0.2
+          stat_percentiles:
+          - 1.0
+          - 99.0
+          clip_output: true
+  contralateral_note: B channel uses the same crop coordinates from the opposite breast with the same view position when available.
 histogram_equalization:
-  # For rgb_scheme="intensity_equalized_gradient", the second channel is already
-  # equalized inside the scheme, so this global post-equalization is skipped.
-  enabled: true
-  apply_to: "third_channel"       # "all_channels", "third_channel", or "none"
-
+  enabled: false
+  apply_to: third_channel
 preserved_16bit:
-  # Save 16-bit grayscale PNGs for inspection/data integrity, not YOLO input.
   save: true
-  percentile_range: [0.1, 99.9]
+  percentile_range:
+  - 0.1
+  - 99.9
   use_foreground_mask: true
-
 metadata:
   save_full_source_csvs: true
   include_dicom_meta: true
-
 splits:
-  # Keep official VinDr test as test, then split official training studies into
-  # train and validation at study level.
   val_fraction_from_training: 0.15
   seed: 123
-
 export:
-  # Keep false unless you intentionally want to delete output_root before export.
   clean_output_root: false
   save_square_crops: true
-
-  # Disable baseline export for this experiment. This run is only the -v3 crop dataset.
   save_baseline_uncropped: false
-
-  # Empty label files are still written for val/test empty crops. The train split
-  # should have no empty crops when train_deterministic_include_empty=false.
   save_empty_label_files: true
-
 square_crops:
-  # Final n x n object-detection crops after preprocessing.
   crop_size: 1024
   stride: 512
-
-  # All splits use deterministic sliding windows.
-  train_crop_mode: "deterministic"
-  val_crop_mode: "deterministic"
-  test_crop_mode: "deterministic"
-
-  # Global default for deterministic crops. Leave true so val/test include all windows.
+  train_crop_mode: deterministic
+  val_crop_mode: deterministic
+  test_crop_mode: deterministic
   deterministic_include_empty: true
-
-  # Critical v3 setting: train is deterministic, but positive-only.
-  # This removes deterministic train windows whose final crop contains no mass box.
   train_deterministic_include_empty: false
-
-  # Keep validation/test realistic by including empty sliding windows.
   val_deterministic_include_empty: true
   test_deterministic_include_empty: true
-
   deterministic_max_windows_per_image: null
   train_deterministic_max_windows_per_image: null
   val_deterministic_max_windows_per_image: null
   test_deterministic_max_windows_per_image: null
-
-  # Optional deterministic foreground-ratio filter. When enabled, each n x n
-  # deterministic crop is kept only if at least this fraction of its pixels looks
-  # like breast foreground. This is useful for experiments where preprocess.crop_breast
-  # is false, because it removes pure-background detector windows without first
-  # cropping the whole mammogram to the breast box.
   deterministic_require_foreground: false
   deterministic_min_foreground_fraction: 0.05
   deterministic_foreground_threshold: null
-
-  # Optional split-specific overrides. Leave null to use the global values above.
   train_deterministic_require_foreground: null
   val_deterministic_require_foreground: null
   test_deterministic_require_foreground: null
   train_deterministic_min_foreground_fraction: null
   val_deterministic_min_foreground_fraction: null
   test_deterministic_min_foreground_fraction: null
-
-  # Random crop options below are ignored while all split crop modes are deterministic.
-  # They are kept so you can switch train_crop_mode back to "random" later.
   random_crops_per_annotation: 5
   balance_train_positive_fraction_globally: true
   random_crops_per_negative_image_when_balancing: 0
   random_crops_per_negative_image: 1
-  positive_fraction: 0.80
+  positive_fraction: 0.8
   center_shift_fraction: 0.25
   max_random_tries: 80
   seed: 123
-
-  # If a breast-cropped image is smaller than 1024 in either direction, pad it.
   pad_if_needed: true
   pad_value: 0.0
-
 crop_annotation_policy:
-  # This policy defines whether a crop counts as containing a bounding box.
-  # Current default: a mass annotation is kept only if the full box is inside the crop.
-  # Therefore, train positive-only crops contain complete mass boxes and avoid crops
-  # that cut through a lesion.
   allow_partial_annotations: false
-  min_box_visibility: 0.30
+  min_box_visibility: 0.3
   reject_partial_windows: true
   negative_max_box_visibility: 0.0
-
 dataset:
   validate_paths: false
-
 visualizations:
-  # Fast plots from already-exported CSV/JSON files. No DICOM reread.
-  output_dir: "/mnt/t9/preprocessed-vindr-v3/visualizations"
+  output_dir: /mnt/t9/preprocessed-vindr-v3/visualizations
   include_square_crops: true
   include_baseline_uncropped: false
   write_html_report: true

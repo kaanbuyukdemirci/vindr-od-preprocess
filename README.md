@@ -1246,3 +1246,20 @@ The preprocessing inspector now overlays mass annotations on the individual proc
 ### GUI preprocessing YAML export
 
 The preprocessing inspector GUI now includes an **Export current preprocessing YAML** panel. It downloads the current fixed preprocessing settings, crop preview settings, channel visibility settings, and R/G/B preprocessing pipelines. The exported YAML includes an `export_config_patch` block. The exporter supports `image_export.rgb_scheme: custom_channel_pipeline` for using GUI-designed R/G/B pipelines during dataset export.
+
+
+## Version 0.30 contralateral-channel preprocessing
+
+The default `config/export_config.yaml` now uses `image_export.rgb_scheme: custom_channel_pipeline` with a contralateral same-view source for the B channel. This lets one RGB channel contain the same crop coordinates from the opposite breast in the same study and view, while R and G use the current crop with normal and bright-region preprocessing.
+
+Run the GUI to inspect or edit it:
+
+```bash
+vindr-mammo-gui --config config/export_config.yaml
+```
+
+Then export the dataset:
+
+```bash
+vindr-mammo-export --config config/export_config.yaml
+```
