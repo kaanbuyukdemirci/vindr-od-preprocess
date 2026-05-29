@@ -139,3 +139,9 @@ The metadata/statistics expander shows pixel intensity histograms for the full g
 - the y-axis is relative frequency, not raw pixel count.
 
 This means a full mammogram and a 1024 x 1024 crop can be visually compared without the full image dominating only because it has more pixels.
+
+## Vendor selector notes
+
+The GUI vendor selector is populated from `metadata.csv`. It now checks multiple common column names, including `Manufacturer`, `manufacturer`, `ManufacturerModelName`, `Manufacturer's Model Name`, and normalized variants such as `manufacturer_model_name`. It also falls back to common image identifier columns such as `image_id`, `SOPInstanceUID`, and filename/path stems.
+
+If no manufacturer/model metadata can be matched to the current image records, the selector will show `Unknown` and the Vendor counts expander will make that visible. This means the GUI is working, but the metadata file does not expose usable vendor columns or image identifiers for matching.

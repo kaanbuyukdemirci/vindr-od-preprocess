@@ -177,9 +177,16 @@ def _load_split_records(dataset: VindrMammoDataset, cfg: dict[str, Any]) -> tupl
 
 
 @st.cache_data(show_spinner="Building image filter table...")
-def _build_enriched_record_table_cached(records_json: str, metadata_json: str, findings_json: str, split_df_json: str) -> pd.DataFrame:
+def _build_enriched_record_table_cached(
+    records_json: str,
+    metadata_json: str,
+    metadata_table_json: str,
+    findings_json: str,
+    split_df_json: str,
+) -> pd.DataFrame:
     records = pd.DataFrame(json.loads(records_json))
     metadata_rows = json.loads(metadata_json)
+    metadata_table_rows = json.loads(metadata_table_json)
     findings = json.loads(findings_json)
     # pandas 2.1+ may treat a raw JSON string as a file path.
     # Wrap the JSON literal in StringIO so it is parsed as JSON content.
@@ -191,17 +198,8 @@ def _build_enriched_record_table_cached(records_json: str, metadata_json: str, f
     split_small["image_id"] = split_small["image_id"].astype(str)
     records = records.merge(split_small, on="image_id", how="left")
 
-    vendor_map = {}
-    meta_preview_map = {}
-    for image_id, rows in metadata_rows.items():
-        row = rows[0] if rows else {}
-        manufacturer = _first_existing(row, ["Manufacturer", "manufacturer", "manufacturers"])
-        model = _first_existing(row, ["ManufacturerModelName", "manufacturer_model_name", "model_name", "model"])
-        vendor = " / ".join([str(x) for x in [manufacturer, model] if x not in [None, "", "nan"]])
-        vendor_map[str(image_id)] = vendor if vendor else "Unknown"
-        meta_preview_map[str(image_id)] = row
-
-    records["vendor"] = records["image_id"].map(vendor_map).fillna("Unknown")
+    vendor_map, meta_preview_map = _build_vendor_maps(metadata_rows, metadata_table_rows, records)
+    records["vendor"] = records["image_id"].astype(str).map(vendor_map).fillna("Unknown")
     records["has_mass"] = records["image_id"].map(lambda x: bool(findings.get(str(x), [])))
     records["record_index"] = np.arange(len(records), dtype=int)
     records["display_name"] = records.apply(
@@ -217,6 +215,7 @@ def _build_enriched_record_table_cached(records_json: str, metadata_json: str, f
 
 def _build_enriched_record_table(dataset: VindrMammoDataset, split_df: pd.DataFrame) -> pd.DataFrame:
     metadata_json = json.dumps(dataset.metadata_by_image_id, default=_json_default, sort_keys=True)
+    metadata_table_json = json.dumps(dataset.metadata_df.to_dict(orient="records"), default=_json_default, sort_keys=True)
     findings = {}
     for image_id, rows in dataset.findings_by_image_id.items():
         mass_rows = [r for r in rows if dataset._is_mass_finding(r)]
@@ -225,6 +224,7 @@ def _build_enriched_record_table(dataset: VindrMammoDataset, split_df: pd.DataFr
     return _build_enriched_record_table_cached(
         json.dumps(dataset.image_records, default=_json_default, sort_keys=True),
         metadata_json,
+        metadata_table_json,
         findings_json,
         split_df.to_json(orient="split"),
     )
@@ -526,11 +526,32 @@ def _record_filter_controls(records_df: pd.DataFrame, *, prefix: str, compact: b
         split_options = ["all", "train", "val", "test"]
         split_choice = st.selectbox("Split", split_options, index=0, key=f"{prefix}_split")
         positive_choice = st.radio("Images", ["positive only", "all images"], index=0, horizontal=True, key=f"{prefix}_positive")
-        vendors = sorted([v for v in records_df["vendor"].dropna().unique().tolist() if str(v).strip()])
+        vendors = _available_vendors(records_df)
         vendor_mode = st.radio("Vendor filter", ["all vendors", "selected vendors"], index=0, horizontal=True, key=f"{prefix}_vendor_mode")
         selected_vendors: list[str] = []
+        st.caption(f"Vendor options available: {len(vendors)}")
         if vendor_mode == "selected vendors":
-            selected_vendors = st.multiselect("Vendors", vendors, default=vendors[:1] if vendors else [], key=f"{prefix}_vendors")
+            vendor_key = f"{prefix}_vendors"
+            if vendor_key in st.session_state:
+                # Drop stale selections when another filter or a rerun changes the option list.
+                st.session_state[vendor_key] = [v for v in st.session_state[vendor_key] if v in vendors]
+            if vendors:
+                selected_vendors = st.multiselect(
+                    "Vendors",
+                    options=vendors,
+                    default=vendors[:1],
+                    key=vendor_key,
+                    help="Vendor values come from metadata.csv Manufacturer and Manufacturer's Model Name when available.",
+                )
+                with st.expander("Vendor counts", expanded=False):
+                    counts = records_df["vendor"].fillna("Unknown").replace("", "Unknown").value_counts().reset_index()
+                    counts.columns = ["vendor", "num_images"]
+                    st.dataframe(counts, hide_index=True, use_container_width=True)
+            else:
+                st.warning(
+                    "No vendor values were found in metadata.csv. The dataset will still work, "
+                    "but vendor filtering cannot be used until Manufacturer/Model columns are available."
+                )
 
     df = records_df.copy()
     if split_choice != "all":
@@ -985,6 +1006,163 @@ def _sample_pixels(arr: np.ndarray, max_pixels: int = 200_000) -> np.ndarray:
     return flat
 
 
+
+_VENDOR_MANUFACTURER_KEYS = [
+    "Manufacturer",
+    "manufacturer",
+    "manufacturers",
+    "ManufacturerName",
+    "manufacturer_name",
+    "Manufacturer's Name",
+    "Manufacturer’s Name",
+    "0008,0070",
+    "(0008,0070)",
+]
+
+_VENDOR_MODEL_KEYS = [
+    "ManufacturerModelName",
+    "Manufacturer's Model Name",
+    "Manufacturer’s Model Name",
+    "manufacturer_model_name",
+    "manufacturer_model",
+    "model_name",
+    "model",
+    "ModelName",
+    "0008,1090",
+    "(0008,1090)",
+]
+
+_METADATA_IMAGE_ID_KEYS = [
+    "image_id",
+    "ImageID",
+    "imageId",
+    "SOPInstanceUID",
+    "sop_instance_uid",
+    "SOP Instance UID",
+    "filename",
+    "file_name",
+    "FileName",
+    "dicom_path",
+    "path",
+]
+
+
+def _available_vendors(records_df: pd.DataFrame) -> list[str]:
+    if "vendor" not in records_df.columns:
+        return []
+    vendors: list[str] = []
+    for value in records_df["vendor"].tolist():
+        cleaned = _clean_scalar(value)
+        if cleaned is None:
+            continue
+        vendors.append(cleaned)
+    vendors = sorted(set(vendors))
+    # If vendor information exists only as missing metadata, still expose Unknown so
+    # the selector is not empty and the user can tell the GUI is functioning.
+    if not vendors and len(records_df) > 0:
+        vendors = ["Unknown"]
+    return vendors
+
+
+def _build_vendor_maps(
+    metadata_by_image_id: dict[str, list[dict[str, Any]]],
+    metadata_table_rows: list[dict[str, Any]],
+    records: pd.DataFrame,
+) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    """Build image_id -> vendor maps robustly across metadata.csv variants.
+
+    Some VinDr-Mammo copies expose columns as `Manufacturer` and
+    `Manufacturer's Model Name`, while others use normalized names such as
+    `manufacturer_model_name`. This helper accepts both and also falls back to
+    common DICOM/SOP UID style image-id columns.
+    """
+    image_ids = {str(x) for x in records["image_id"].astype(str).tolist()} if "image_id" in records else set()
+    vendor_map: dict[str, str] = {}
+    meta_preview_map: dict[str, dict[str, Any]] = {}
+
+    def update(image_id: Any, row: dict[str, Any]) -> None:
+        iid = _clean_image_id(image_id)
+        if iid is None or (image_ids and iid not in image_ids):
+            return
+        vendor = _vendor_from_row(row)
+        vendor_map[iid] = vendor
+        meta_preview_map[iid] = row
+
+    # First use the Dataset's direct grouping when metadata.csv has image_id.
+    for image_id, rows in (metadata_by_image_id or {}).items():
+        row = rows[0] if rows else {}
+        update(image_id, row)
+
+    # Then scan the full metadata table. This catches alternative image-id column
+    # names and also improves vendor extraction when metadata_by_image_id was empty.
+    for row in metadata_table_rows or []:
+        image_id = _metadata_row_image_id(row)
+        if image_id is not None:
+            update(image_id, row)
+
+    # Last resort: if a metadata row has study_id + view/laterality but no image_id,
+    # match it to a unique record with the same tuple.
+    tuple_to_image: dict[tuple[str, str, str], str] = {}
+    duplicate_keys: set[tuple[str, str, str]] = set()
+    for _, record in records.iterrows():
+        key = (
+            _clean_scalar(record.get("study_id")) or "",
+            _clean_scalar(record.get("laterality")) or "",
+            _clean_scalar(record.get("view_position")) or "",
+        )
+        if not all(key):
+            continue
+        if key in tuple_to_image:
+            duplicate_keys.add(key)
+        else:
+            tuple_to_image[key] = str(record.get("image_id"))
+    for key in duplicate_keys:
+        tuple_to_image.pop(key, None)
+
+    for row in metadata_table_rows or []:
+        if _metadata_row_image_id(row) is not None:
+            continue
+        key = (
+            _clean_scalar(_first_existing(row, ["study_id", "StudyID", "StudyInstanceUID"])) or "",
+            _clean_scalar(_first_existing(row, ["laterality", "Laterality", "ImageLaterality", "Image Laterality"])) or "",
+            _clean_scalar(_first_existing(row, ["view_position", "ViewPosition", "View Position"])) or "",
+        )
+        image_id = tuple_to_image.get(key)
+        if image_id is not None:
+            update(image_id, row)
+
+    # Fill missing records with Unknown, otherwise the multiselect can become empty.
+    for image_id in image_ids:
+        vendor_map.setdefault(image_id, "Unknown")
+    return vendor_map, meta_preview_map
+
+
+def _metadata_row_image_id(row: dict[str, Any]) -> str | None:
+    value = _first_existing(row, _METADATA_IMAGE_ID_KEYS)
+    return _clean_image_id(value)
+
+
+def _clean_image_id(value: Any) -> str | None:
+    text = _clean_scalar(value)
+    if text is None:
+        return None
+    # If a path is supplied, use the file stem because VinDr image_id is the DICOM filename stem.
+    text = text.replace("\\", "/")
+    if "/" in text:
+        text = Path(text).stem
+    if text.endswith(".dicom") or text.endswith(".dcm"):
+        text = Path(text).stem
+    return text or None
+
+
+def _vendor_from_row(row: dict[str, Any]) -> str:
+    manufacturer = _first_existing(row, _VENDOR_MANUFACTURER_KEYS)
+    model = _first_existing(row, _VENDOR_MODEL_KEYS)
+    parts = [_clean_scalar(x) for x in [manufacturer, model]]
+    parts = [x for x in parts if x]
+    return " / ".join(parts) if parts else "Unknown"
+
+
 def _compact_metadata(target_summary: dict[str, Any], processing_meta: dict[str, Any]) -> dict[str, Any]:
     metadata = target_summary.get("metadata", {}) or {}
     dicom_meta = target_summary.get("dicom_meta", {}) or {}
@@ -1001,21 +1179,51 @@ def _compact_metadata(target_summary: dict[str, Any], processing_meta: dict[str,
 def _vendor_from_summary(summary: dict[str, Any]) -> str:
     meta = summary.get("metadata", {}) or {}
     dicom = summary.get("dicom_meta", {}) or {}
-    manufacturer = _first_existing(meta, ["Manufacturer", "manufacturer"])
-    if manufacturer in [None, "", "nan"]:
-        manufacturer = _first_existing(dicom, ["Manufacturer"])
-    model = _first_existing(meta, ["ManufacturerModelName", "manufacturer_model_name", "model_name", "model"])
-    if model in [None, "", "nan"]:
-        model = _first_existing(dicom, ["ManufacturerModelName"])
-    vendor = " / ".join([str(x) for x in [manufacturer, model] if x not in [None, "", "nan"]])
-    return vendor if vendor else "Unknown"
+    vendor = _vendor_from_row(meta)
+    if vendor == "Unknown":
+        vendor = _vendor_from_row(dicom)
+    return vendor
 
 
 def _first_existing(row: dict[str, Any], keys: list[str]) -> Any:
+    if not isinstance(row, dict):
+        return None
+    # First try exact column names.
     for key in keys:
-        if key in row and row[key] not in [None, "", "nan"]:
-            return row[key]
+        if key in row:
+            cleaned = _clean_scalar(row[key])
+            if cleaned is not None:
+                return cleaned
+    # Then try normalized names so variants like "Manufacturer's Model Name" and
+    # "manufacturer_model_name" can match each other.
+    normalized_row = {_normalize_key(k): v for k, v in row.items()}
+    for key in keys:
+        value = normalized_row.get(_normalize_key(key))
+        cleaned = _clean_scalar(value)
+        if cleaned is not None:
+            return cleaned
     return None
+
+
+def _normalize_key(value: Any) -> str:
+    text = str(value).strip().lower()
+    for ch in ["\'", "’", "`", "\"", "(", ")", ",", ":", ";", "-", "/"]:
+        text = text.replace(ch, " ")
+    return "_".join(text.split())
+
+
+def _clean_scalar(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null", "na", "n/a"}:
+        return None
+    return text
 
 
 def _json_default(obj: Any) -> Any:
