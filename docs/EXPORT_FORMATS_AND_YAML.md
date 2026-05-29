@@ -529,7 +529,7 @@ the exporter keeps a deterministic train window only if at least one complete ma
 
 The exporter can now filter deterministic sliding-window crops by the amount of breast foreground inside the crop. This is different from `preprocess.crop_breast`:
 
-- `preprocess.crop_breast: true` crops the whole mammogram to the detected breast box before square-crop generation.
+- `preprocess.crop_breast: true` crops the whole mammogram to the detected breast box before square-crop generation. By default this is now `false`, so the global breast crop is skipped unless you enable it.
 - `deterministic_require_foreground: true` keeps the full preprocessed image, creates normal sliding windows, and rejects individual windows if too little of that crop is breast foreground.
 
 This is useful for experiments where you want to disable the global breast crop and let the square-crop stage decide which windows contain enough breast tissue:

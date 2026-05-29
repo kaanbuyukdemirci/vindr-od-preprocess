@@ -1,12 +1,3 @@
-# VinDr-Mammo export configuration for the contralateral-channel experiment.
-# Default RGB scheme:
-#   R = current crop: percentile normalization -> histogram equalization -> standardization
-#   G = current crop: percentile normalization -> histogram equalization -> upper-percentile normalization -> histogram equalization -> standardization
-#   B = opposite breast, same view, same xyxy crop: percentile normalization -> histogram equalization -> standardization
-# Notes:
-#   The opposite-breast channel is paired by study_id + view_position + opposite laterality.
-#   Fixed preprocessing is applied before pairing/cropping, including MONOCHROME1 correction and optional mirroring.
-
 paths:
   data_root: /mnt/t9/vindr
   output_root: /mnt/t9/preprocessed-vindr-v3
@@ -20,7 +11,7 @@ image:
   use_voi_lut: false
 preprocess:
   invert_to_black_background: true
-  crop_breast: true
+  crop_breast: false
   mirror_right_to_left: true
   crop_padding: 20
   crop_threshold: null
@@ -107,7 +98,8 @@ image_export:
           - 1.0
           - 99.0
           clip_output: true
-  contralateral_note: B channel uses the same crop coordinates from the opposite breast with the same view position when available.
+  contralateral_note: B channel uses the same crop coordinates from the opposite breast
+    with the same view position when available.
 histogram_equalization:
   enabled: false
   apply_to: third_channel

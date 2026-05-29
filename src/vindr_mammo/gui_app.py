@@ -399,7 +399,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
 
     These options are applied before crop selection and before the per-channel RGB
     experiment pipeline. They match the preprocessing used by the export code:
-    MONOCHROME1 correction, breast-region crop, and right-to-left mirroring.
+    MONOCHROME1 correction, optional breast-region crop, and right-to-left mirroring.
     """
     cfg = dict(cfg)
     cfg["preprocess"] = dict(cfg.get("preprocess", {}) or {})
@@ -422,8 +422,11 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     )
     pp["crop_breast"] = st.sidebar.checkbox(
         "Crop to breast foreground",
-        value=bool(pp.get("crop_breast", True)),
-        help="Find the breast foreground and remove as much pure background as possible.",
+        value=bool(pp.get("crop_breast", False)),
+        help=(
+            "Find the breast foreground and remove as much pure background as possible. "
+            "Default is off so deterministic full-image crop experiments are not silently altered."
+        ),
     )
     pp["mirror_right_to_left"] = st.sidebar.checkbox(
         "Mirror right-entering breasts to left-entering",
@@ -539,7 +542,19 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         step=0.05,
         help="A crop is considered positive if at least one mass box has this fraction visible inside the crop.",
     )
-    allow_partial = st.sidebar.checkbox("Display partial boxes after clipping", value=bool(policy.get("allow_partial_annotations", True)))
+    # This is a GUI display/debug option, so default it to enabled even when the
+    # export annotation policy is strict. Users can still turn it off manually.
+    if "gui_display_partial_boxes_after_clipping" not in st.session_state:
+        st.session_state["gui_display_partial_boxes_after_clipping"] = True
+    allow_partial = st.sidebar.checkbox(
+        "Display partial boxes after clipping",
+        key="gui_display_partial_boxes_after_clipping",
+        help=(
+            "GUI-only debugging default. When enabled, boxes that intersect the crop boundary "
+            "are clipped and drawn if they satisfy the visibility threshold. This does not "
+            "change config/export_config.yaml unless you explicitly export and apply the GUI YAML."
+        ),
+    )
     min_box_visibility = st.sidebar.slider("Minimum box visibility to draw/keep", 0.0, 1.0, float(policy.get("min_box_visibility", 0.30)), 0.05)
 
     random_preview_count = 20

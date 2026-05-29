@@ -669,12 +669,12 @@ For exam mode, a batch looks like:
 
 ## Optional preprocessing
 
-The dataset now accepts a compact `preprocess_options` dictionary. These steps are optional, but the default `main.py` enables them because they are useful for mass-focused detection experiments.
+The dataset now accepts a compact `preprocess_options` dictionary. These steps are optional. The current default dataset export keeps global breast cropping disabled so full-image deterministic crop experiments are not silently altered. You can still enable it in the config or GUI when needed.
 
 ```python
 PREPROCESS_OPTIONS = {
     "invert_to_black_background": True,
-    "crop_breast": True,
+    "crop_breast": False,
     "mirror_right_to_left": True,
     "crop_padding": 20,
     "crop_threshold": None,
