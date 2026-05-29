@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import math
 import sys
@@ -179,7 +180,9 @@ def _build_enriched_record_table_cached(records_json: str, metadata_json: str, f
     records = pd.DataFrame(json.loads(records_json))
     metadata_rows = json.loads(metadata_json)
     findings = json.loads(findings_json)
-    split_df = pd.read_json(split_df_json, orient="split")
+    # pandas 2.1+ may treat a raw JSON string as a file path.
+    # Wrap the JSON literal in StringIO so it is parsed as JSON content.
+    split_df = pd.read_json(io.StringIO(split_df_json), orient="split")
 
     records["image_id"] = records["image_id"].astype(str)
     records["study_id"] = records["study_id"].astype(str)
