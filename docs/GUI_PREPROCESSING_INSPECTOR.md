@@ -54,6 +54,17 @@ The image selector supports:
 
 The split logic matches the export code: official VinDr `test` remains test, and official VinDr `training` is split into train/val by study ID according to `splits.val_fraction_from_training` and `splits.seed`.
 
+## Fixed preprocessing controls
+
+The sidebar has a **Fixed preprocessing before crops** section. These are the preprocessing steps used before square-crop selection and before the experimental RGB channel pipeline:
+
+- `Invert MONOCHROME1 to black background`: only images tagged `MONOCHROME1` are inverted; `MONOCHROME2` images are left unchanged.
+- `Crop to breast foreground`: crops away pure background and updates boxes.
+- `Mirror right-entering breasts to left-entering`: if the detected breast foreground is mostly on the right side, the image is flipped horizontally and boxes are mirrored.
+- `Breast crop padding`, `Breast crop threshold`, and `Minimum breast component area fraction`: control the breast foreground crop.
+
+The metadata panel reports what was actually applied for the currently loaded image, including `InvertedMonochrome1`, `crop_box_xyxy`, and `mirrored`.
+
 ## Crop controls
 
 The crop controls include:
@@ -119,3 +130,12 @@ Use **Vendor / image comparison** mode to compare multiple images side by side. 
 - The GUI is intended for qualitative inspection, not final training.
 - Very large DICOMs can still take a few seconds to load. Recently viewed images are cached by Streamlit.
 - If you change the YAML preprocessing settings, reload the app to ensure the cached dataset uses the new settings.
+
+## Histogram normalization
+
+The metadata/statistics expander shows pixel intensity histograms for the full grayscale image, selected crop, and processed RGB channels. For easier comparison, the GUI normalizes each histogram series independently:
+
+- the x-axis is min-max normalized to `[0, 1]` per image or channel;
+- the y-axis is relative frequency, not raw pixel count.
+
+This means a full mammogram and a 1024 x 1024 crop can be visually compared without the full image dominating only because it has more pixels.

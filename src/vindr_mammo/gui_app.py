@@ -49,6 +49,7 @@ def main() -> None:
 
     config_path = _get_config_path_from_query_or_cli()
     cfg = _load_config_ui(config_path)
+    cfg = _global_preprocess_controls(cfg)
 
     dataset = _load_dataset_from_config(cfg)
     split_records, split_df = _load_split_records(dataset, cfg)
@@ -232,6 +233,87 @@ def _build_enriched_record_table(dataset: VindrMammoDataset, split_df: pd.DataFr
 # -----------------------------------------------------------------------------
 # UI controls
 # -----------------------------------------------------------------------------
+
+
+def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Expose fixed geometry/display preprocessing in the GUI sidebar.
+
+    These options are applied before crop selection and before the per-channel RGB
+    experiment pipeline. They match the preprocessing used by the export code:
+    MONOCHROME1 correction, breast-region crop, and right-to-left mirroring.
+    """
+    cfg = dict(cfg)
+    cfg["preprocess"] = dict(cfg.get("preprocess", {}) or {})
+    pp = cfg["preprocess"]
+
+    st.sidebar.divider()
+    st.sidebar.subheader("Fixed preprocessing before crops")
+    st.sidebar.caption(
+        "These steps are applied before square crop selection and before the RGB channel pipeline. "
+        "They are not experimental per-channel filters."
+    )
+
+    pp["invert_to_black_background"] = st.sidebar.checkbox(
+        "Invert MONOCHROME1 to black background",
+        value=bool(pp.get("invert_to_black_background", True)),
+        help=(
+            "If enabled, only DICOM images tagged MONOCHROME1 are inverted. "
+            "MONOCHROME2 images are left unchanged."
+        ),
+    )
+    pp["crop_breast"] = st.sidebar.checkbox(
+        "Crop to breast foreground",
+        value=bool(pp.get("crop_breast", True)),
+        help="Find the breast foreground and remove as much pure background as possible.",
+    )
+    pp["mirror_right_to_left"] = st.sidebar.checkbox(
+        "Mirror right-entering breasts to left-entering",
+        value=bool(pp.get("mirror_right_to_left", True)),
+        help="If the breast foreground is mostly on the right side, flip horizontally and update boxes.",
+    )
+    pp["crop_padding"] = st.sidebar.number_input(
+        "Breast crop padding, pixels",
+        min_value=0,
+        max_value=512,
+        step=5,
+        value=int(pp.get("crop_padding", 20)),
+        help="Padding added around the detected breast foreground crop.",
+    )
+
+    threshold_mode = st.sidebar.radio(
+        "Breast crop threshold",
+        ["auto", "manual"],
+        index=0 if pp.get("crop_threshold", None) is None else 1,
+        horizontal=True,
+        help="Auto usually works best. Manual is useful for debugging foreground segmentation.",
+    )
+    if threshold_mode == "manual":
+        pp["crop_threshold"] = st.sidebar.number_input(
+            "Manual threshold value",
+            value=float(pp.get("crop_threshold", 0.0) or 0.0),
+            step=0.01,
+            format="%.6f",
+        )
+    else:
+        pp["crop_threshold"] = None
+
+    pp["min_component_area_fraction"] = st.sidebar.slider(
+        "Minimum breast component area fraction",
+        min_value=0.0,
+        max_value=0.05,
+        value=float(pp.get("min_component_area_fraction", 0.001)),
+        step=0.0005,
+        format="%.4f",
+        help="Small connected components below this relative image area are ignored while finding the breast crop.",
+    )
+
+    with st.sidebar.expander("What happened to the image?", expanded=False):
+        st.write(
+            "For each loaded image, the metadata panel reports whether the image was actually "
+            "inverted, what breast crop box was used, and whether mirroring was applied."
+        )
+
+    return cfg
 
 
 def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -600,8 +682,8 @@ def _show_sample(
         st.caption(f"Selected crop window xyxy={tuple(int(v) for v in window)} | max mass visibility={selected.get('max_visibility', 0.0):.3f}")
 
     cols = st.columns(3)
-    cols[0].image(full_draw, caption="Original black/white image with selected crop window", use_container_width=True)
-    cols[1].image(crop_draw, caption="Original crop", use_container_width=True)
+    cols[0].image(full_draw, caption="Fixed-preprocessed grayscale image with selected crop window", use_container_width=True)
+    cols[1].image(crop_draw, caption="Crop from fixed-preprocessed image", use_container_width=True)
     cols[2].image(proc_draw, caption="Preprocessed RGB crop", use_container_width=True)
 
     with st.expander("Metadata and statistics", expanded=not compact):
@@ -642,17 +724,37 @@ def _stats_row(name: str, arr: np.ndarray) -> dict[str, Any]:
 
 
 def _histogram_figure(full: np.ndarray, crop: np.ndarray, processed_rgb: np.ndarray):
+    """Plot comparable pixel intensity distributions.
+
+    Every plotted series is independently min-max normalized to the x-axis range
+    [0, 1]. Histogram heights are also normalized to relative frequency so the
+    full image, crop, and RGB channels can be compared even though they contain
+    different numbers of pixels.
+    """
     fig, ax = plt.subplots(figsize=(8, 4))
-    ax.hist(_sample_pixels(full), bins=80, alpha=0.35, label="full grayscale")
-    ax.hist(_sample_pixels(crop), bins=80, alpha=0.35, label="crop grayscale")
+    bins = np.linspace(0.0, 1.0, 81)
+
+    _plot_normalized_hist(ax, full, bins=bins, alpha=0.35, label="full grayscale")
+    _plot_normalized_hist(ax, crop, bins=bins, alpha=0.35, label="crop grayscale")
     for i, name in enumerate(["R", "G", "B"]):
-        ax.hist(_sample_pixels(processed_rgb[..., i]), bins=80, alpha=0.25, label=f"processed {name}")
-    ax.set_title("Pixel intensity distributions")
-    ax.set_xlabel("Intensity")
-    ax.set_ylabel("Count")
+        _plot_normalized_hist(ax, processed_rgb[..., i], bins=bins, alpha=0.25, label=f"processed {name}")
+
+    ax.set_title("Pixel intensity distributions, each series normalized to [0, 1]")
+    ax.set_xlabel("Normalized intensity, per image/channel")
+    ax.set_ylabel("Relative frequency")
+    ax.set_xlim(0.0, 1.0)
     ax.legend(fontsize=8)
     fig.tight_layout()
     return fig
+
+
+def _plot_normalized_hist(ax, arr: np.ndarray, *, bins: np.ndarray, alpha: float, label: str) -> None:
+    values = _sample_pixels(arr).astype(np.float32, copy=False)
+    if values.size == 0:
+        values = np.array([0.0], dtype=np.float32)
+    values = _normalize_minmax(values)
+    weights = np.ones(values.shape, dtype=np.float32) / max(int(values.size), 1)
+    ax.hist(values, bins=bins, weights=weights, alpha=alpha, label=label)
 
 
 # -----------------------------------------------------------------------------
