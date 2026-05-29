@@ -909,16 +909,35 @@ def _render_comparison_mode(
     display_controls: dict[str, Any],
 ) -> None:
     st.subheader("Vendor / image comparison")
-    st.caption("All comparison slots use the same crop controls and RGB preprocessing pipeline from the sidebar.")
-    n_slots = st.slider("Number of comparison slots", 2, 6, 2)
+    st.caption(
+        "All comparison slots use the same crop controls and RGB preprocessing pipeline from the sidebar. "
+        "By default, the first five slots are assigned to different detected vendors/devices when possible."
+    )
+    n_slots = st.slider("Number of comparison slots", 2, 10, 5)
+    default_vendors = _default_comparison_vendors(records_df, n_slots)
+    if default_vendors:
+        st.caption("Default slot vendors: " + ", ".join(default_vendors))
+
     results = []
     slot_cols = st.columns(n_slots)
     for slot_idx, col in enumerate(slot_cols):
         with col:
-            filtered = _record_filter_controls(records_df, prefix=f"cmp_{slot_idx}", compact=True)
+            default_vendor = default_vendors[slot_idx] if slot_idx < len(default_vendors) else None
+            filtered = _record_filter_controls(
+                records_df,
+                prefix=f"cmp_{slot_idx}",
+                compact=True,
+                default_vendor_mode="selected vendors" if default_vendor else "all vendors",
+                default_selected_vendors=[default_vendor] if default_vendor else None,
+                default_positive_choice="positive only",
+                default_split="all",
+            )
             header_col, img_idx_col = st.columns([1.15, 0.85], vertical_alignment="bottom")
             header_col.markdown(f"**Slot {slot_idx + 1}**")
-            header_col.caption(f"{len(filtered)} matching images")
+            if default_vendor:
+                header_col.caption(f"{len(filtered)} matching images | default: {default_vendor}")
+            else:
+                header_col.caption(f"{len(filtered)} matching images")
             if filtered.empty:
                 img_idx_col.caption("No image index")
                 results.append(None)
@@ -1209,21 +1228,38 @@ def _normalized_entropy(values: np.ndarray) -> float:
     return entropy / math.log2(max(len(hist), 2))
 
 
-def _record_filter_controls(records_df: pd.DataFrame, *, prefix: str, compact: bool = False) -> pd.DataFrame:
+def _record_filter_controls(
+    records_df: pd.DataFrame,
+    *,
+    prefix: str,
+    compact: bool = False,
+    default_vendor_mode: str = "all vendors",
+    default_selected_vendors: list[str] | None = None,
+    default_positive_choice: str = "positive only",
+    default_split: str = "all",
+) -> pd.DataFrame:
     # Always create an actual Streamlit container object. The `streamlit` module
     # itself is not a context manager, so `with st:` raises
     # TypeError: 'module' object does not support the context manager protocol.
     ui_container = st.container(border=bool(compact))
     with ui_container:
         split_options = ["all", "train", "val", "test"]
-        split_choice = st.selectbox("Split", split_options, index=0, key=f"{prefix}_split")
-        positive_choice = st.radio("Images", ["positive only", "all images"], index=0, horizontal=True, key=f"{prefix}_positive")
+        split_index = split_options.index(default_split) if default_split in split_options else 0
+        split_choice = st.selectbox("Split", split_options, index=split_index, key=f"{prefix}_split")
+        image_options = ["positive only", "all images"]
+        positive_index = image_options.index(default_positive_choice) if default_positive_choice in image_options else 0
+        positive_choice = st.radio("Images", image_options, index=positive_index, horizontal=True, key=f"{prefix}_positive")
         vendors = _available_vendors(records_df)
-        vendor_mode = st.radio("Vendor filter", ["all vendors", "selected vendors"], index=0, horizontal=True, key=f"{prefix}_vendor_mode")
+        vendor_modes = ["all vendors", "selected vendors"]
+        vendor_mode_index = vendor_modes.index(default_vendor_mode) if default_vendor_mode in vendor_modes else 0
+        vendor_mode = st.radio("Vendor filter", vendor_modes, index=vendor_mode_index, horizontal=True, key=f"{prefix}_vendor_mode")
         selected_vendors: list[str] = []
         st.caption(f"Vendor options available: {len(vendors)}")
         if vendor_mode == "selected vendors":
             vendor_key = f"{prefix}_vendors"
+            requested_defaults = [v for v in (default_selected_vendors or []) if v in vendors]
+            if not requested_defaults and vendors:
+                requested_defaults = vendors[:1]
             if vendor_key in st.session_state:
                 # Drop stale selections when another filter or a rerun changes the option list.
                 st.session_state[vendor_key] = [v for v in st.session_state[vendor_key] if v in vendors]
@@ -1231,7 +1267,7 @@ def _record_filter_controls(records_df: pd.DataFrame, *, prefix: str, compact: b
                 selected_vendors = st.multiselect(
                     "Vendors",
                     options=vendors,
-                    default=vendors[:1],
+                    default=requested_defaults,
                     key=vendor_key,
                     help="Vendor values come from metadata.csv Manufacturer and Manufacturer's Model Name when available.",
                 )
@@ -2017,6 +2053,31 @@ def _available_vendors(records_df: pd.DataFrame) -> list[str]:
     if not vendors and len(records_df) > 0:
         vendors = ["Unknown"]
     return vendors
+
+
+def _default_comparison_vendors(records_df: pd.DataFrame, n_slots: int) -> list[str]:
+    """Choose default compare-slot vendors, preferring positive images and diversity.
+
+    The comparison tab is mainly used for cross-device debugging. By default we
+    therefore assign each visible slot to a different vendor/device when possible.
+    Vendors with mass-positive records are preferred because the default image
+    filter is also positive-only.
+    """
+    if "vendor" not in records_df.columns or records_df.empty:
+        return []
+    df = records_df.copy()
+    df["vendor"] = df["vendor"].fillna("Unknown").replace("", "Unknown")
+    if "has_mass" in df.columns:
+        positive_df = df[df["has_mass"] == True]  # noqa: E712
+        if not positive_df.empty:
+            df = positive_df
+    counts = df["vendor"].value_counts()
+    vendors = [str(v) for v in counts.index.tolist()]
+    if len(vendors) > 1:
+        known = [v for v in vendors if v != "Unknown"]
+        unknown = [v for v in vendors if v == "Unknown"]
+        vendors = known + unknown
+    return vendors[: max(0, int(n_slots))]
 
 
 def _build_vendor_maps(
