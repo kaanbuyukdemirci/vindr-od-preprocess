@@ -1263,3 +1263,9 @@ Then export the dataset:
 ```bash
 vindr-mammo-export --config config/export_config.yaml
 ```
+
+### GUI-driven export controls
+
+The preprocessing GUI now includes an **Export dataset from GUI** panel. It supports selected-vendor export, split-specific mass-window-only export for train/val/test, output folder/name controls, and a progress bar while the dataset is being written.
+
+Use it when you want the exported dataset to exactly match the current GUI preprocessing settings without manually editing `config/export_config.yaml`.

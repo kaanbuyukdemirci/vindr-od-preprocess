@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import io
 import json
 import math
@@ -32,7 +33,7 @@ from .crops import (
     sliding_square_windows,
 )
 from .dataset import VindrMammoDataset
-from .export import load_export_config, make_train_val_test_split
+from .export import export_from_config, load_export_config, make_train_val_test_split
 
 
 # -----------------------------------------------------------------------------
@@ -75,6 +76,12 @@ def main() -> None:
         cfg=cfg,
         crop_controls=crop_controls,
         display_controls=display_controls,
+        pipeline=pipeline,
+    )
+    _export_dataset_from_gui_panel(
+        cfg=cfg,
+        records_df=enriched,
+        crop_controls=crop_controls,
         pipeline=pipeline,
     )
 
@@ -844,6 +851,233 @@ def _op_parameter_controls(channel: str, step: int, op: str) -> dict[str, Any]:
         return {"gain": float(gain)}
     return {}
 
+
+
+# -----------------------------------------------------------------------------
+# GUI-driven dataset export
+# -----------------------------------------------------------------------------
+
+
+def _export_dataset_from_gui_panel(
+    *,
+    cfg: dict[str, Any],
+    records_df: pd.DataFrame,
+    crop_controls: dict[str, Any],
+    pipeline: dict[str, Any],
+) -> None:
+    """Run a dataset export directly from the GUI using current controls."""
+    st.sidebar.divider()
+    with st.sidebar.expander("Export dataset from GUI", expanded=False):
+        st.caption(
+            "Create a dataset using the current fixed preprocessing, crop controls, vendor filter, "
+            "and RGB channel pipeline. This runs the same exporter as main.py, but with a GUI-built config."
+        )
+        current_output = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/preprocessed-vindr-v3")))
+        output_parent = st.text_input(
+            "Export parent folder",
+            value=str(current_output.parent),
+            help="The dataset folder will be created inside this parent folder.",
+            key="gui_export_parent_folder",
+        )
+        dataset_name = st.text_input(
+            "Dataset folder name",
+            value=current_output.name if current_output.name else "preprocessed-vindr-gui",
+            help="Final output path is parent/name. Example: /mnt/t9/preprocessed-vindr-v4.",
+            key="gui_export_dataset_name",
+        )
+        output_root = Path(output_parent) / dataset_name
+        st.code(str(output_root), language="text")
+        clean_output = st.checkbox(
+            "Delete output folder before export",
+            value=False,
+            key="gui_export_clean_output",
+            help="Enable only when you are sure the target folder can be removed.",
+        )
+
+        vendors = _available_vendors(records_df)
+        vendor_mode = st.radio(
+            "Vendor/device export filter",
+            ["all vendors", "selected vendors only"],
+            horizontal=True,
+            key="gui_export_vendor_mode",
+        )
+        selected_vendors: list[str] = []
+        if vendor_mode == "selected vendors only":
+            default_vendors = _default_comparison_vendors(records_df, min(5, len(vendors)))
+            selected_vendors = st.multiselect(
+                "Vendors/devices to include",
+                options=vendors,
+                default=[v for v in default_vendors if v in vendors] or (vendors[:1] if vendors else []),
+                key="gui_export_selected_vendors",
+                help="Only source images from these detected devices will be included in train/val/test before crop export.",
+            )
+            if not selected_vendors:
+                st.warning("Select at least one vendor, or switch to all vendors.")
+
+        st.markdown("**Split-specific crop inclusion**")
+        st.caption(
+            "When checked, deterministic export keeps only windows containing a visible mass. "
+            "This is controlled independently for train, validation, and test."
+        )
+        crop_cfg = dict(cfg.get("square_crops", {}) or {})
+        default_train_mass_only = not bool(crop_cfg.get("train_deterministic_include_empty", crop_cfg.get("deterministic_include_empty", True)))
+        default_val_mass_only = not bool(crop_cfg.get("val_deterministic_include_empty", crop_cfg.get("deterministic_include_empty", True)))
+        default_test_mass_only = not bool(crop_cfg.get("test_deterministic_include_empty", crop_cfg.get("deterministic_include_empty", True)))
+        c_train, c_val, c_test = st.columns(3)
+        train_mass_only = c_train.checkbox("Train mass windows only", value=default_train_mass_only, key="gui_export_train_mass_only")
+        val_mass_only = c_val.checkbox("Val mass windows only", value=default_val_mass_only, key="gui_export_val_mass_only")
+        test_mass_only = c_test.checkbox("Test mass windows only", value=default_test_mass_only, key="gui_export_test_mass_only")
+
+        export_mode = st.radio(
+            "Crop export mode",
+            ["deterministic sliding for all splits", "train stochastic, val/test deterministic"],
+            index=0,
+            key="gui_export_crop_mode",
+            help="The mass-window-only checkboxes apply to deterministic sliding windows. For most experiments here, keep deterministic.",
+        )
+        save_baseline = st.checkbox("Also export baseline_uncropped dataset", value=False, key="gui_export_baseline")
+        confirm = st.checkbox("I checked the output path and want to start export", value=False, key="gui_export_confirm")
+
+        if st.button("Start exporting dataset", type="primary", use_container_width=True, disabled=not confirm):
+            if vendor_mode == "selected vendors only" and not selected_vendors:
+                st.error("No vendors selected. Select at least one vendor before exporting.")
+                return
+            export_cfg = _build_gui_export_config(
+                cfg=cfg,
+                output_root=output_root,
+                clean_output=clean_output,
+                selected_vendors=selected_vendors if vendor_mode == "selected vendors only" else [],
+                train_mass_only=train_mass_only,
+                val_mass_only=val_mass_only,
+                test_mass_only=test_mass_only,
+                export_mode=export_mode,
+                save_baseline=save_baseline,
+                crop_controls=crop_controls,
+                pipeline=pipeline,
+            )
+            _run_export_with_streamlit_progress(export_cfg)
+
+
+def _build_gui_export_config(
+    *,
+    cfg: dict[str, Any],
+    output_root: Path,
+    clean_output: bool,
+    selected_vendors: list[str],
+    train_mass_only: bool,
+    val_mass_only: bool,
+    test_mass_only: bool,
+    export_mode: str,
+    save_baseline: bool,
+    crop_controls: dict[str, Any],
+    pipeline: dict[str, Any],
+) -> dict[str, Any]:
+    out = copy.deepcopy(cfg)
+    out.setdefault("paths", {})["output_root"] = str(output_root)
+    out.setdefault("export", {})["clean_output_root"] = bool(clean_output)
+    out.setdefault("export", {})["save_square_crops"] = True
+    out.setdefault("export", {})["save_baseline_uncropped"] = bool(save_baseline)
+    out.setdefault("export", {})["save_empty_label_files"] = True
+
+    out["vendor_filter"] = {
+        "enabled": bool(selected_vendors),
+        "include_vendors": list(selected_vendors),
+    }
+
+    crop_options = dict(crop_controls.get("crop_options", {}) or {})
+    square = out.setdefault("square_crops", {})
+    square["crop_size"] = int(crop_controls.get("crop_size", square.get("crop_size", 1024)))
+    square["stride"] = int(crop_controls.get("stride", square.get("stride", 512)))
+    if export_mode == "train stochastic, val/test deterministic":
+        square["train_crop_mode"] = "random"
+        square["val_crop_mode"] = "deterministic"
+        square["test_crop_mode"] = "deterministic"
+    else:
+        square["train_crop_mode"] = "deterministic"
+        square["val_crop_mode"] = "deterministic"
+        square["test_crop_mode"] = "deterministic"
+    square["train_deterministic_include_empty"] = not bool(train_mass_only)
+    square["val_deterministic_include_empty"] = not bool(val_mass_only)
+    square["test_deterministic_include_empty"] = not bool(test_mass_only)
+    square["deterministic_include_empty"] = True
+    square["deterministic_require_foreground"] = bool(crop_controls.get("require_foreground", False))
+    square["deterministic_min_foreground_fraction"] = float(crop_controls.get("min_foreground_fraction", 0.05))
+    square["deterministic_foreground_threshold"] = crop_controls.get("foreground_threshold", None)
+    square["positive_fraction"] = float(crop_options.get("positive_fraction", square.get("positive_fraction", 0.80)))
+    square["center_shift_fraction"] = float(crop_options.get("center_shift_fraction", square.get("center_shift_fraction", 0.25)))
+
+    out["crop_annotation_policy"] = {
+        "allow_partial_annotations": bool(crop_options.get("allow_partial_annotations", False)),
+        "min_box_visibility": float(crop_options.get("min_box_visibility", 0.30)),
+        "reject_partial_windows": bool(crop_options.get("reject_partial_windows", True)),
+        "negative_max_box_visibility": float(crop_options.get("negative_max_box_visibility", 0.0)),
+    }
+    out["image_export"] = dict(out.get("image_export", {}) or {})
+    out["image_export"]["rgb_scheme"] = "custom_channel_pipeline"
+    out["image_export"]["custom_channel_pipeline"] = {
+        "R": _pipeline_channel_payload(pipeline, "R"),
+        "G": _pipeline_channel_payload(pipeline, "G"),
+        "B": _pipeline_channel_payload(pipeline, "B"),
+    }
+    return out
+
+
+def _run_export_with_streamlit_progress(export_cfg: dict[str, Any]) -> None:
+    stages = [
+        "initialize_dataset",
+        "make_train_val_test_split",
+        "write_source_metadata_and_config",
+        "export_square_crops",
+        "export_baseline_uncropped",
+        "write_completion_manifest",
+    ]
+    active_stages = list(stages)
+    if not bool(export_cfg.get("export", {}).get("save_baseline_uncropped", False)):
+        active_stages.remove("export_baseline_uncropped")
+
+    progress_bar = st.progress(0.0, text="Export not started yet")
+    status_box = st.empty()
+    log_box = st.empty()
+    log_lines: list[str] = []
+
+    def update_progress(event: dict[str, Any]) -> None:
+        stage = str(event.get("stage", ""))
+        try:
+            stage_idx = active_stages.index(stage)
+        except ValueError:
+            stage_idx = 0
+        event_name = str(event.get("event", ""))
+        frac_inside_stage = 0.0
+        if event_name == "image_progress" and int(event.get("total", 0) or 0) > 0:
+            frac_inside_stage = min(1.0, max(0.0, float(event.get("processed", 0)) / float(event.get("total", 1))))
+        elif event_name == "stage_finish":
+            frac_inside_stage = 1.0
+        else:
+            frac_inside_stage = 0.02
+        overall = (stage_idx + frac_inside_stage) / max(len(active_stages), 1)
+        text = stage.replace("_", " ")
+        if event_name == "image_progress":
+            text += f" | {event.get('split', '?')} | {event.get('processed', 0)}/{event.get('total', 0)} source images"
+        elif event_name == "stage_start":
+            text += " | started"
+        elif event_name == "stage_finish":
+            text += " | complete"
+        elif event_name == "stage_failed":
+            text += " | failed"
+        progress_bar.progress(float(min(max(overall, 0.0), 1.0)), text=text)
+        if event_name in {"stage_start", "stage_finish", "stage_failed"}:
+            log_lines.append(text)
+            log_box.code("\n".join(log_lines[-12:]), language="text")
+
+    try:
+        status_box.info("Export is running. Keep this browser tab open until completion.")
+        result = export_from_config(export_cfg, progress_callback=update_progress)
+        progress_bar.progress(1.0, text="Export complete")
+        status_box.success(f"Export complete: {result.output_root}")
+        st.json(result.summary)
+    except Exception as exc:
+        status_box.error(f"Export failed: {exc}")
+        raise
 
 # -----------------------------------------------------------------------------
 # Single and comparison rendering

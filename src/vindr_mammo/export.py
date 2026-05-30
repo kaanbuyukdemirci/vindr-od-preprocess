@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import pandas as pd
@@ -64,7 +64,7 @@ def load_export_config(path: str | Path) -> dict[str, Any]:
     return cfg
 
 
-def export_from_config(config: dict[str, Any]) -> ExportResult:
+def export_from_config(config: dict[str, Any], progress_callback: Callable[[dict[str, Any]], None] | None = None) -> ExportResult:
     """Build preprocessed VinDr-Mammo exports from a configuration dictionary.
 
     The exporter reads every DICOM only once for each required source image and
@@ -84,12 +84,16 @@ def export_from_config(config: dict[str, Any]) -> ExportResult:
     stage_timings: list[dict[str, Any]] = []
 
     def timed_stage(name: str, func):
+        if progress_callback is not None:
+            progress_callback({"event": "stage_start", "stage": name})
         stage_started_at = _utc_now_iso()
         stage_start = time.perf_counter()
         try:
             result = func()
         except Exception as exc:
             elapsed = time.perf_counter() - stage_start
+            if progress_callback is not None:
+                progress_callback({"event": "stage_failed", "stage": name, "error": repr(exc), "elapsed_seconds": float(elapsed)})
             stage_timings.append(
                 {
                     "name": name,
@@ -102,6 +106,8 @@ def export_from_config(config: dict[str, Any]) -> ExportResult:
             )
             raise
         elapsed = time.perf_counter() - stage_start
+        if progress_callback is not None:
+            progress_callback({"event": "stage_finish", "stage": name, "elapsed_seconds": float(elapsed)})
         stage_timings.append(
             {
                 "name": name,
@@ -149,11 +155,12 @@ def export_from_config(config: dict[str, Any]) -> ExportResult:
             val_fraction=float(config.get("splits", {}).get("val_fraction_from_training", 0.15)),
             seed=int(config.get("splits", {}).get("seed", 123)),
         )
+        split_records_, split_table_, vendor_summary_ = _apply_vendor_filter_to_splits(dataset, split_records_, split_table_, config)
         split_path = output_root / "split_assignments.csv"
         split_table_.to_csv(split_path, index=False)
-        return split_records_, split_table_, split_path
+        return split_records_, split_table_, split_path, vendor_summary_
 
-    split_records, split_table, split_path = timed_stage("make_train_val_test_split", make_splits)
+    split_records, split_table, split_path, vendor_filter_summary = timed_stage("make_train_val_test_split", make_splits)
 
     created_files: list[Path] = [split_path]
     created_files.extend(timed_stage("write_source_metadata_and_config", lambda: _write_global_metadata_files(output_root, dataset, config)))
@@ -174,12 +181,13 @@ def export_from_config(config: dict[str, Any]) -> ExportResult:
             "val": crop_cfg_for_summary.get("val_deterministic_include_empty", crop_cfg_for_summary.get("deterministic_include_empty", True)),
             "test": crop_cfg_for_summary.get("test_deterministic_include_empty", crop_cfg_for_summary.get("deterministic_include_empty", True)),
         },
+        "vendor_filter": vendor_filter_summary,
     }
 
     if bool(export_cfg.get("save_square_crops", True)):
         crop_summary, crop_files = timed_stage(
             "export_square_crops",
-            lambda: export_square_crop_datasets(dataset, split_records, config, output_root),
+            lambda: export_square_crop_datasets(dataset, split_records, config, output_root, progress_callback=progress_callback),
         )
         summary["square_crops"] = crop_summary
         created_files.extend(crop_files)
@@ -213,6 +221,123 @@ def export_from_config(config: dict[str, Any]) -> ExportResult:
     created_files.extend(manifest_files)
     summary["manifest"] = manifest
     return ExportResult(output_root=output_root, created_files=created_files, summary=summary)
+
+
+def _apply_vendor_filter_to_splits(
+    dataset: VindrMammoDataset,
+    split_records: dict[str, list[dict[str, Any]]],
+    split_table: pd.DataFrame,
+    config: dict[str, Any],
+) -> tuple[dict[str, list[dict[str, Any]]], pd.DataFrame, dict[str, Any]]:
+    """Optionally restrict export to selected vendors/devices.
+
+    The GUI writes this under ``vendor_filter``. If disabled or empty, the
+    exporter preserves the original train/val/test split records.
+    """
+    vendor_cfg = dict(config.get("vendor_filter", {}) or {})
+    enabled = bool(vendor_cfg.get("enabled", False))
+    include_vendors = [str(v).strip() for v in vendor_cfg.get("include_vendors", []) if str(v).strip()]
+    vendor_map = _vendor_map_for_records(dataset, dataset.image_records)
+    before_counts = {split: len(records) for split, records in split_records.items()}
+    if not enabled or not include_vendors:
+        return split_records, split_table, {
+            "enabled": False,
+            "include_vendors": include_vendors,
+            "before_counts": before_counts,
+            "after_counts": before_counts,
+        }
+
+    include_set = set(include_vendors)
+    out: dict[str, list[dict[str, Any]]] = {}
+    for split, records in split_records.items():
+        out[split] = [r for r in records if vendor_map.get(str(r.get("image_id", "")), "Unknown") in include_set]
+
+    keep_image_ids = {str(r.get("image_id", "")) for records in out.values() for r in records}
+    filtered_table = split_table[split_table["image_id"].astype(str).isin(keep_image_ids)].copy()
+    after_counts = {split: len(records) for split, records in out.items()}
+    return out, filtered_table, {
+        "enabled": True,
+        "include_vendors": include_vendors,
+        "before_counts": before_counts,
+        "after_counts": after_counts,
+    }
+
+
+def _vendor_map_for_records(dataset: VindrMammoDataset, records: list[dict[str, Any]]) -> dict[str, str]:
+    """Build image_id -> vendor/model label using metadata.csv and DICOM metadata fallbacks."""
+    image_ids = {str(r.get("image_id", "")) for r in records}
+    out = {image_id: "Unknown" for image_id in image_ids}
+
+    def update(image_id: Any, row: dict[str, Any]) -> None:
+        iid = _clean_image_id_for_vendor(image_id)
+        if iid is None or iid not in out:
+            return
+        out[iid] = _vendor_from_metadata_row(row)
+
+    for image_id, rows in getattr(dataset, "metadata_by_image_id", {}).items():
+        if rows:
+            update(image_id, rows[0])
+
+    metadata_df = getattr(dataset, "metadata_df", pd.DataFrame())
+    if isinstance(metadata_df, pd.DataFrame) and not metadata_df.empty:
+        for row in metadata_df.to_dict(orient="records"):
+            image_id = _first_existing_for_vendor(row, _METADATA_IMAGE_ID_KEYS_EXPORT)
+            if image_id is not None:
+                update(image_id, row)
+
+    return out
+
+
+def _vendor_from_metadata_row(row: dict[str, Any]) -> str:
+    manufacturer = _first_existing_for_vendor(row, _VENDOR_MANUFACTURER_KEYS_EXPORT)
+    model = _first_existing_for_vendor(row, _VENDOR_MODEL_KEYS_EXPORT)
+    parts = [_clean_scalar_for_vendor(x) for x in [manufacturer, model]]
+    parts = [x for x in parts if x]
+    return " / ".join(parts) if parts else "Unknown"
+
+
+def _first_existing_for_vendor(row: dict[str, Any], keys: list[str]) -> Any:
+    for key in keys:
+        if key in row and row.get(key) is not None:
+            return row.get(key)
+    return None
+
+
+def _clean_scalar_for_vendor(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return None
+    return text
+
+
+def _clean_image_id_for_vendor(value: Any) -> str | None:
+    text = _clean_scalar_for_vendor(value)
+    if text is None:
+        return None
+    text = text.replace("\\", "/")
+    if "/" in text:
+        text = Path(text).stem
+    if text.endswith(".dicom") or text.endswith(".dcm"):
+        text = Path(text).stem
+    return text or None
+
+
+_VENDOR_MANUFACTURER_KEYS_EXPORT = [
+    "Manufacturer", "manufacturer", "ManufacturerName", "manufacturer_name",
+    "DeviceManufacturer", "device_manufacturer", "vendor", "Vendor",
+]
+_VENDOR_MODEL_KEYS_EXPORT = [
+    "ManufacturerModelName", "Manufacturer's Model Name", "manufacturer_model_name",
+    "ModelName", "model_name", "model", "Model", "DeviceModel", "device_model",
+]
+_METADATA_IMAGE_ID_KEYS_EXPORT = [
+    "image_id", "ImageID", "imageId", "SOPInstanceUID", "sop_instance_uid",
+    "SOP Instance UID", "filename", "file_name", "FileName", "dicom_path", "path",
+]
 
 
 def make_train_val_test_split(
@@ -270,6 +395,8 @@ def export_square_crop_datasets(
     split_records: dict[str, list[dict[str, Any]]],
     config: dict[str, Any],
     output_root: Path,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any], list[Path]]:
     """Export n x n crop datasets.
 
@@ -322,6 +449,8 @@ def export_square_crop_datasets(
     max_preprocessed_cache_items = int(crop_cfg.get("contralateral_preprocessed_cache_items", 8))
     contralateral_lookup = _build_contralateral_record_lookup(dataset.image_records)
     needs_contralateral = _config_uses_contralateral_source(config)
+    total_records_for_progress = sum(len(split_records.get(split, [])) for split in ["train", "val", "test"])
+    processed_records_for_progress = 0
 
     def get_preprocessed(record_: dict[str, Any]) -> tuple[torch.Tensor, dict[str, Any]]:
         key = str(record_.get("image_id", ""))
@@ -423,6 +552,15 @@ def export_square_crop_datasets(
                     )
                 )
                 image_id_counter += 1
+            processed_records_for_progress += 1
+            if progress_callback is not None:
+                progress_callback({
+                    "event": "image_progress",
+                    "stage": "export_square_crops",
+                    "split": split_name,
+                    "processed": int(processed_records_for_progress),
+                    "total": int(total_records_for_progress),
+                })
 
     created = _write_shared_export_files(crop_root, coco_by_split, stats_rows, metadata_rows, dataset_kind="square_crops")
     return _summary_from_stats(stats_rows), created
@@ -658,6 +796,8 @@ def export_baseline_dataset(
     max_preprocessed_cache_items = int(crop_cfg.get("contralateral_preprocessed_cache_items", 8))
     contralateral_lookup = _build_contralateral_record_lookup(dataset.image_records)
     needs_contralateral = _config_uses_contralateral_source(config)
+    total_records_for_progress = sum(len(split_records.get(split, [])) for split in ["train", "val", "test"])
+    processed_records_for_progress = 0
 
     def get_preprocessed(record_: dict[str, Any]) -> tuple[torch.Tensor, dict[str, Any]]:
         key = str(record_.get("image_id", ""))

@@ -291,3 +291,28 @@ The old `aggressive_upper_percentile_normalize` operation is no longer used in t
 
 - Default GUI display now starts with all R/G/B channels visible, individual channel panels enabled, and partial box display enabled.
 - Compare-mode statistics now separates raw source-crop statistics from final processed R/G/B statistics. The main pairwise similarity metrics and combined distance focus on the final R/G/B model input, while raw crop distances are retained only as diagnostic columns.
+
+## Exporting a dataset directly from the GUI
+
+The sidebar contains an **Export dataset from GUI** panel. It lets you build a new dataset with the current GUI preprocessing and crop controls.
+
+Available export controls:
+
+- output parent folder and dataset folder name,
+- optional clean export folder,
+- all vendors or selected vendors only,
+- independent mass-window-only controls for train, validation, and test,
+- deterministic crop export or train-stochastic / val-test deterministic export,
+- current R/G/B channel pipeline export, including contralateral same-view channels.
+
+When you click **Start exporting dataset**, the GUI calls the same exporter used by `main.py`, but with a temporary config built from the current GUI state. A progress bar is updated by export stage and by source image during square-crop export.
+
+The exported dataset still writes the usual structure:
+
+```text
+<output_root>/square_crops/images/train,val,test
+<output_root>/square_crops/labels/train,val,test
+<output_root>/square_crops/vindr_mass.yaml
+<output_root>/manifest.json
+<output_root>/EXPORT_DONE.txt
+```
