@@ -316,3 +316,15 @@ The exported dataset still writes the usual structure:
 <output_root>/manifest.json
 <output_root>/EXPORT_DONE.txt
 ```
+
+
+## Dataset visualization mode
+
+The GUI also has a **Dataset visualizations** mode. Use this when you already exported a dataset and want to calculate or inspect the visualization report from an arbitrary path.
+
+1. Open the GUI with `vindr-mammo-gui --config config/export_config.yaml`.
+2. Select **Dataset visualizations** from the sidebar mode selector.
+3. Enter either the export root, for example `/mnt/t9/preprocessed-vindr-v3`, or a direct dataset folder such as `/mnt/t9/preprocessed-vindr-v3/square_crops`.
+4. Click **Calculate / refresh visualizations**.
+
+The GUI writes the usual visualization files under `<export_root>/visualizations` by default and displays the COCO small/medium/large box-size tables and plots directly in the app. The COCO bins follow the standard detection AP area ranges: small boxes have area less than `32^2`, medium boxes have area from `32^2` to less than `96^2`, and large boxes have area at least `96^2`.

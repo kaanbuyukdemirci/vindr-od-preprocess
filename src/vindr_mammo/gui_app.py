@@ -34,6 +34,7 @@ from .crops import (
 )
 from .dataset import VindrMammoDataset
 from .export import export_from_config, load_export_config, make_train_val_test_split
+from .visualize import create_visualizations_from_export
 
 
 # -----------------------------------------------------------------------------
@@ -58,7 +59,7 @@ def main() -> None:
     split_records, split_df = _load_split_records(dataset, cfg)
     enriched = _build_enriched_record_table(dataset, split_df)
 
-    mode = st.sidebar.radio("Mode", ["Single image", "Vendor / image comparison"], index=0)
+    mode = st.sidebar.radio("Mode", ["Single image", "Vendor / image comparison", "Dataset visualizations"], index=0)
     crop_controls = _crop_controls(cfg)
     show_annotations = st.sidebar.checkbox("Show mass annotations", value=True)
     display_window = st.sidebar.slider(
@@ -87,9 +88,187 @@ def main() -> None:
 
     if mode == "Single image":
         _render_single_mode(dataset, enriched, crop_controls, pipeline, show_annotations, display_window, display_controls)
-    else:
+    elif mode == "Vendor / image comparison":
         _render_comparison_mode(dataset, enriched, crop_controls, pipeline, show_annotations, display_window, display_controls)
+    else:
+        _render_dataset_visualization_mode(cfg)
 
+
+
+# -----------------------------------------------------------------------------
+# Dataset visualization mode
+# -----------------------------------------------------------------------------
+
+
+def _render_dataset_visualization_mode(cfg: dict[str, Any]) -> None:
+    """Create and view exported-dataset visualizations from an arbitrary path."""
+    st.subheader("Dataset visualizations from path")
+    st.caption(
+        "Enter an already exported dataset path, then calculate the same fast visualizations "
+        "that visualize_export.py creates. This reads CSV/COCO JSON files only. It does not "
+        "read DICOMs and it does not regenerate crops."
+    )
+
+    default_root = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/preprocessed-vindr-v3")))
+    path_text = st.text_input(
+        "Exported dataset path",
+        value=str(default_root),
+        help=(
+            "Usually this is the export root, for example /mnt/t9/preprocessed-vindr-v3. "
+            "You may also point directly to square_crops or baseline_uncropped."
+        ),
+        key="viz_mode_dataset_path",
+    )
+    input_path = Path(path_text).expanduser()
+
+    inferred = _infer_visualization_paths(input_path)
+    output_root = inferred["output_root"]
+    include_square = inferred["include_square_crops"]
+    include_baseline = inferred["include_baseline_uncropped"]
+
+    info_cols = st.columns(3)
+    info_cols[0].metric("Resolved export root", str(output_root))
+    info_cols[1].metric("Use square_crops", "yes" if include_square else "no")
+    info_cols[2].metric("Use baseline", "yes" if include_baseline else "no")
+
+    with st.expander("Visualization options", expanded=True):
+        output_dir_default = output_root / "visualizations"
+        output_dir_text = st.text_input(
+            "Visualization output folder",
+            value=str(output_dir_default),
+            key="viz_mode_output_dir",
+        )
+        option_cols = st.columns(4)
+        include_square = option_cols[0].checkbox("Include square_crops", value=bool(include_square), key="viz_mode_include_square")
+        include_baseline = option_cols[1].checkbox("Include baseline_uncropped", value=bool(include_baseline), key="viz_mode_include_baseline")
+        write_html = option_cols[2].checkbox("Write HTML report", value=True, key="viz_mode_write_html")
+        use_row_limit = option_cols[3].checkbox("Limit samples.csv rows", value=False, key="viz_mode_use_row_limit")
+        max_rows = None
+        if use_row_limit:
+            max_rows = st.number_input("Max rows per samples.csv", min_value=100, value=5000, step=1000, key="viz_mode_max_rows")
+
+    if not output_root.exists():
+        st.error(f"Path does not exist: {output_root}")
+        return
+
+    run_cols = st.columns([1.2, 2.0])
+    run_now = run_cols[0].button("Calculate / refresh visualizations", type="primary", use_container_width=True)
+    run_cols[1].caption(
+        "This creates CSV summaries and PNG plots under the visualization output folder, "
+        "then displays the main COCO-size statistics below."
+    )
+
+    result = None
+    if run_now:
+        progress = st.progress(0.0, text="Starting visualization calculation")
+        try:
+            progress.progress(0.15, text="Reading exported CSV and COCO JSON files")
+            with st.spinner("Calculating visualizations from exported dataset files..."):
+                result = create_visualizations_from_export(
+                    output_root=output_root,
+                    output_dir=Path(output_dir_text).expanduser(),
+                    include_square_crops=bool(include_square),
+                    include_baseline=bool(include_baseline),
+                    write_html_report=bool(write_html),
+                    max_rows_per_samples_csv=max_rows,
+                )
+            progress.progress(1.0, text="Visualization calculation complete")
+            st.success(f"Created {len(result.created_files)} files in {result.output_dir}")
+        except Exception as exc:
+            progress.progress(1.0, text="Visualization calculation failed")
+            st.exception(exc)
+            return
+
+    output_dir = Path(output_dir_text).expanduser()
+    _show_visualization_outputs(output_dir, result=result)
+
+
+def _infer_visualization_paths(path: Path) -> dict[str, Any]:
+    """Accept either an export root or a direct dataset subfolder."""
+    name = path.name
+    if name == "square_crops":
+        return {"output_root": path.parent, "include_square_crops": True, "include_baseline_uncropped": False}
+    if name == "baseline_uncropped":
+        return {"output_root": path.parent, "include_square_crops": False, "include_baseline_uncropped": True}
+    return {
+        "output_root": path,
+        "include_square_crops": (path / "square_crops").exists(),
+        "include_baseline_uncropped": (path / "baseline_uncropped").exists(),
+    }
+
+
+def _show_visualization_outputs(output_dir: Path, *, result: Any | None = None) -> None:
+    """Show generated tables and figures directly in Streamlit."""
+    st.divider()
+    st.markdown("### Visualization results")
+    if result is not None:
+        safe_summary = _streamlit_json_safe(getattr(result, "summary", {}) or {})
+        with st.expander("Visualization run summary", expanded=False):
+            st.json(safe_summary)
+
+    if not output_dir.exists():
+        st.info(f"No visualization output folder found yet: {output_dir}")
+        return
+
+    st.write(f"Output folder: `{output_dir}`")
+    html_path = output_dir / "index.html"
+    if html_path.exists():
+        st.write(f"HTML report: `{html_path}`")
+
+    table_specs = [
+        ("coco_box_size_stats.csv", "COCO small / medium / large box size statistics"),
+        ("coco_box_annotations.csv", "Per-box COCO annotation table"),
+        ("combined_summary.csv", "Combined image-level summary"),
+        ("sanity_report.json", "Sanity report"),
+    ]
+    for filename, title in table_specs:
+        path = output_dir / filename
+        if not path.exists():
+            continue
+        with st.expander(title, expanded=(filename == "coco_box_size_stats.csv")):
+            try:
+                if path.suffix.lower() == ".csv":
+                    df = pd.read_csv(path)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    st.download_button(
+                        f"Download {filename}",
+                        data=path.read_bytes(),
+                        file_name=filename,
+                        mime="text/csv",
+                        use_container_width=True,
+                        key=f"download_{filename}",
+                    )
+                else:
+                    obj = json.loads(path.read_text(encoding="utf-8"))
+                    st.json(obj)
+            except Exception as exc:
+                st.warning(f"Could not display {path}: {exc}")
+
+    st.markdown("### COCO-size plots")
+    coco_plot_files = [
+        "20_coco_box_size_counts.png",
+        "21_coco_box_size_percentages.png",
+        "22_coco_sqrt_box_area_hist.png",
+        "23_coco_box_width_height_scatter.png",
+    ]
+    available_plots = [output_dir / name for name in coco_plot_files if (output_dir / name).exists()]
+    if available_plots:
+        cols = st.columns(2)
+        for i, path in enumerate(available_plots):
+            with cols[i % 2]:
+                st.image(str(path), caption=path.name, use_container_width=True)
+    else:
+        st.info("No COCO-size plot PNGs found yet. Click Calculate / refresh visualizations.")
+
+    with st.expander("All generated PNG plots", expanded=False):
+        pngs = sorted(output_dir.glob("*.png"))
+        if not pngs:
+            st.write("No PNG plots found.")
+        else:
+            cols = st.columns(2)
+            for i, path in enumerate(pngs):
+                with cols[i % 2]:
+                    st.image(str(path), caption=path.name, use_container_width=True)
 
 
 # -----------------------------------------------------------------------------

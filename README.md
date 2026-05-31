@@ -1287,3 +1287,8 @@ Open:
 ```
 
 The report now includes COCO-style box-size statistics from the exported COCO/MMDetection JSON files. It writes `coco_box_size_stats.csv`, `coco_box_annotations.csv`, and plots for small, medium, and large object bins.
+
+
+### GUI visualization of an exported dataset
+
+The Streamlit GUI includes a **Dataset visualizations** mode. Enter an exported dataset root such as `/mnt/t9/preprocessed-vindr-v3`, click **Calculate / refresh visualizations**, and the app will display the COCO small/medium/large box-size tables and plots directly.
