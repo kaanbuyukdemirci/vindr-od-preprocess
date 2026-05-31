@@ -1074,10 +1074,104 @@ def _run_export_with_streamlit_progress(export_cfg: dict[str, Any]) -> None:
         result = export_from_config(export_cfg, progress_callback=update_progress)
         progress_bar.progress(1.0, text="Export complete")
         status_box.success(f"Export complete: {result.output_root}")
-        st.json(result.summary)
+        _render_export_result_summary(result)
     except Exception as exc:
         status_box.error(f"Export failed: {exc}")
         raise
+
+
+def _render_export_result_summary(result: Any) -> None:
+    """Render export completion info without passing circular objects to st.json."""
+    summary = _streamlit_json_safe(getattr(result, "summary", {}) or {})
+    output_root = Path(getattr(result, "output_root", ""))
+
+    st.subheader("Export result")
+    st.write(f"Output root: `{output_root}`")
+
+    summary_table_rows = []
+    for key in [
+        "num_source_images",
+        "rgb_scheme",
+        "histogram_equalization_enabled",
+    ]:
+        if key in summary:
+            summary_table_rows.append({"field": key, "value": summary.get(key)})
+
+    if isinstance(summary.get("splits"), dict):
+        for split, count in summary["splits"].items():
+            summary_table_rows.append({"field": f"split_{split}_source_images", "value": count})
+
+    if isinstance(summary.get("manifest"), dict):
+        manifest = summary["manifest"]
+        for key in ["status", "finished_at", "total_duration_minutes", "manifest_path", "done_path"]:
+            if key in manifest:
+                summary_table_rows.append({"field": f"manifest_{key}", "value": manifest.get(key)})
+
+    if summary_table_rows:
+        st.dataframe(pd.DataFrame(summary_table_rows), use_container_width=True, hide_index=True)
+
+    with st.expander("Full export summary", expanded=False):
+        st.json(summary)
+
+    summary_json = json.dumps(summary, indent=2, ensure_ascii=False)
+    st.download_button(
+        "Download export summary JSON",
+        data=summary_json,
+        file_name="export_summary_gui.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+
+def _streamlit_json_safe(value: Any, _seen: set[int] | None = None) -> Any:
+    """Make arbitrary nested values safe for st.json and json.dumps."""
+    if _seen is None:
+        _seen = set()
+
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        x = float(value)
+        return x if math.isfinite(x) else None
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+
+    if isinstance(value, dict):
+        obj_id = id(value)
+        if obj_id in _seen:
+            return "<circular_reference>"
+        _seen.add(obj_id)
+        try:
+            return {str(k): _streamlit_json_safe(v, _seen) for k, v in value.items()}
+        finally:
+            _seen.discard(obj_id)
+
+    if isinstance(value, (list, tuple, set)):
+        obj_id = id(value)
+        if obj_id in _seen:
+            return "<circular_reference>"
+        _seen.add(obj_id)
+        try:
+            return [_streamlit_json_safe(v, _seen) for v in value]
+        finally:
+            _seen.discard(obj_id)
+
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return str(value)
 
 # -----------------------------------------------------------------------------
 # Single and comparison rendering

@@ -219,8 +219,21 @@ def export_from_config(config: dict[str, Any], progress_callback: Callable[[dict
         ),
     )
     created_files.extend(manifest_files)
-    summary["manifest"] = manifest
-    return ExportResult(output_root=output_root, created_files=created_files, summary=summary)
+
+    # Keep the returned in-memory summary acyclic. The full manifest already
+    # contains a snapshot of ``summary`` and is written to disk, so placing the
+    # whole manifest back into summary would create:
+    # summary -> manifest -> summary. That breaks Streamlit/JSON display.
+    summary["manifest"] = {
+        "status": manifest.get("status"),
+        "started_at": manifest.get("started_at"),
+        "finished_at": manifest.get("finished_at"),
+        "total_duration_seconds": manifest.get("total_duration_seconds"),
+        "total_duration_minutes": manifest.get("total_duration_minutes"),
+        "manifest_path": _path_as_posix(output_root / "manifest.json"),
+        "done_path": _path_as_posix(output_root / "EXPORT_DONE.txt"),
+    }
+    return ExportResult(output_root=output_root, created_files=created_files, summary=_json_safe(summary))
 
 
 def _apply_vendor_filter_to_splits(
@@ -1999,8 +2012,11 @@ def _progress(iterable: Iterable[Any], enabled: bool, desc: str, unit: str = "it
     return iterable
 
 
-def _json_safe(value: Any) -> Any:
-    """Convert tensors, numpy values, paths, and NaNs to JSON-safe values."""
+def _json_safe(value: Any, _seen: set[int] | None = None) -> Any:
+    """Convert tensors, numpy values, paths, NaNs, and cycles to JSON-safe values."""
+    if _seen is None:
+        _seen = set()
+
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().tolist()
     if isinstance(value, np.ndarray):
@@ -2016,10 +2032,32 @@ def _json_safe(value: Any) -> Any:
         return _path_as_posix(value)
     if isinstance(value, float):
         return value if math.isfinite(value) else None
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+
     if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
-    if pd.isna(value) if not isinstance(value, (list, tuple, dict, np.ndarray, torch.Tensor)) else False:
-        return None
-    return value
+        obj_id = id(value)
+        if obj_id in _seen:
+            return "<circular_reference>"
+        _seen.add(obj_id)
+        try:
+            return {str(k): _json_safe(v, _seen) for k, v in value.items()}
+        finally:
+            _seen.discard(obj_id)
+
+    if isinstance(value, (list, tuple, set)):
+        obj_id = id(value)
+        if obj_id in _seen:
+            return "<circular_reference>"
+        _seen.add(obj_id)
+        try:
+            return [_json_safe(v, _seen) for v in value]
+        finally:
+            _seen.discard(obj_id)
+
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return str(value)
