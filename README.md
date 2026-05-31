@@ -1269,3 +1269,21 @@ vindr-mammo-export --config config/export_config.yaml
 The preprocessing GUI now includes an **Export dataset from GUI** panel. It supports selected-vendor export, split-specific mass-window-only export for train/val/test, output folder/name controls, and a progress bar while the dataset is being written.
 
 Use it when you want the exported dataset to exactly match the current GUI preprocessing settings without manually editing `config/export_config.yaml`.
+
+## Visualizing cropped dataset and COCO box-size bins
+
+After an export finishes, regenerate the visualization report with:
+
+```bash
+vindr-mammo-visualize --config config/export_config.yaml
+```
+
+or run `visualize_export.py` from VSCode.
+
+Open:
+
+```text
+<output_root>/visualizations/index.html
+```
+
+The report now includes COCO-style box-size statistics from the exported COCO/MMDetection JSON files. It writes `coco_box_size_stats.csv`, `coco_box_annotations.csv`, and plots for small, medium, and large object bins.

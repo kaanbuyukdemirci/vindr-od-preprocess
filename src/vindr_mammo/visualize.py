@@ -22,6 +22,15 @@ except Exception:  # pragma: no cover
 SPLIT_ORDER = ["train", "val", "test"]
 DATASET_ORDER = ["square_crops", "baseline_uncropped"]
 
+# COCO evaluation area ranges for bbox AP. In pycocotools these are
+# [0, 32^2], [32^2, 96^2], [96^2, 1e5^2]. For dataset summaries we assign
+# each box to exactly one non-overlapping bin using sqrt(area):
+# small < 32 px, medium 32 <= sqrt(area) < 96 px, large >= 96 px.
+COCO_SMALL_SIDE = 32.0
+COCO_LARGE_SIDE = 96.0
+COCO_SMALL_AREA = COCO_SMALL_SIDE ** 2
+COCO_LARGE_AREA = COCO_LARGE_SIDE ** 2
+
 
 @dataclass
 class VisualizationResult:
@@ -110,6 +119,7 @@ def create_visualizations_from_export(
     summaries: list[pd.DataFrame] = []
     samples: list[pd.DataFrame] = []
     metadata_flat: list[pd.DataFrame] = []
+    coco_boxes: list[pd.DataFrame] = []
     warnings: list[str] = []
 
     for dataset_name in dataset_names:
@@ -142,10 +152,18 @@ def create_visualizations_from_export(
             df["dataset"] = df.get("dataset", dataset_name)
             metadata_flat.append(df)
 
+        coco_dir = output_root / dataset_name / "mmdetection" / "annotations"
+        if coco_dir.exists():
+            for split in SPLIT_ORDER:
+                coco_path = coco_dir / f"instances_{split}.json"
+                if coco_path.exists():
+                    coco_boxes.append(_read_coco_box_dataframe(coco_path, dataset_name=dataset_name, split=split))
+
     created: list[Path] = []
     summary_df = pd.concat(summaries, ignore_index=True) if summaries else pd.DataFrame()
     samples_df = pd.concat(samples, ignore_index=True) if samples else pd.DataFrame()
     meta_df = pd.concat(metadata_flat, ignore_index=True) if metadata_flat else pd.DataFrame()
+    coco_box_df = pd.concat(coco_boxes, ignore_index=True) if coco_boxes else pd.DataFrame()
 
     # Save combined copies so the user can inspect everything in one place.
     if not summary_df.empty:
@@ -156,11 +174,21 @@ def create_visualizations_from_export(
         p = output_dir / "combined_samples.csv"
         samples_df.to_csv(p, index=False)
         created.append(p)
+    if not coco_box_df.empty:
+        p = output_dir / "coco_box_annotations.csv"
+        coco_box_df.to_csv(p, index=False)
+        created.append(p)
+        stats = _coco_box_size_summary(coco_box_df)
+        p = output_dir / "coco_box_size_stats.csv"
+        stats.to_csv(p, index=False)
+        created.append(p)
 
     if not summary_df.empty:
         created.extend(_plot_summary_figures(summary_df, output_dir))
     if not samples_df.empty:
         created.extend(_plot_sample_figures(samples_df, output_dir))
+    if not coco_box_df.empty:
+        created.extend(_plot_coco_box_size_figures(coco_box_df, output_dir))
     if not meta_df.empty:
         created.extend(_plot_metadata_figures(meta_df, output_dir))
 
@@ -169,6 +197,8 @@ def create_visualizations_from_export(
         created.extend(_plot_manifest_figures(manifest_path, output_dir))
 
     sanity = _sanity_report(output_root, dataset_names, summary_df)
+    if not coco_box_df.empty:
+        sanity["coco_box_size_stats"] = _coco_box_size_summary(coco_box_df).to_dict(orient="records")
     sanity_path = output_dir / "sanity_report.json"
     with open(sanity_path, "w", encoding="utf-8") as f:
         json.dump(_json_safe({"warnings": warnings, **sanity}), f, indent=2, ensure_ascii=False)
@@ -315,6 +345,173 @@ def _plot_sample_figures(df: pd.DataFrame, output_dir: Path) -> list[Path]:
 
     return created
 
+
+
+def _read_coco_box_dataframe(coco_path: Path, *, dataset_name: str, split: str) -> pd.DataFrame:
+    """Read per-box statistics from an exported COCO/MMDetection JSON file."""
+    with open(coco_path, "r", encoding="utf-8") as f:
+        coco = json.load(f)
+
+    images = {img.get("id"): img for img in coco.get("images", [])}
+    rows: list[dict[str, Any]] = []
+    for ann in coco.get("annotations", []):
+        bbox = ann.get("bbox", [np.nan, np.nan, np.nan, np.nan])
+        if len(bbox) < 4:
+            continue
+        x, y, w, h = bbox[:4]
+        try:
+            x = float(x)
+            y = float(y)
+            w = float(w)
+            h = float(h)
+        except Exception:
+            continue
+        area = ann.get("area", w * h)
+        try:
+            area = float(area)
+        except Exception:
+            area = float(w * h)
+        if not np.isfinite(area) or area < 0:
+            area = float(w * h)
+        sqrt_area = float(np.sqrt(area)) if area >= 0 else np.nan
+        if sqrt_area < COCO_SMALL_SIDE:
+            coco_size = "small"
+        elif sqrt_area < COCO_LARGE_SIDE:
+            coco_size = "medium"
+        else:
+            coco_size = "large"
+        img = images.get(ann.get("image_id"), {})
+        rows.append({
+            "dataset": dataset_name,
+            "split": split,
+            "coco_json": str(coco_path),
+            "image_id": ann.get("image_id"),
+            "file_name": img.get("file_name"),
+            "annotation_id": ann.get("id"),
+            "category_id": ann.get("category_id"),
+            "bbox_x": x if np.isfinite(x) else np.nan,
+            "bbox_y": y if np.isfinite(y) else np.nan,
+            "bbox_width_px": w,
+            "bbox_height_px": h,
+            "bbox_area_px2": area,
+            "bbox_sqrt_area_px": sqrt_area,
+            "bbox_aspect_ratio_w_over_h": (w / h) if np.isfinite(h) and h > 0 else np.nan,
+            "coco_size": coco_size,
+            "is_coco_small": bool(coco_size == "small"),
+            "is_coco_medium": bool(coco_size == "medium"),
+            "is_coco_large": bool(coco_size == "large"),
+        })
+    return pd.DataFrame(rows)
+
+
+def _coco_box_size_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Summarize COCO small/medium/large box counts by dataset and split."""
+    if df.empty:
+        return pd.DataFrame()
+    data = df.copy()
+    data["coco_size"] = pd.Categorical(data["coco_size"], categories=["small", "medium", "large"], ordered=True)
+    rows: list[dict[str, Any]] = []
+    for keys, group in data.groupby(["dataset", "split"], observed=True, dropna=False):
+        dataset, split = keys
+        total = int(len(group))
+        counts = group["coco_size"].value_counts().to_dict()
+        row = {
+            "dataset": str(dataset),
+            "split": str(split),
+            "num_boxes": total,
+            "small_boxes": int(counts.get("small", 0)),
+            "medium_boxes": int(counts.get("medium", 0)),
+            "large_boxes": int(counts.get("large", 0)),
+            "small_percent": 100.0 * int(counts.get("small", 0)) / total if total else 0.0,
+            "medium_percent": 100.0 * int(counts.get("medium", 0)) / total if total else 0.0,
+            "large_percent": 100.0 * int(counts.get("large", 0)) / total if total else 0.0,
+            "median_width_px": float(group["bbox_width_px"].median()) if total else np.nan,
+            "median_height_px": float(group["bbox_height_px"].median()) if total else np.nan,
+            "median_sqrt_area_px": float(group["bbox_sqrt_area_px"].median()) if total else np.nan,
+            "p10_sqrt_area_px": float(group["bbox_sqrt_area_px"].quantile(0.10)) if total else np.nan,
+            "p90_sqrt_area_px": float(group["bbox_sqrt_area_px"].quantile(0.90)) if total else np.nan,
+        }
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = _ordered(out)
+    return out
+
+
+def _plot_coco_box_size_figures(df: pd.DataFrame, output_dir: Path) -> list[Path]:
+    created: list[Path] = []
+    data = df.copy()
+    if data.empty:
+        return created
+    data = _ordered(data)
+    data["coco_size"] = pd.Categorical(data["coco_size"], categories=["small", "medium", "large"], ordered=True)
+
+    stats = _coco_box_size_summary(data)
+    if not stats.empty:
+        label_col = "split_label" if "split_label" in stats.columns else "split"
+        fig, ax = plt.subplots(figsize=(11, 5))
+        x = np.arange(len(stats))
+        bottom = np.zeros(len(stats))
+        for size, col in [("small", "small_boxes"), ("medium", "medium_boxes"), ("large", "large_boxes")]:
+            vals = pd.to_numeric(stats[col], errors="coerce").fillna(0).to_numpy()
+            ax.bar(x, vals, bottom=bottom, label=size)
+            bottom += vals
+        ax.set_title("COCO box size categories by dataset and split")
+        ax.set_xlabel("")
+        ax.set_ylabel("number of boxes")
+        ax.set_xticks(x)
+        ax.set_xticklabels(stats[label_col].astype(str), rotation=30, ha="right")
+        ax.legend(loc="best")
+        p = output_dir / "20_coco_box_size_counts.png"
+        _savefig(fig, p)
+        created.append(p)
+
+        fig, ax = plt.subplots(figsize=(11, 5))
+        bottom = np.zeros(len(stats))
+        for size, col in [("small", "small_percent"), ("medium", "medium_percent"), ("large", "large_percent")]:
+            vals = pd.to_numeric(stats[col], errors="coerce").fillna(0).to_numpy()
+            ax.bar(x, vals, bottom=bottom, label=size)
+            bottom += vals
+        ax.set_title("COCO box size percentages by dataset and split")
+        ax.set_xlabel("")
+        ax.set_ylabel("boxes (%)")
+        ax.set_xticks(x)
+        ax.set_xticklabels(stats[label_col].astype(str), rotation=30, ha="right")
+        ax.set_ylim(0, 100)
+        ax.legend(loc="best")
+        p = output_dir / "21_coco_box_size_percentages.png"
+        _savefig(fig, p)
+        created.append(p)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for label, group in data.groupby(["dataset", "split"], observed=True, dropna=False):
+        values = pd.to_numeric(group["bbox_sqrt_area_px"], errors="coerce").dropna()
+        if len(values):
+            ax.hist(values, bins=45, alpha=0.35, label="/".join(map(str, label)))
+    ax.axvline(COCO_SMALL_SIDE, linestyle="--", linewidth=1)
+    ax.axvline(COCO_LARGE_SIDE, linestyle="--", linewidth=1)
+    ax.text(COCO_SMALL_SIDE, ax.get_ylim()[1] * 0.95, "32 px", rotation=90, va="top", ha="right")
+    ax.text(COCO_LARGE_SIDE, ax.get_ylim()[1] * 0.95, "96 px", rotation=90, va="top", ha="right")
+    ax.set_title("COCO size distribution by sqrt(box area)")
+    ax.set_xlabel("sqrt(box area) in pixels")
+    ax.set_ylabel("boxes")
+    ax.legend(loc="best", fontsize=8)
+    p = output_dir / "22_coco_sqrt_box_area_hist.png"
+    _savefig(fig, p)
+    created.append(p)
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    for size, group in data.groupby("coco_size", observed=True, dropna=False):
+        ax.scatter(group["bbox_width_px"], group["bbox_height_px"], s=10, alpha=0.35, label=str(size))
+    ax.set_title("Box width vs height colored by COCO area bin")
+    ax.set_xlabel("box width (pixels)")
+    ax.set_ylabel("box height (pixels)")
+    ax.legend(loc="best")
+    p = output_dir / "23_coco_box_width_height_scatter.png"
+    _savefig(fig, p)
+    created.append(p)
+
+    return created
 
 def _plot_metadata_figures(df: pd.DataFrame, output_dir: Path) -> list[Path]:
     created: list[Path] = []

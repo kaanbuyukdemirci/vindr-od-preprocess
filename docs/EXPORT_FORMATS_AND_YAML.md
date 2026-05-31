@@ -564,3 +564,32 @@ square_crops:
 ```
 
 The exporter stores `foreground_filter_enabled`, `foreground_fraction`, and `min_foreground_fraction` in `samples.csv` and per-sample metadata so you can audit which crops passed the filter.
+
+## COCO size statistics in visualization reports
+
+The visualization command now reads the exported COCO/MMDetection annotation files under:
+
+```text
+<output_root>/square_crops/mmdetection/annotations/instances_train.json
+<output_root>/square_crops/mmdetection/annotations/instances_val.json
+<output_root>/square_crops/mmdetection/annotations/instances_test.json
+```
+
+It computes per-box COCO-style object size bins using bbox area in pixels:
+
+- small: `sqrt(area) < 32`, approximately area `< 32 x 32`
+- medium: `32 <= sqrt(area) < 96`, approximately `32 x 32` to `< 96 x 96`
+- large: `sqrt(area) >= 96`, approximately area `>= 96 x 96`
+
+The report writes:
+
+```text
+visualizations/coco_box_annotations.csv
+visualizations/coco_box_size_stats.csv
+visualizations/20_coco_box_size_counts.png
+visualizations/21_coco_box_size_percentages.png
+visualizations/22_coco_sqrt_box_area_hist.png
+visualizations/23_coco_box_width_height_scatter.png
+```
+
+These are meant to help interpret AP_small, AP_medium, and AP_large behavior in COCO-style evaluation.
