@@ -328,3 +328,28 @@ The GUI also has a **Dataset visualizations** mode. Use this when you already ex
 4. Click **Calculate / refresh visualizations**.
 
 The GUI writes the usual visualization files under `<export_root>/visualizations` by default and displays the COCO small/medium/large box-size tables and plots directly in the app. The COCO bins follow the standard detection AP area ranges: small boxes have area less than `32^2`, medium boxes have area from `32^2` to less than `96^2`, and large boxes have area at least `96^2`.
+
+## GUI export progress and split-specific deterministic sampling
+
+The GUI export panel now shows elapsed time and an estimated remaining time next to the Streamlit progress bar. The estimate is based on the current overall export fraction, so it becomes more stable after the first few export steps.
+
+For deterministic square-crop exports, each split can now use one of three selection modes:
+
+- `mass_only`: keep only deterministic windows with at least one visible mass.
+- `all`: keep every deterministic sliding-window crop.
+- `positive_ratio`: keep all mass-positive deterministic windows, then sample non-mass windows to approach the requested positive crop ratio for that split.
+
+The corresponding YAML keys are:
+
+```yaml
+square_crops:
+  train_deterministic_selection_mode: mass_only
+  val_deterministic_selection_mode: all
+  test_deterministic_selection_mode: all
+
+  train_deterministic_target_positive_ratio: 0.80
+  val_deterministic_target_positive_ratio: 0.80
+  test_deterministic_target_positive_ratio: 0.80
+```
+
+The older `train_deterministic_include_empty`, `val_deterministic_include_empty`, and `test_deterministic_include_empty` keys are still written for backward compatibility.

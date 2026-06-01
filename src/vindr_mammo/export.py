@@ -181,6 +181,14 @@ def export_from_config(config: dict[str, Any], progress_callback: Callable[[dict
             "val": crop_cfg_for_summary.get("val_deterministic_include_empty", crop_cfg_for_summary.get("deterministic_include_empty", True)),
             "test": crop_cfg_for_summary.get("test_deterministic_include_empty", crop_cfg_for_summary.get("deterministic_include_empty", True)),
         },
+        "deterministic_selection_mode": {
+            split: _deterministic_selection_mode(crop_cfg_for_summary, split)
+            for split in ["train", "val", "test"]
+        },
+        "deterministic_target_positive_ratio": {
+            split: _deterministic_target_positive_ratio(crop_cfg_for_summary, split)
+            for split in ["train", "val", "test"]
+        },
         "vendor_filter": vendor_filter_summary,
     }
 
@@ -477,8 +485,140 @@ def export_square_crop_datasets(
             preprocessed_cache.popitem(last=False)
         return value
 
+    def save_window(
+        *,
+        record: dict[str, Any],
+        split_name: str,
+        crop_number: int,
+        window: tuple[int, int, int, int],
+        extra_info: dict[str, Any],
+    ) -> bool:
+        nonlocal image_id_counter, ann_id_counter
+        image, target = get_preprocessed(record)
+        crop_result = crop_image_and_boxes_to_window(
+            image,
+            boxes=target["boxes"],
+            mass_boxes=target["mass"]["boxes"],
+            window_xyxy=window,
+            options=common_crop_options,
+        )
+        boxes = crop_result.mass_boxes
+        if str(extra_info.get("deterministic_selection_mode", "")).casefold() == "mass_only" and boxes.shape[0] == 0:
+            return False
+        if int(extra_info.get("deterministic_include_empty", 1)) == 0 and boxes.shape[0] == 0:
+            return False
+
+        filename = _make_crop_filename(record, split_name, crop_number, window)
+        rel_img_path = Path("images") / split_name / filename
+        source_arrays = None
+        if needs_contralateral:
+            source_arrays = _contralateral_source_arrays_for_window(
+                record=record,
+                window=window,
+                crop_options=common_crop_options,
+                contralateral_lookup=contralateral_lookup,
+                get_preprocessed=get_preprocessed,
+            )
+        save_info = _save_export_images(crop_result.image, crop_root, rel_img_path, config, source_arrays=source_arrays)
+
+        labels_path = crop_root / "labels" / split_name / f"{Path(filename).stem}.txt"
+        _write_yolo_label_file(labels_path, boxes, width=crop_size, height=crop_size, save_empty=save_empty_labels)
+
+        crop_info = {"window_xyxy": window, **extra_info, **crop_result.info}
+        image_meta = _coco_image_record(
+            image_id_counter,
+            filename,
+            crop_size,
+            crop_size,
+            record,
+            save_info,
+            split_name,
+            dataset_name="square_crops",
+            crop_info=crop_info,
+        )
+        coco = coco_by_split[split_name]
+        coco["images"].append(image_meta)
+        ann_rows = _append_coco_annotations(coco, image_id_counter, ann_id_counter, boxes)
+        ann_id_counter += ann_rows
+        stats_rows.append(
+            _sample_stats_row(
+                dataset_name="square_crops",
+                split=split_name,
+                filename=filename,
+                image_width=crop_size,
+                image_height=crop_size,
+                boxes=boxes,
+                record=record,
+                crop_info=crop_info,
+                save_info=save_info,
+            )
+        )
+        metadata_rows.append(
+            _sample_metadata_record(
+                dataset_name="square_crops",
+                split=split_name,
+                filename=filename,
+                target=target,
+                record=record,
+                boxes=boxes,
+                save_info=save_info,
+                crop_info=crop_info,
+            )
+        )
+        image_id_counter += 1
+        return True
+
     for split_name in ["train", "val", "test"]:
         records = split_records.get(split_name, [])
+        split_mode = str(crop_cfg.get(f"{split_name}_crop_mode", "random" if split_name == "train" else "deterministic")).casefold().strip()
+        selection_mode = _deterministic_selection_mode(crop_cfg, split_name) if split_mode == "deterministic" else ""
+
+        if split_mode == "deterministic" and selection_mode == "positive_ratio":
+            candidates: list[tuple[dict[str, Any], tuple[int, int, int, int], dict[str, Any]]] = []
+            iterator = _progress(records, show_progress, f"Plan square crops {split_name}", unit="img")
+            for record in iterator:
+                image, target = get_preprocessed(record)
+                height, width = int(image.shape[-2]), int(image.shape[-1])
+                windows = _windows_for_export_split(
+                    split_name=split_name,
+                    image_width=width,
+                    image_height=height,
+                    image_tensor=image,
+                    mass_boxes=target["mass"]["boxes"],
+                    crop_options=common_crop_options,
+                    crop_cfg=crop_cfg,
+                    rng=rng,
+                )
+                candidates.extend((record, window, extra_info) for window, extra_info in windows)
+                processed_records_for_progress += 1
+                if progress_callback is not None:
+                    progress_callback({
+                        "event": "image_progress",
+                        "stage": "export_square_crops",
+                        "split": f"{split_name} planning",
+                        "processed": int(processed_records_for_progress),
+                        "total": int(total_records_for_progress),
+                        "unit": "source images",
+                    })
+
+            selected = _select_positive_ratio_candidates(candidates, crop_cfg, split_name, rng)
+            save_iter = _progress(selected, show_progress, f"Save square crops {split_name}", unit="crop")
+            total_selected = len(selected)
+            saved_count = 0
+            for crop_number, (record, window, extra_info) in enumerate(save_iter):
+                if save_window(record=record, split_name=split_name, crop_number=crop_number, window=window, extra_info=extra_info):
+                    saved_count += 1
+                if progress_callback is not None:
+                    progress_callback({
+                        "event": "image_progress",
+                        "stage": "export_square_crops",
+                        "split": f"{split_name} saving",
+                        "processed": int(crop_number + 1),
+                        "total": int(total_selected),
+                        "unit": "crops",
+                    })
+            continue
+
         iterator = _progress(records, show_progress, f"Export square crops {split_name}", unit="img")
         for record in iterator:
             image, target = get_preprocessed(record)
@@ -494,77 +634,7 @@ def export_square_crop_datasets(
                 rng=rng,
             )
             for crop_number, (window, extra_info) in enumerate(windows):
-                crop_result = crop_image_and_boxes_to_window(
-                    image,
-                    boxes=target["boxes"],
-                    mass_boxes=target["mass"]["boxes"],
-                    window_xyxy=window,
-                    options=common_crop_options,
-                )
-                boxes = crop_result.mass_boxes
-                # Safety guard for split-specific positive-only deterministic exports.
-                # Window selection should already have removed empty windows, but this
-                # protects against any future annotation-policy change.
-                if int(extra_info.get("deterministic_include_empty", 1)) == 0 and boxes.shape[0] == 0:
-                    continue
-
-                filename = _make_crop_filename(record, split_name, crop_number, window)
-                rel_img_path = Path("images") / split_name / filename
-                source_arrays = None
-                if needs_contralateral:
-                    source_arrays = _contralateral_source_arrays_for_window(
-                        record=record,
-                        window=window,
-                        crop_options=common_crop_options,
-                        contralateral_lookup=contralateral_lookup,
-                        get_preprocessed=get_preprocessed,
-                    )
-                save_info = _save_export_images(crop_result.image, crop_root, rel_img_path, config, source_arrays=source_arrays)
-
-                labels_path = crop_root / "labels" / split_name / f"{Path(filename).stem}.txt"
-                _write_yolo_label_file(labels_path, boxes, width=crop_size, height=crop_size, save_empty=save_empty_labels)
-
-                image_meta = _coco_image_record(
-                    image_id_counter,
-                    filename,
-                    crop_size,
-                    crop_size,
-                    record,
-                    save_info,
-                    split_name,
-                    dataset_name="square_crops",
-                    crop_info={"window_xyxy": window, **extra_info, **crop_result.info},
-                )
-                coco = coco_by_split[split_name]
-                coco["images"].append(image_meta)
-                ann_rows = _append_coco_annotations(coco, image_id_counter, ann_id_counter, boxes)
-                ann_id_counter += ann_rows
-                stats_rows.append(
-                    _sample_stats_row(
-                        dataset_name="square_crops",
-                        split=split_name,
-                        filename=filename,
-                        image_width=crop_size,
-                        image_height=crop_size,
-                        boxes=boxes,
-                        record=record,
-                        crop_info={"window_xyxy": window, **extra_info, **crop_result.info},
-                        save_info=save_info,
-                    )
-                )
-                metadata_rows.append(
-                    _sample_metadata_record(
-                        dataset_name="square_crops",
-                        split=split_name,
-                        filename=filename,
-                        target=target,
-                        record=record,
-                        boxes=boxes,
-                        save_info=save_info,
-                        crop_info={"window_xyxy": window, **extra_info, **crop_result.info},
-                    )
-                )
-                image_id_counter += 1
+                save_window(record=record, split_name=split_name, crop_number=crop_number, window=window, extra_info=extra_info)
             processed_records_for_progress += 1
             if progress_callback is not None:
                 progress_callback({
@@ -573,6 +643,7 @@ def export_square_crop_datasets(
                     "split": split_name,
                     "processed": int(processed_records_for_progress),
                     "total": int(total_records_for_progress),
+                    "unit": "source images",
                 })
 
     created = _write_shared_export_files(crop_root, coco_by_split, stats_rows, metadata_rows, dataset_kind="square_crops")
@@ -592,6 +663,82 @@ def _split_crop_cfg(crop_cfg: dict[str, Any], split_name: str, key: str, default
     if key in crop_cfg and crop_cfg.get(key) is not None:
         return crop_cfg.get(key)
     return default
+
+
+def _deterministic_selection_mode(crop_cfg: dict[str, Any], split_name: str) -> str:
+    mode = str(_split_crop_cfg(crop_cfg, split_name, "deterministic_selection_mode", "") or "").strip().casefold()
+    aliases = {
+        "all": "all",
+        "all_windows": "all",
+        "mass_only": "mass_only",
+        "positive_only": "mass_only",
+        "mass only": "mass_only",
+        "positive_ratio": "positive_ratio",
+        "all_mass_plus_sampled_non_mass": "positive_ratio",
+        "all mass + sampled non-mass": "positive_ratio",
+    }
+    if mode in aliases:
+        return aliases[mode]
+    include_empty = bool(
+        crop_cfg.get(
+            f"{split_name}_deterministic_include_empty",
+            crop_cfg.get("deterministic_include_empty", True),
+        )
+    )
+    return "all" if include_empty else "mass_only"
+
+
+def _deterministic_target_positive_ratio(crop_cfg: dict[str, Any], split_name: str) -> float:
+    value = _split_crop_cfg(
+        crop_cfg,
+        split_name,
+        "deterministic_target_positive_ratio",
+        crop_cfg.get("deterministic_target_positive_ratio", crop_cfg.get("positive_fraction", 0.80)),
+    )
+    try:
+        ratio = float(value)
+    except Exception:
+        ratio = 0.80
+    return min(max(ratio, 0.01), 1.0)
+
+
+def _select_positive_ratio_candidates(
+    candidates: list[tuple[dict[str, Any], tuple[int, int, int, int], dict[str, Any]]],
+    crop_cfg: dict[str, Any],
+    split_name: str,
+    rng: np.random.Generator,
+) -> list[tuple[dict[str, Any], tuple[int, int, int, int], dict[str, Any]]]:
+    target_ratio = _deterministic_target_positive_ratio(crop_cfg, split_name)
+    positives = [c for c in candidates if int(c[2].get("is_positive_window", 0)) == 1]
+    negatives = [c for c in candidates if int(c[2].get("is_positive_window", 0)) == 0]
+    if not positives:
+        return []
+    if target_ratio >= 1.0 or not negatives:
+        selected = positives
+    else:
+        wanted_negatives = int(round(len(positives) * (1.0 - target_ratio) / target_ratio))
+        wanted_negatives = min(max(0, wanted_negatives), len(negatives))
+        if wanted_negatives > 0:
+            indices = rng.choice(len(negatives), size=wanted_negatives, replace=False)
+            selected_negatives = [negatives[int(i)] for i in indices]
+        else:
+            selected_negatives = []
+        selected = positives + selected_negatives
+    # Keep deterministic/reproducible ordering by source image and window position.
+    selected.sort(key=lambda c: (str(c[0].get("image_id", "")), int(c[1][1]), int(c[1][0]), int(c[1][3]), int(c[1][2])))
+    selected_count = len(selected)
+    positive_count = len(positives)
+    negative_count = max(0, selected_count - positive_count)
+    achieved_ratio = float(positive_count / selected_count) if selected_count else 0.0
+    out = []
+    for record, window, extra in selected:
+        e = dict(extra)
+        e["deterministic_target_positive_ratio"] = float(target_ratio)
+        e["deterministic_achieved_positive_ratio"] = float(achieved_ratio)
+        e["deterministic_selected_positive_windows"] = int(positive_count)
+        e["deterministic_selected_negative_windows"] = int(negative_count)
+        out.append((record, window, e))
+    return out
 
 
 def _windows_for_export_split(
@@ -620,17 +767,18 @@ def _windows_for_export_split(
             stride=int(crop_cfg.get("stride", 512)),
         )
 
-        # Split-specific empty-window control. This is useful for experiments such as
-        # v3, where training should be deterministic but positive-only, while
-        # validation/test should remain full sliding-window evaluations.
-        include_empty = bool(
-            crop_cfg.get(
-                f"{split_name}_deterministic_include_empty",
-                crop_cfg.get("deterministic_include_empty", True),
-            )
-        )
-        if not include_empty:
-            windows = [w for w in windows if window_has_positive_mass(w, mass_boxes, crop_options)]
+        selection_mode = _deterministic_selection_mode(crop_cfg, split_name)
+        target_positive_ratio = _deterministic_target_positive_ratio(crop_cfg, split_name)
+        include_empty = selection_mode != "mass_only"
+
+        # Compute positivity before any selection so the positive-ratio mode can
+        # keep all mass windows and then globally sample non-mass windows.
+        positive_by_window = {
+            w: bool(window_has_positive_mass(w, mass_boxes, crop_options))
+            for w in windows
+        }
+        if selection_mode == "mass_only":
+            windows = [w for w in windows if positive_by_window.get(w, False)]
 
         foreground_filter_enabled = bool(_split_crop_cfg(
             crop_cfg,
@@ -672,6 +820,9 @@ def _windows_for_export_split(
                     "crop_mode": "deterministic",
                     "split_crop_mode": split_mode,
                     "deterministic_include_empty": int(include_empty),
+                    "deterministic_selection_mode": selection_mode,
+                    "deterministic_target_positive_ratio": float(target_positive_ratio),
+                    "is_positive_window": int(bool(positive_by_window.get(w, False))),
                     "foreground_filter_enabled": int(foreground_filter_enabled),
                     "min_foreground_fraction": float(min_foreground_fraction),
                     "foreground_fraction": foreground_fractions.get(w, None),
@@ -1068,6 +1219,15 @@ def _make_custom_channel_pipeline_rgb(
     }
     source_arrays = dict(source_arrays or {})
     source_arrays.setdefault("current_crop", arr)
+    source_masks: dict[str, np.ndarray] = {}
+    for key, value in source_arrays.items():
+        if value is None:
+            continue
+        try:
+            source_masks[key] = _foreground_mask(np.asarray(value, dtype=np.float32))
+        except Exception:
+            source_masks[key] = mask
+
     for channel in ["R", "G", "B"]:
         source_name = _custom_channel_source(pipeline, channel)
         if source_name not in source_arrays or source_arrays.get(source_name) is None:
@@ -1078,6 +1238,13 @@ def _make_custom_channel_pipeline_rgb(
             work = np.asarray(source_arrays[source_name], dtype=np.float32).copy()
             source_used = source_name
             source_fallback = False
+        # Use a source-specific foreground mask for percentile/statistics operations.
+        # This is important for contralateral channels and for full-image crops with
+        # large black background.
+        stat_mask = source_masks.get(source_used, mask)
+        if stat_mask is not None and stat_mask.shape != work.shape:
+            stat_mask = _foreground_mask(work)
+
         applied: list[dict[str, Any]] = []
         for step in _custom_channel_steps(pipeline, channel):
             if not isinstance(step, dict):
@@ -1086,7 +1253,9 @@ def _make_custom_channel_pipeline_rgb(
             params = step.get("params", {}) or {}
             if op in {"none", "", "null"}:
                 continue
-            work = _apply_custom_channel_operation(work, op, params, mask)
+            work = _apply_custom_channel_operation(work, op, params, stat_mask)
+            if stat_mask is not None and stat_mask.shape != work.shape:
+                stat_mask = _foreground_mask(work)
             applied.append({"op": op, "params": params})
         channels.append(_float_to_uint8_custom(work))
         meta[f"custom_{channel}_source_requested"] = source_name

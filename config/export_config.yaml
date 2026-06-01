@@ -98,7 +98,8 @@ image_export:
           - 1.0
           - 99.0
           clip_output: true
-  contralateral_note: B channel uses the same crop coordinates from the opposite breast with the same view position when available.
+  contralateral_note: B channel uses the same crop coordinates from the opposite breast
+    with the same view position when available.
 histogram_equalization:
   enabled: false
   apply_to: third_channel
@@ -152,6 +153,13 @@ square_crops:
   seed: 123
   pad_if_needed: true
   pad_value: 0.0
+  train_deterministic_selection_mode: mass_only
+  val_deterministic_selection_mode: all
+  test_deterministic_selection_mode: all
+  deterministic_target_positive_ratio: 0.8
+  train_deterministic_target_positive_ratio: 0.8
+  val_deterministic_target_positive_ratio: 0.8
+  test_deterministic_target_positive_ratio: 0.8
 crop_annotation_policy:
   allow_partial_annotations: false
   min_box_visibility: 0.3

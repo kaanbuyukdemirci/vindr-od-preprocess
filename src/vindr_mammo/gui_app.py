@@ -5,6 +5,7 @@ import io
 import json
 import math
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -1037,6 +1038,84 @@ def _op_parameter_controls(channel: str, step: int, op: str) -> dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 
+
+def _selection_mode_from_config(crop_cfg: dict[str, Any], split: str) -> str:
+    mode = str(crop_cfg.get(f"{split}_deterministic_selection_mode", "") or "").strip().casefold()
+    aliases = {
+        "mass only": "mass_only",
+        "mass_only": "mass_only",
+        "positive_only": "mass_only",
+        "all": "all",
+        "all windows": "all",
+        "positive_ratio": "positive_ratio",
+        "all mass + sampled non-mass": "positive_ratio",
+        "all_mass_plus_sampled_non_mass": "positive_ratio",
+    }
+    if mode in aliases:
+        return aliases[mode]
+    include_empty = bool(crop_cfg.get(f"{split}_deterministic_include_empty", crop_cfg.get("deterministic_include_empty", True)))
+    return "all" if include_empty else "mass_only"
+
+
+def _deterministic_selection_controls(crop_cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    options = ["mass only", "all", "all mass + sampled non-mass"]
+    mode_to_label = {
+        "mass_only": "mass only",
+        "all": "all",
+        "positive_ratio": "all mass + sampled non-mass",
+    }
+    payload: dict[str, dict[str, Any]] = {}
+    cols = st.columns(3)
+    for split, col in zip(["train", "val", "test"], cols):
+        with col:
+            current_mode = _selection_mode_from_config(crop_cfg, split)
+            label = mode_to_label.get(current_mode, "all")
+            selected_label = st.radio(
+                f"{split.title()} windows",
+                options,
+                index=options.index(label),
+                key=f"gui_export_{split}_deterministic_selection_mode",
+                help=(
+                    "mass only exports only crops with visible mass. all exports every deterministic window. "
+                    "all mass + sampled non-mass keeps all positive windows and samples enough negative windows "
+                    "to approach the target positive crop ratio for that split."
+                ),
+            )
+            target_ratio = float(crop_cfg.get(f"{split}_deterministic_target_positive_ratio", crop_cfg.get("deterministic_target_positive_ratio", crop_cfg.get("positive_fraction", 0.80))))
+            if selected_label == "all mass + sampled non-mass":
+                target_ratio = st.slider(
+                    f"{split.title()} target positive ratio",
+                    min_value=0.01,
+                    max_value=1.0,
+                    value=min(max(target_ratio, 0.01), 1.0),
+                    step=0.01,
+                    key=f"gui_export_{split}_target_positive_ratio",
+                )
+            payload[split] = {
+                "mode": {
+                    "mass only": "mass_only",
+                    "all": "all",
+                    "all mass + sampled non-mass": "positive_ratio",
+                }[selected_label],
+                "target_positive_ratio": float(target_ratio),
+            }
+    return payload
+
+
+def _apply_deterministic_selection_to_config(square: dict[str, Any], payload: dict[str, dict[str, Any]]) -> None:
+    for split in ["train", "val", "test"]:
+        split_payload = payload.get(split, {})
+        mode = str(split_payload.get("mode", "all")).strip().casefold()
+        if mode not in {"mass_only", "all", "positive_ratio"}:
+            mode = "all"
+        ratio = float(split_payload.get("target_positive_ratio", square.get("positive_fraction", 0.80)))
+        ratio = min(max(ratio, 0.01), 1.0)
+        square[f"{split}_deterministic_selection_mode"] = mode
+        square[f"{split}_deterministic_target_positive_ratio"] = ratio
+        # Backward-compatible field used by older code and summaries.
+        square[f"{split}_deterministic_include_empty"] = mode != "mass_only"
+
+
 def _export_dataset_from_gui_panel(
     *,
     cfg: dict[str, Any],
@@ -1093,26 +1172,20 @@ def _export_dataset_from_gui_panel(
             if not selected_vendors:
                 st.warning("Select at least one vendor, or switch to all vendors.")
 
-        st.markdown("**Split-specific crop inclusion**")
+        st.markdown("**Split-specific deterministic crop selection**")
         st.caption(
-            "When checked, deterministic export keeps only windows containing a visible mass. "
-            "This is controlled independently for train, validation, and test."
+            "For each split, deterministic sliding windows can be exported as all windows, mass windows only, "
+            "or all mass windows plus sampled non-mass windows to target a positive crop ratio."
         )
         crop_cfg = dict(cfg.get("square_crops", {}) or {})
-        default_train_mass_only = not bool(crop_cfg.get("train_deterministic_include_empty", crop_cfg.get("deterministic_include_empty", True)))
-        default_val_mass_only = not bool(crop_cfg.get("val_deterministic_include_empty", crop_cfg.get("deterministic_include_empty", True)))
-        default_test_mass_only = not bool(crop_cfg.get("test_deterministic_include_empty", crop_cfg.get("deterministic_include_empty", True)))
-        c_train, c_val, c_test = st.columns(3)
-        train_mass_only = c_train.checkbox("Train mass windows only", value=default_train_mass_only, key="gui_export_train_mass_only")
-        val_mass_only = c_val.checkbox("Val mass windows only", value=default_val_mass_only, key="gui_export_val_mass_only")
-        test_mass_only = c_test.checkbox("Test mass windows only", value=default_test_mass_only, key="gui_export_test_mass_only")
+        selection_payload = _deterministic_selection_controls(crop_cfg)
 
         export_mode = st.radio(
             "Crop export mode",
             ["deterministic sliding for all splits", "train stochastic, val/test deterministic"],
             index=0,
             key="gui_export_crop_mode",
-            help="The mass-window-only checkboxes apply to deterministic sliding windows. For most experiments here, keep deterministic.",
+            help="The split-specific deterministic selection controls above apply when a split is deterministic. For most experiments here, keep deterministic.",
         )
         save_baseline = st.checkbox("Also export baseline_uncropped dataset", value=False, key="gui_export_baseline")
         confirm = st.checkbox("I checked the output path and want to start export", value=False, key="gui_export_confirm")
@@ -1126,9 +1199,7 @@ def _export_dataset_from_gui_panel(
                 output_root=output_root,
                 clean_output=clean_output,
                 selected_vendors=selected_vendors if vendor_mode == "selected vendors only" else [],
-                train_mass_only=train_mass_only,
-                val_mass_only=val_mass_only,
-                test_mass_only=test_mass_only,
+                deterministic_selection=selection_payload,
                 export_mode=export_mode,
                 save_baseline=save_baseline,
                 crop_controls=crop_controls,
@@ -1143,9 +1214,7 @@ def _build_gui_export_config(
     output_root: Path,
     clean_output: bool,
     selected_vendors: list[str],
-    train_mass_only: bool,
-    val_mass_only: bool,
-    test_mass_only: bool,
+    deterministic_selection: dict[str, dict[str, Any]],
     export_mode: str,
     save_baseline: bool,
     crop_controls: dict[str, Any],
@@ -1175,9 +1244,7 @@ def _build_gui_export_config(
         square["train_crop_mode"] = "deterministic"
         square["val_crop_mode"] = "deterministic"
         square["test_crop_mode"] = "deterministic"
-    square["train_deterministic_include_empty"] = not bool(train_mass_only)
-    square["val_deterministic_include_empty"] = not bool(val_mass_only)
-    square["test_deterministic_include_empty"] = not bool(test_mass_only)
+    _apply_deterministic_selection_to_config(square, deterministic_selection)
     square["deterministic_include_empty"] = True
     square["deterministic_require_foreground"] = bool(crop_controls.get("require_foreground", False))
     square["deterministic_min_foreground_fraction"] = float(crop_controls.get("min_foreground_fraction", 0.05))
@@ -1201,6 +1268,17 @@ def _build_gui_export_config(
     return out
 
 
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(float(seconds))))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:d}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes:d}m {secs:02d}s"
+    return f"{secs:d}s"
+
+
 def _run_export_with_streamlit_progress(export_cfg: dict[str, Any]) -> None:
     stages = [
         "initialize_dataset",
@@ -1216,8 +1294,17 @@ def _run_export_with_streamlit_progress(export_cfg: dict[str, Any]) -> None:
 
     progress_bar = st.progress(0.0, text="Export not started yet")
     status_box = st.empty()
+    time_box = st.empty()
     log_box = st.empty()
     log_lines: list[str] = []
+    export_started_at = time.monotonic()
+
+    def _time_text(overall_fraction: float) -> str:
+        elapsed = max(0.0, time.monotonic() - export_started_at)
+        if overall_fraction > 0.01:
+            remaining = max(0.0, elapsed * (1.0 - overall_fraction) / overall_fraction)
+            return f"Elapsed: {_format_duration(elapsed)} | Estimated remaining: {_format_duration(remaining)}"
+        return f"Elapsed: {_format_duration(elapsed)} | Estimated remaining: calculating"
 
     def update_progress(event: dict[str, Any]) -> None:
         stage = str(event.get("stage", ""))
@@ -1236,14 +1323,18 @@ def _run_export_with_streamlit_progress(export_cfg: dict[str, Any]) -> None:
         overall = (stage_idx + frac_inside_stage) / max(len(active_stages), 1)
         text = stage.replace("_", " ")
         if event_name == "image_progress":
-            text += f" | {event.get('split', '?')} | {event.get('processed', 0)}/{event.get('total', 0)} source images"
+            unit = str(event.get("unit", "source images"))
+            text += f" | {event.get('split', '?')} | {event.get('processed', 0)}/{event.get('total', 0)} {unit}"
         elif event_name == "stage_start":
             text += " | started"
         elif event_name == "stage_finish":
             text += " | complete"
         elif event_name == "stage_failed":
             text += " | failed"
-        progress_bar.progress(float(min(max(overall, 0.0), 1.0)), text=text)
+        overall_clamped = float(min(max(overall, 0.0), 1.0))
+        timer_text = _time_text(overall_clamped)
+        progress_bar.progress(overall_clamped, text=f"{text} | {timer_text}")
+        time_box.info(timer_text)
         if event_name in {"stage_start", "stage_finish", "stage_failed"}:
             log_lines.append(text)
             log_box.code("\n".join(log_lines[-12:]), language="text")
@@ -2200,13 +2291,23 @@ def apply_channel_pipeline(
             arr = np.asarray(source_crops[source_name], dtype=np.float32).copy()
             source_fallback = False
 
+        # Compute statistics over the visible breast/foreground pixels by default.
+        # This matters when the fixed breast crop is disabled: otherwise black
+        # background can dominate low percentile windows, for example [0, 10],
+        # and make the operation appear unchanged.
+        stat_mask = _operation_stat_mask(arr)
+
         applied = []
         for step in _channel_steps(pipeline, channel):
             op = step.get("op", "none")
             params = step.get("params", {}) or {}
             if op == "none":
                 continue
-            arr = _apply_operation(arr, op, params)
+            arr = _apply_operation(arr, op, params, stat_mask=stat_mask)
+            # Keep the mask tied to the same physical foreground region after
+            # point-wise transforms; recompute only if the shape changes.
+            if stat_mask.shape != arr.shape:
+                stat_mask = _operation_stat_mask(arr)
             applied.append({"op": op, "params": params})
         ch = _float_to_uint8(arr)
         channels.append(ch)
@@ -2218,24 +2319,29 @@ def apply_channel_pipeline(
         }
     return np.stack(channels, axis=-1).astype(np.uint8, copy=False), meta
 
-def _apply_operation(arr: np.ndarray, op: str, params: dict[str, Any]) -> np.ndarray:
+def _apply_operation(arr: np.ndarray, op: str, params: dict[str, Any], stat_mask: np.ndarray | None = None) -> np.ndarray:
     arr = np.nan_to_num(np.asarray(arr, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    if stat_mask is not None and stat_mask.shape != arr.shape:
+        stat_mask = None
     if op == "percentile_normalize":
-        return _normalize_percentile(arr, params.get("percentiles", [1.0, 99.0]))
+        return _normalize_percentile(arr, params.get("percentiles", [1.0, 99.0]), stat_mask)
     if op == "percentile_clip_only":
-        lo, hi = _safe_percentile(arr, params.get("percentiles", [1.0, 99.0]))
+        lo, hi = _safe_percentile(arr, params.get("percentiles", [1.0, 99.0]), stat_mask)
         return np.clip(arr, lo, hi).astype(np.float32)
     if op == "zscore_clip":
-        m = float(np.mean(arr))
-        s = float(np.std(arr)) or 1.0
+        pixels = arr[stat_mask] if stat_mask is not None and stat_mask.any() else arr[np.isfinite(arr)]
+        if pixels.size == 0:
+            pixels = arr[np.isfinite(arr)]
+        m = float(np.mean(pixels)) if pixels.size else 0.0
+        s = float(np.std(pixels)) or 1.0
         z = (arr - m) / max(s, 1e-12)
         limit = float(params.get("z_limit", 3.0))
         z = np.clip(z, -limit, limit)
         return ((z + limit) / max(2 * limit, 1e-12)).astype(np.float32)
     if op == "standardize_to_target":
-        return _standardize_to_target(arr, params)
+        return _standardize_to_target(arr, params, stat_mask)
     if op == "aggressive_upper_percentile_normalize":
-        return _normalize_percentile(arr, params.get("percentiles", [70.0, 100.0]))
+        return _normalize_percentile(arr, params.get("percentiles", [70.0, 100.0]), stat_mask)
     if op == "hist_equalize":
         return _equalize(_float_to_uint8(arr)).astype(np.float32) / 255.0
     if op == "clahe":
@@ -2266,22 +2372,22 @@ def _apply_operation(arr: np.ndarray, op: str, params: dict[str, Any]) -> np.nda
         blurred = cv2.GaussianBlur(arr.astype(np.float32), (0, 0), sigmaX=sigma)
         return (arr + amount * (arr - blurred)).astype(np.float32)
     if op == "sobel_gradient":
-        return _sobel(arr, params)
+        return _sobel(arr, params, stat_mask)
     if op == "laplacian":
-        return _laplacian(arr, params)
+        return _laplacian(arr, params, stat_mask)
     if op == "gamma":
         gamma = max(float(params.get("gamma", 1.0)), 1e-6)
-        return np.power(np.clip(_normalize_minmax(arr), 0.0, 1.0), gamma).astype(np.float32)
+        return np.power(np.clip(_normalize_minmax(arr, stat_mask), 0.0, 1.0), gamma).astype(np.float32)
     if op == "log":
         gain = float(params.get("gain", 5.0))
-        x = np.clip(_normalize_minmax(arr), 0.0, 1.0)
+        x = np.clip(_normalize_minmax(arr, stat_mask), 0.0, 1.0)
         return (np.log1p(gain * x) / np.log1p(gain)).astype(np.float32)
     if op == "invert":
-        return 1.0 - _normalize_minmax(arr)
+        return 1.0 - _normalize_minmax(arr, stat_mask)
     return arr
 
 
-def _standardize_to_target(arr: np.ndarray, params: dict[str, Any]) -> np.ndarray:
+def _standardize_to_target(arr: np.ndarray, params: dict[str, Any], stat_mask: np.ndarray | None = None) -> np.ndarray:
     """Dynamic affine standardization: y = a*x + b.
 
     a and b are chosen from the current image/channel statistics so the output
@@ -2293,15 +2399,18 @@ def _standardize_to_target(arr: np.ndarray, params: dict[str, Any]) -> np.ndarra
     finite = x[np.isfinite(x)]
     if finite.size == 0:
         return np.zeros_like(x, dtype=np.float32)
+    pixels = x[stat_mask] if stat_mask is not None and stat_mask.any() else finite
+    if pixels.size == 0:
+        pixels = finite
 
     stat_percentiles = params.get("stat_percentiles", [1.0, 99.0])
     try:
-        lo, hi = _safe_percentile(finite, stat_percentiles)
-        stat_pixels = finite[(finite >= lo) & (finite <= hi)]
+        lo, hi = _safe_percentile(pixels, stat_percentiles)
+        stat_pixels = pixels[(pixels >= lo) & (pixels <= hi)]
     except Exception:
-        stat_pixels = finite
+        stat_pixels = pixels
     if stat_pixels.size < 2:
-        stat_pixels = finite
+        stat_pixels = pixels
 
     current_mean = float(np.mean(stat_pixels))
     current_std = float(np.std(stat_pixels))
@@ -2315,7 +2424,7 @@ def _standardize_to_target(arr: np.ndarray, params: dict[str, Any]) -> np.ndarra
         y = np.clip(y, 0.0, 1.0).astype(np.float32)
     return y
 
-def _sobel(arr: np.ndarray, params: dict[str, Any]) -> np.ndarray:
+def _sobel(arr: np.ndarray, params: dict[str, Any], stat_mask: np.ndarray | None = None) -> np.ndarray:
     if cv2 is None:
         gy, gx = np.gradient(arr.astype(np.float32))
         mag = np.sqrt(gx * gx + gy * gy)
@@ -2325,10 +2434,10 @@ def _sobel(arr: np.ndarray, params: dict[str, Any]) -> np.ndarray:
         gx = cv2.Sobel(u8, cv2.CV_32F, 1, 0, ksize=k)
         gy = cv2.Sobel(u8, cv2.CV_32F, 0, 1, ksize=k)
         mag = cv2.magnitude(gx, gy)
-    return _normalize_percentile(mag.astype(np.float32), params.get("percentiles", [1.0, 99.0]))
+    return _normalize_percentile(mag.astype(np.float32), params.get("percentiles", [1.0, 99.0]), stat_mask)
 
 
-def _laplacian(arr: np.ndarray, params: dict[str, Any]) -> np.ndarray:
+def _laplacian(arr: np.ndarray, params: dict[str, Any], stat_mask: np.ndarray | None = None) -> np.ndarray:
     if cv2 is None:
         gy, gx = np.gradient(arr.astype(np.float32))
         gyy, _ = np.gradient(gy)
@@ -2406,8 +2515,26 @@ def _float_to_uint8(arr: np.ndarray) -> np.ndarray:
     return _to_uint8_percentile(arr, [1.0, 99.0])
 
 
-def _safe_percentile(arr: np.ndarray, percentiles: list[float] | tuple[float, float]) -> tuple[float, float]:
-    finite = arr[np.isfinite(arr)]
+def _operation_stat_mask(arr: np.ndarray) -> np.ndarray:
+    """Return the default pixel mask for contrast/statistics operations.
+
+    Percentile operations should normally ignore the black mammogram background,
+    especially when global breast cropping is disabled. Otherwise low percentile
+    ranges such as [0, 10] often collapse to [0, 0] because the crop contains a
+    large black background area.
+    """
+    try:
+        return _foreground_mask_for_crop(np.asarray(arr, dtype=np.float32), threshold=None)
+    except Exception:
+        return np.isfinite(arr)
+
+
+def _safe_percentile(arr: np.ndarray, percentiles: list[float] | tuple[float, float], mask: np.ndarray | None = None) -> tuple[float, float]:
+    arr = np.asarray(arr, dtype=np.float32)
+    if mask is not None and mask.shape == arr.shape and mask.any():
+        finite = arr[mask & np.isfinite(arr)]
+    else:
+        finite = arr[np.isfinite(arr)]
     if finite.size == 0:
         return 0.0, 1.0
     p0, p1 = float(percentiles[0]), float(percentiles[1])
@@ -2422,13 +2549,17 @@ def _safe_percentile(arr: np.ndarray, percentiles: list[float] | tuple[float, fl
     return float(lo), float(hi)
 
 
-def _normalize_percentile(arr: np.ndarray, percentiles: list[float] | tuple[float, float]) -> np.ndarray:
-    lo, hi = _safe_percentile(arr, percentiles)
+def _normalize_percentile(arr: np.ndarray, percentiles: list[float] | tuple[float, float], mask: np.ndarray | None = None) -> np.ndarray:
+    lo, hi = _safe_percentile(arr, percentiles, mask)
     return ((np.clip(arr, lo, hi) - lo) / max(hi - lo, 1e-12)).astype(np.float32)
 
 
-def _normalize_minmax(arr: np.ndarray) -> np.ndarray:
-    finite = arr[np.isfinite(arr)]
+def _normalize_minmax(arr: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float32)
+    if mask is not None and mask.shape == arr.shape and mask.any():
+        finite = arr[mask & np.isfinite(arr)]
+    else:
+        finite = arr[np.isfinite(arr)]
     if finite.size == 0:
         return np.zeros_like(arr, dtype=np.float32)
     lo, hi = float(np.min(finite)), float(np.max(finite))
