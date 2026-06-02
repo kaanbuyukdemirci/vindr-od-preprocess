@@ -54,13 +54,23 @@ def main() -> None:
 
     config_path = _get_config_path_from_query_or_cli()
     cfg = _load_config_ui(config_path)
+    cfg = _apply_loaded_manifest_settings_if_any(cfg)
     cfg = _global_preprocess_controls(cfg)
 
     dataset = _load_dataset_from_config(cfg)
     split_records, split_df = _load_split_records(dataset, cfg)
     enriched = _build_enriched_record_table(dataset, split_df)
 
-    mode = st.sidebar.radio("Mode", ["Single image", "Vendor / image comparison", "Dataset visualizations"], index=0)
+    mode = st.sidebar.radio(
+        "Mode",
+        [
+            "Single image",
+            "Vendor / image comparison",
+            "Dataset visualizations",
+            "Manifest comparison / load settings",
+        ],
+        index=0,
+    )
     crop_controls = _crop_controls(cfg)
     show_annotations = st.sidebar.checkbox("Show mass annotations", value=True)
     display_window = st.sidebar.slider(
@@ -72,7 +82,7 @@ def main() -> None:
     st.sidebar.divider()
     st.sidebar.subheader("RGB preprocessing pipeline")
     st.sidebar.caption("Build the output RGB crop channel by channel.")
-    pipeline = _pipeline_controls()
+    pipeline = _pipeline_controls(cfg)
     _export_current_preprocessing_yaml_panel(
         config_path=config_path,
         cfg=cfg,
@@ -91,8 +101,10 @@ def main() -> None:
         _render_single_mode(dataset, enriched, crop_controls, pipeline, show_annotations, display_window, display_controls)
     elif mode == "Vendor / image comparison":
         _render_comparison_mode(dataset, enriched, crop_controls, pipeline, show_annotations, display_window, display_controls)
-    else:
+    elif mode == "Dataset visualizations":
         _render_dataset_visualization_mode(cfg)
+    else:
+        _render_manifest_comparison_mode(cfg)
 
 
 
@@ -271,6 +283,367 @@ def _show_visualization_outputs(output_dir: Path, *, result: Any | None = None) 
                 with cols[i % 2]:
                     st.image(str(path), caption=path.name, use_container_width=True)
 
+
+
+# -----------------------------------------------------------------------------
+# Manifest comparison and settings loading
+# -----------------------------------------------------------------------------
+
+
+def _apply_loaded_manifest_settings_if_any(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Merge a loaded manifest config snapshot into the active GUI config."""
+    loaded = st.session_state.get("loaded_manifest_config_snapshot")
+    if not isinstance(loaded, dict):
+        return cfg
+    keep_paths = bool(st.session_state.get("loaded_manifest_keep_current_paths", True))
+    loaded_cfg = copy.deepcopy(loaded)
+    if keep_paths:
+        loaded_cfg.pop("paths", None)
+    merged = _deep_merge_dict(copy.deepcopy(cfg), loaded_cfg)
+    with st.sidebar.expander("Loaded manifest settings", expanded=False):
+        source = st.session_state.get("loaded_manifest_source", "manifest")
+        st.success(f"Using settings loaded from: {source}")
+        if keep_paths:
+            st.caption("Current config paths were kept. Preprocessing, crop, vendor, and image-export settings were loaded.")
+        else:
+            st.caption("Full config snapshot was loaded, including paths.")
+        if st.button("Clear loaded manifest settings", key="clear_loaded_manifest_settings", use_container_width=True):
+            for key in ["loaded_manifest_config_snapshot", "loaded_manifest_source", "loaded_manifest_keep_current_paths"]:
+                st.session_state.pop(key, None)
+            _clear_relevant_gui_widget_state()
+            st.rerun()
+    return merged
+
+
+def _deep_merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            base[key] = _deep_merge_dict(dict(base[key]), value)
+        else:
+            base[key] = copy.deepcopy(value)
+    return base
+
+
+def _clear_relevant_gui_widget_state() -> None:
+    prefixes = [
+        "R_", "G_", "B_", "gui_export_", "fixed_preprocess_",
+        "gui_display_", "crop_", "manifest_",
+    ]
+    exact_keys = {
+        "Visible RGB channels", "Show individual processed channels",
+    }
+    for key in list(st.session_state.keys()):
+        if key in exact_keys or any(str(key).startswith(prefix) for prefix in prefixes):
+            st.session_state.pop(key, None)
+
+
+def _render_manifest_comparison_mode(cfg: dict[str, Any]) -> None:
+    st.subheader("Manifest comparison and settings loading")
+    st.caption(
+        "Enter exported dataset folders or manifest paths. The app will look for manifest.json first, then export_summary.json. "
+        "It explains the first manifest, then explains each next manifest as a change from the previous one."
+    )
+
+    default_paths = "\n".join([
+        str(cfg.get("paths", {}).get("output_root", "/mnt/t9/preprocessed-vindr-v3")),
+    ])
+    path_text = st.text_area(
+        "Dataset directories or manifest/export_summary paths, one per line",
+        value=st.session_state.get("manifest_compare_paths", default_paths),
+        height=140,
+        key="manifest_compare_paths",
+        help="Examples: /mnt/t9/preprocessed-vindr-v5 or /mnt/t9/preprocessed-vindr-v5/manifest.json",
+    )
+    uploaded = st.file_uploader(
+        "Optional: upload manifest/export_summary JSON files",
+        type=["json", "txt"],
+        accept_multiple_files=True,
+        key="manifest_compare_uploads",
+    )
+
+    if st.button("Read and compare manifests", type="primary", key="manifest_compare_run"):
+        st.session_state["manifest_compare_results"] = _load_manifests_from_inputs(path_text, uploaded)
+
+    results = st.session_state.get("manifest_compare_results")
+    if not results:
+        st.info("Add at least one dataset directory or manifest path, then click Read and compare manifests.")
+        return
+
+    valid = [r for r in results if r.get("ok")]
+    invalid = [r for r in results if not r.get("ok")]
+    if invalid:
+        with st.expander("Paths/files that could not be read", expanded=True):
+            for item in invalid:
+                st.error(f"{item.get('source')}: {item.get('error')}")
+    if not valid:
+        return
+
+    summaries = [_manifest_summary_row(item["manifest"], item["source"]) for item in valid]
+    overview_df = pd.DataFrame(summaries)
+    st.markdown("### Overview")
+    st.dataframe(overview_df, hide_index=True, use_container_width=True)
+
+    st.markdown("### Step-by-step explanation")
+    for idx, item in enumerate(valid):
+        manifest = item["manifest"]
+        title = _manifest_short_name(manifest, item["source"])
+        with st.expander(f"{idx + 1}. {title}", expanded=True):
+            if idx == 0:
+                st.markdown(_explain_manifest_baseline(manifest))
+            else:
+                previous = valid[idx - 1]["manifest"]
+                st.markdown(_explain_manifest_change(previous, manifest))
+            _render_manifest_key_settings(manifest)
+
+    if len(valid) >= 2:
+        st.markdown("### Pairwise differences")
+        diff_rows = []
+        for idx in range(1, len(valid)):
+            diff_rows.extend(_manifest_diff_rows(valid[idx - 1]["manifest"], valid[idx]["manifest"], idx))
+        diff_df = pd.DataFrame(diff_rows)
+        st.dataframe(diff_df, hide_index=True, use_container_width=True)
+
+        csv_data = diff_df.to_csv(index=False)
+        st.download_button(
+            "Download pairwise difference CSV",
+            data=csv_data,
+            file_name="manifest_pairwise_differences.csv",
+            mime="text/csv",
+            key="manifest_diff_download",
+        )
+
+    st.markdown("### Load settings from a manifest")
+    options = [f"{i + 1}. {_manifest_short_name(item['manifest'], item['source'])}" for i, item in enumerate(valid)]
+    selected_label = st.selectbox("Manifest to load", options, key="manifest_load_select")
+    selected_index = options.index(selected_label)
+    keep_paths = st.checkbox(
+        "Keep current data/output paths",
+        value=True,
+        key="manifest_load_keep_paths",
+        help="Recommended. Loads preprocessing/crop/RGB/vendor settings, but keeps the current config paths to avoid overwriting old dataset folders.",
+    )
+    load_cols = st.columns(2)
+    with load_cols[0]:
+        if st.button("Load settings into GUI session", type="primary", key="manifest_load_settings"):
+            selected = valid[selected_index]
+            snapshot = selected["manifest"].get("config_snapshot") or {}
+            if not isinstance(snapshot, dict) or not snapshot:
+                st.error("This manifest does not contain a config_snapshot block to load.")
+            else:
+                st.session_state["loaded_manifest_config_snapshot"] = copy.deepcopy(snapshot)
+                st.session_state["loaded_manifest_source"] = _manifest_short_name(selected["manifest"], selected["source"])
+                st.session_state["loaded_manifest_keep_current_paths"] = bool(keep_paths)
+                _clear_relevant_gui_widget_state()
+                st.success("Settings loaded. The app will rerun now.")
+                st.rerun()
+    with load_cols[1]:
+        snapshot = valid[selected_index]["manifest"].get("config_snapshot") or {}
+        if isinstance(snapshot, dict) and snapshot:
+            yaml_text = yaml.safe_dump(_make_yaml_safe(snapshot), sort_keys=False, allow_unicode=True, width=120)
+            st.download_button(
+                "Download selected config snapshot YAML",
+                data=yaml_text,
+                file_name="loaded_manifest_config_snapshot.yaml",
+                mime="application/x-yaml",
+                key="manifest_snapshot_download",
+            )
+
+
+def _load_manifests_from_inputs(path_text: str, uploaded_files: list[Any] | None) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for raw_line in str(path_text or "").splitlines():
+        raw = raw_line.strip()
+        if not raw or raw.startswith("#"):
+            continue
+        source_path = Path(raw).expanduser()
+        try:
+            manifest_path = _resolve_manifest_path(source_path)
+            with manifest_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            results.append({"ok": True, "source": str(manifest_path), "manifest": data})
+        except Exception as exc:
+            results.append({"ok": False, "source": raw, "error": str(exc)})
+
+    for upload in uploaded_files or []:
+        try:
+            content = upload.getvalue().decode("utf-8")
+            data = json.loads(content)
+            results.append({"ok": True, "source": getattr(upload, "name", "uploaded manifest"), "manifest": data})
+        except Exception as exc:
+            results.append({"ok": False, "source": getattr(upload, "name", "uploaded manifest"), "error": str(exc)})
+    return results
+
+
+def _resolve_manifest_path(path: Path) -> Path:
+    if path.is_file():
+        return path
+    if not path.exists():
+        raise FileNotFoundError(f"Path does not exist: {path}")
+    candidates = [
+        path / "manifest.json",
+        path / "export_summary.json",
+        path / "EXPORT_MANIFEST.json",
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    raise FileNotFoundError(f"No manifest.json or export_summary.json found under: {path}")
+
+
+def _manifest_short_name(manifest: dict[str, Any], source: str) -> str:
+    root = str(manifest.get("output_root") or manifest.get("summary", {}).get("output_root") or source)
+    return Path(root).name or str(source)
+
+
+def _manifest_summary_row(manifest: dict[str, Any], source: str) -> dict[str, Any]:
+    summary = manifest.get("summary", {}) or {}
+    square = summary.get("square_crops", {}) or {}
+    splits = square.get("splits", {}) or {}
+    vendor = summary.get("vendor_filter", {}) or {}
+    selection = summary.get("deterministic_selection_mode", {}) or {}
+    target_pos = summary.get("deterministic_target_positive_ratio", {}) or {}
+    return {
+        "dataset": _manifest_short_name(manifest, source),
+        "output_root": manifest.get("output_root", ""),
+        "duration_min": round(float(manifest.get("total_duration_minutes", 0.0) or 0.0), 1),
+        "vendor_filter": bool(vendor.get("enabled", False)),
+        "vendors": ", ".join(vendor.get("include_vendors", []) or []),
+        "source_train/val/test": _split_count_text(summary.get("splits", {}) or {}),
+        "crop_modes": _split_count_text(summary.get("square_crop_modes", {}) or {}),
+        "selection_modes": _split_count_text(selection),
+        "target_pos": _split_count_text(target_pos),
+        "square_images": int(square.get("num_images", 0) or 0),
+        "positive_images": int(square.get("num_positive_images", 0) or 0),
+        "train_images": int((splits.get("train", {}) or {}).get("num_images", 0) or 0),
+        "train_pos": int((splits.get("train", {}) or {}).get("num_positive_images", 0) or 0),
+        "val_images": int((splits.get("val", {}) or {}).get("num_images", 0) or 0),
+        "test_images": int((splits.get("test", {}) or {}).get("num_images", 0) or 0),
+        "R": _channel_compact(manifest, "R"),
+        "G": _channel_compact(manifest, "G"),
+        "B": _channel_compact(manifest, "B"),
+    }
+
+
+def _split_count_text(value: dict[str, Any]) -> str:
+    if not isinstance(value, dict) or not value:
+        return ""
+    return ", ".join(f"{k}={v}" for k, v in value.items())
+
+
+def _channel_compact(manifest: dict[str, Any], channel: str) -> str:
+    ch = (((manifest.get("config_snapshot") or {}).get("image_export") or {}).get("custom_channel_pipeline") or {}).get(channel, {}) or {}
+    source = ch.get("source", "current_crop")
+    ops = []
+    for step in ch.get("steps", []) or []:
+        op = str(step.get("op", "none"))
+        params = step.get("params", {}) or {}
+        if op == "percentile_normalize" and "percentiles" in params:
+            op = f"percentile{params['percentiles']}"
+        ops.append(op)
+    return f"{source}: " + " -> ".join(ops)
+
+
+def _explain_manifest_baseline(manifest: dict[str, Any]) -> str:
+    row = _manifest_summary_row(manifest, str(manifest.get("output_root", "")))
+    vendor_text = row["vendors"] if row["vendor_filter"] else "all vendors"
+    return (
+        f"This dataset is **{row['dataset']}**. It used **{vendor_text}**, "
+        f"created **{row['square_images']}** square crops, and **{row['positive_images']}** of them are mass-positive. "
+        f"Train/val/test exported crop counts are **{row['train_images']} / {row['val_images']} / {row['test_images']}**. "
+        f"Crop modes are: **{row['crop_modes']}**."
+    )
+
+
+def _explain_manifest_change(prev: dict[str, Any], cur: dict[str, Any]) -> str:
+    changes = []
+    prev_row = _manifest_summary_row(prev, str(prev.get("output_root", "")))
+    cur_row = _manifest_summary_row(cur, str(cur.get("output_root", "")))
+
+    def add_change(label: str, old: Any, new: Any) -> None:
+        if old != new:
+            changes.append(f"- **{label}** changed from `{old}` to `{new}`.")
+
+    add_change("vendor filter", prev_row["vendors"] if prev_row["vendor_filter"] else "all vendors", cur_row["vendors"] if cur_row["vendor_filter"] else "all vendors")
+    add_change("source split counts", prev_row["source_train/val/test"], cur_row["source_train/val/test"])
+    add_change("crop modes", prev_row["crop_modes"], cur_row["crop_modes"])
+    add_change("selection modes", prev_row["selection_modes"], cur_row["selection_modes"])
+    add_change("target positive ratios", prev_row["target_pos"], cur_row["target_pos"])
+    add_change("R channel", prev_row["R"], cur_row["R"])
+    add_change("G channel", prev_row["G"], cur_row["G"])
+    add_change("B channel", prev_row["B"], cur_row["B"])
+
+    old_n = int(prev_row["square_images"])
+    new_n = int(cur_row["square_images"])
+    if old_n != new_n:
+        delta = new_n - old_n
+        changes.append(f"- **Total square crops** changed from `{old_n}` to `{new_n}` (`{delta:+d}`).")
+    old_pos = int(prev_row["positive_images"])
+    new_pos = int(cur_row["positive_images"])
+    if old_pos != new_pos:
+        delta = new_pos - old_pos
+        changes.append(f"- **Positive square crops** changed from `{old_pos}` to `{new_pos}` (`{delta:+d}`).")
+    if not changes:
+        return "No important manifest-level settings changed, except output path/timestamps."
+    return "\n".join(changes)
+
+
+def _render_manifest_key_settings(manifest: dict[str, Any]) -> None:
+    config = manifest.get("config_snapshot", {}) or {}
+    summary = manifest.get("summary", {}) or {}
+    cols = st.columns(3)
+    cols[0].metric("Output", Path(str(manifest.get("output_root", ""))).name)
+    cols[1].metric("Total crops", int((summary.get("square_crops", {}) or {}).get("num_images", 0) or 0))
+    cols[2].metric("Positive crops", int((summary.get("square_crops", {}) or {}).get("num_positive_images", 0) or 0))
+    with st.expander("Resolved config snapshot", expanded=False):
+        st.json(_make_yaml_safe(config))
+
+
+def _manifest_diff_rows(prev: dict[str, Any], cur: dict[str, Any], pair_index: int) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    watched = [
+        ("output_root", ["output_root"]),
+        ("vendor_filter", ["summary", "vendor_filter"]),
+        ("source_splits", ["summary", "splits"]),
+        ("square_crop_modes", ["summary", "square_crop_modes"]),
+        ("deterministic_include_empty", ["summary", "deterministic_include_empty"]),
+        ("deterministic_selection_mode", ["summary", "deterministic_selection_mode"]),
+        ("deterministic_target_positive_ratio", ["summary", "deterministic_target_positive_ratio"]),
+        ("square_crops", ["summary", "square_crops"]),
+        ("preprocess", ["config_snapshot", "preprocess"]),
+        ("R_pipeline", ["config_snapshot", "image_export", "custom_channel_pipeline", "R"]),
+        ("G_pipeline", ["config_snapshot", "image_export", "custom_channel_pipeline", "G"]),
+        ("B_pipeline", ["config_snapshot", "image_export", "custom_channel_pipeline", "B"]),
+        ("square_crops_config", ["config_snapshot", "square_crops"]),
+        ("crop_annotation_policy", ["config_snapshot", "crop_annotation_policy"]),
+    ]
+    pair = f"{_manifest_short_name(prev, '')} -> {_manifest_short_name(cur, '')}"
+    for label, path in watched:
+        old = _nested_get(prev, path, None)
+        new = _nested_get(cur, path, None)
+        if old != new:
+            rows.append({
+                "pair": pair,
+                "section": label,
+                "old": _compact_json(old),
+                "new": _compact_json(new),
+            })
+    return rows
+
+
+def _nested_get(obj: dict[str, Any], path: list[str], default: Any = None) -> Any:
+    cur: Any = obj
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def _compact_json(value: Any, max_len: int = 500) -> str:
+    text = json.dumps(_make_yaml_safe(value), sort_keys=True, ensure_ascii=False, default=_json_default)
+    if len(text) > max_len:
+        return text[:max_len - 3] + "..."
+    return text
 
 # -----------------------------------------------------------------------------
 # Current GUI configuration export
@@ -602,6 +975,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     pp["invert_to_black_background"] = st.sidebar.checkbox(
         "Invert MONOCHROME1 to black background",
         value=bool(pp.get("invert_to_black_background", True)),
+        key="fixed_preprocess_invert_to_black_background",
         help=(
             "If enabled, only DICOM images tagged MONOCHROME1 are inverted. "
             "MONOCHROME2 images are left unchanged."
@@ -610,6 +984,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     pp["crop_breast"] = st.sidebar.checkbox(
         "Crop to breast foreground",
         value=bool(pp.get("crop_breast", False)),
+        key="fixed_preprocess_crop_breast",
         help=(
             "Find the breast foreground and remove as much pure background as possible. "
             "Default is off so deterministic full-image crop experiments are not silently altered."
@@ -618,6 +993,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     pp["mirror_right_to_left"] = st.sidebar.checkbox(
         "Mirror right-entering breasts to left-entering",
         value=bool(pp.get("mirror_right_to_left", True)),
+        key="fixed_preprocess_mirror_right_to_left",
         help="If the breast foreground is mostly on the right side, flip horizontally and update boxes.",
     )
     pp["crop_padding"] = st.sidebar.number_input(
@@ -626,6 +1002,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         max_value=512,
         step=5,
         value=int(pp.get("crop_padding", 20)),
+        key="fixed_preprocess_crop_padding",
         help="Padding added around the detected breast foreground crop.",
     )
 
@@ -633,6 +1010,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         "Breast crop threshold",
         ["auto", "manual"],
         index=0 if pp.get("crop_threshold", None) is None else 1,
+        key="fixed_preprocess_crop_threshold_mode",
         horizontal=True,
         help="Auto usually works best. Manual is useful for debugging foreground segmentation.",
     )
@@ -641,6 +1019,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
             "Manual threshold value",
             value=float(pp.get("crop_threshold", 0.0) or 0.0),
             step=0.01,
+            key="fixed_preprocess_crop_threshold_value",
             format="%.6f",
         )
     else:
@@ -651,6 +1030,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         min_value=0.0,
         max_value=0.05,
         value=float(pp.get("min_component_area_fraction", 0.001)),
+        key="fixed_preprocess_min_component_area_fraction",
         step=0.0005,
         format="%.4f",
         help="Small connected components below this relative image area are ignored while finding the breast crop.",
@@ -862,16 +1242,17 @@ OP_NAMES = [
 ]
 
 
-def _pipeline_controls() -> dict[str, Any]:
+def _pipeline_controls(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg_pipeline = (cfg or {}).get("image_export", {}).get("custom_channel_pipeline", {}) or {}
     default_channel_sources = {
-        "R": "current_crop",
-        "G": "current_crop",
-        "B": "contralateral_same_view_crop",
+        "R": str(cfg_pipeline.get("R", {}).get("source", "current_crop")),
+        "G": str(cfg_pipeline.get("G", {}).get("source", "current_crop")),
+        "B": str(cfg_pipeline.get("B", {}).get("source", "contralateral_same_view_crop")),
     }
     default_channel_steps = {
-        "R": ["percentile_normalize", "hist_equalize", "standardize_to_target"],
-        "G": ["percentile_normalize", "hist_equalize", "percentile_normalize", "hist_equalize", "standardize_to_target"],
-        "B": ["percentile_normalize", "hist_equalize", "standardize_to_target"],
+        "R": [str(s.get("op", "none")) for s in cfg_pipeline.get("R", {}).get("steps", [])] or ["percentile_normalize", "hist_equalize", "standardize_to_target"],
+        "G": [str(s.get("op", "none")) for s in cfg_pipeline.get("G", {}).get("steps", [])] or ["percentile_normalize", "hist_equalize", "percentile_normalize", "hist_equalize", "standardize_to_target"],
+        "B": [str(s.get("op", "none")) for s in cfg_pipeline.get("B", {}).get("steps", [])] or ["percentile_normalize", "hist_equalize", "standardize_to_target"],
     }
     source_options = {
         "current_crop": "current crop",
@@ -903,6 +1284,8 @@ def _pipeline_controls() -> dict[str, Any]:
             steps = []
             for i in range(int(n_steps)):
                 default_op = default_channel_steps[channel][i] if i < len(default_channel_steps[channel]) else "none"
+                if default_op not in OP_NAMES:
+                    default_op = "none"
                 op = st.selectbox(
                     f"Step {i + 1}",
                     OP_NAMES,

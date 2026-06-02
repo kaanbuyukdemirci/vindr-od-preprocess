@@ -353,3 +353,9 @@ square_crops:
 ```
 
 The older `train_deterministic_include_empty`, `val_deterministic_include_empty`, and `test_deterministic_include_empty` keys are still written for backward compatibility.
+
+## Manifest comparison and settings loading
+
+The GUI includes a `Manifest comparison / load settings` mode. Paste one exported dataset folder or manifest path per line. For a folder, the app tries `manifest.json`, then `export_summary.json`. It reads each manifest, summarizes it, and explains each dataset relative to the previous one.
+
+This mode also has a `Load settings into GUI session` button. It loads the selected manifest's `config_snapshot` into the current GUI session. By default it keeps the current data/output paths to avoid accidentally overwriting old dataset folders, while loading preprocessing, RGB pipeline, crop, vendor, and annotation settings.
