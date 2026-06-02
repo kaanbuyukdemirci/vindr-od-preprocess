@@ -1681,29 +1681,63 @@ def _run_export_with_streamlit_progress(export_cfg: dict[str, Any]) -> None:
     log_box = st.empty()
     log_lines: list[str] = []
     export_started_at = time.monotonic()
+    current_stage_started_at = export_started_at
 
-    def _time_text(overall_fraction: float) -> str:
-        elapsed = max(0.0, time.monotonic() - export_started_at)
-        if overall_fraction > 0.01:
-            remaining = max(0.0, elapsed * (1.0 - overall_fraction) / overall_fraction)
-            return f"Elapsed: {_format_duration(elapsed)} | Estimated remaining: {_format_duration(remaining)}"
-        return f"Elapsed: {_format_duration(elapsed)} | Estimated remaining: calculating"
+    def _time_text(*, stage_fraction: float | None, event_name: str) -> str:
+        """Return elapsed and remaining time text.
+
+        Earlier versions estimated remaining time from the coarse overall export
+        fraction. That made ETA look very close to elapsed, because the long
+        square-crop stage starts after several short stages and therefore the
+        overall fraction is already large. Here the ETA is based on the current
+        stage progress, especially the image/crop progress inside
+        ``export_square_crops``.
+        """
+        now = time.monotonic()
+        total_elapsed = max(0.0, now - export_started_at)
+        stage_elapsed = max(0.0, now - current_stage_started_at)
+        if event_name == "stage_finish":
+            return f"Elapsed: {_format_duration(total_elapsed)} | Estimated remaining: 0s"
+        if stage_fraction is not None and stage_fraction > 0.001:
+            frac = float(min(max(stage_fraction, 0.001), 0.999))
+            stage_remaining = max(0.0, stage_elapsed * (1.0 - frac) / frac)
+            return (
+                f"Elapsed: {_format_duration(total_elapsed)} | "
+                f"Stage elapsed: {_format_duration(stage_elapsed)} | "
+                f"Estimated remaining: {_format_duration(stage_remaining)}"
+            )
+        return (
+            f"Elapsed: {_format_duration(total_elapsed)} | "
+            f"Stage elapsed: {_format_duration(stage_elapsed)} | "
+            "Estimated remaining: calculating"
+        )
 
     def update_progress(event: dict[str, Any]) -> None:
+        nonlocal current_stage_started_at
         stage = str(event.get("stage", ""))
         try:
             stage_idx = active_stages.index(stage)
         except ValueError:
             stage_idx = 0
         event_name = str(event.get("event", ""))
-        frac_inside_stage = 0.0
-        if event_name == "image_progress" and int(event.get("total", 0) or 0) > 0:
+        frac_inside_stage: float | None = None
+        if event_name == "stage_start":
+            current_stage_started_at = time.monotonic()
+            frac_inside_stage = 0.0
+        elif event_name == "image_progress" and int(event.get("total", 0) or 0) > 0:
             frac_inside_stage = min(1.0, max(0.0, float(event.get("processed", 0)) / float(event.get("total", 1))))
         elif event_name == "stage_finish":
             frac_inside_stage = 1.0
+        elif event_name == "stage_failed":
+            frac_inside_stage = None
         else:
-            frac_inside_stage = 0.02
-        overall = (stage_idx + frac_inside_stage) / max(len(active_stages), 1)
+            frac_inside_stage = 0.0
+
+        # Keep the progress bar monotonic at a coarse stage level, but calculate
+        # ETA from stage_fraction above. The ETA should answer: how much of the
+        # currently running long operation remains?
+        progress_fraction_for_bar = 0.02 if frac_inside_stage is None else float(frac_inside_stage)
+        overall = (stage_idx + progress_fraction_for_bar) / max(len(active_stages), 1)
         text = stage.replace("_", " ")
         if event_name == "image_progress":
             unit = str(event.get("unit", "source images"))
@@ -1715,7 +1749,7 @@ def _run_export_with_streamlit_progress(export_cfg: dict[str, Any]) -> None:
         elif event_name == "stage_failed":
             text += " | failed"
         overall_clamped = float(min(max(overall, 0.0), 1.0))
-        timer_text = _time_text(overall_clamped)
+        timer_text = _time_text(stage_fraction=frac_inside_stage, event_name=event_name)
         progress_bar.progress(overall_clamped, text=f"{text} | {timer_text}")
         time_box.info(timer_text)
         if event_name in {"stage_start", "stage_finish", "stage_failed"}:
