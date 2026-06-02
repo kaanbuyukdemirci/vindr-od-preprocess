@@ -1242,8 +1242,71 @@ OP_NAMES = [
 ]
 
 
+def _custom_pipeline_from_image_export_config(cfg: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the GUI channel pipeline implied by image_export settings.
+
+    Older manifests/configs may use high-level rgb_scheme values such as
+    intensity_equalized_gradient instead of custom_channel_pipeline. The GUI is
+    channel-pipeline based, so convert those schemes to equivalent editable
+    R/G/B steps for inspection and for GUI-driven exports.
+    """
+    image_export = (cfg or {}).get("image_export", {}) or {}
+    explicit = image_export.get("custom_channel_pipeline") or {}
+    scheme = str(image_export.get("rgb_scheme", "custom_channel_pipeline") or "custom_channel_pipeline")
+    if scheme == "custom_channel_pipeline" and isinstance(explicit, dict) and explicit:
+        return copy.deepcopy(explicit)
+
+    single_window = image_export.get("single_window", [1.0, 99.0])
+    if not isinstance(single_window, (list, tuple)) or len(single_window) < 2:
+        single_window = [1.0, 99.0]
+
+    if scheme == "multi_window":
+        windows = image_export.get("multi_window_percentiles", [[0.5, 99.5], [1.0, 99.0], [2.0, 98.0]])
+        while len(windows) < 3:
+            windows.append(single_window)
+        return {
+            "R": {"source": "current_crop", "steps": [{"op": "percentile_normalize", "params": {"percentiles": list(windows[0])}}]},
+            "G": {"source": "current_crop", "steps": [{"op": "percentile_normalize", "params": {"percentiles": list(windows[1])}}]},
+            "B": {"source": "current_crop", "steps": [{"op": "percentile_normalize", "params": {"percentiles": list(windows[2])}}]},
+        }
+
+    if scheme == "equalized_rgb":
+        step = [
+            {"op": "percentile_normalize", "params": {"percentiles": list(single_window)}},
+            {"op": "hist_equalize", "params": {}},
+        ]
+        return {ch: {"source": "current_crop", "steps": copy.deepcopy(step)} for ch in ["R", "G", "B"]}
+
+    if scheme == "intensity_equalized_gradient":
+        ieg = image_export.get("intensity_equalized_gradient", {}) or {}
+        intensity_window = ieg.get("intensity_window", single_window)
+        gradient_window = ieg.get("gradient_window", single_window)
+        gradient_ksize = int(ieg.get("gradient_ksize", 3) or 3)
+        return {
+            "R": {
+                "source": "current_crop",
+                "steps": [{"op": "percentile_normalize", "params": {"percentiles": list(intensity_window)}}],
+            },
+            "G": {
+                "source": "current_crop",
+                "steps": [
+                    {"op": "percentile_normalize", "params": {"percentiles": list(intensity_window)}},
+                    {"op": "hist_equalize", "params": {}},
+                ],
+            },
+            "B": {
+                "source": "current_crop",
+                "steps": [{"op": "sobel_gradient", "params": {"ksize": gradient_ksize, "percentiles": list(gradient_window)}}],
+            },
+        }
+
+    # grayscale_rgb, bitpack16 fallback, and unknown schemes become three equal grayscale channels.
+    step = [{"op": "percentile_normalize", "params": {"percentiles": list(single_window)}}]
+    return {ch: {"source": "current_crop", "steps": copy.deepcopy(step)} for ch in ["R", "G", "B"]}
+
+
 def _pipeline_controls(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
-    cfg_pipeline = (cfg or {}).get("image_export", {}).get("custom_channel_pipeline", {}) or {}
+    cfg_pipeline = _custom_pipeline_from_image_export_config(cfg)
     default_channel_sources = {
         "R": str(cfg_pipeline.get("R", {}).get("source", "current_crop")),
         "G": str(cfg_pipeline.get("G", {}).get("source", "current_crop")),
@@ -1262,6 +1325,8 @@ def _pipeline_controls(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     for channel in ["R", "G", "B"]:
         with st.sidebar.expander(f"{channel} channel", expanded=(channel == "R")):
             default_source = default_channel_sources[channel]
+            if default_source not in source_options:
+                default_source = "current_crop"
             source_label = st.selectbox(
                 f"Source ({channel})",
                 options=list(source_options.values()),
@@ -1274,6 +1339,7 @@ def _pipeline_controls(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
                 ),
             )
             source = {v: k for k, v in source_options.items()}[source_label]
+            default_steps_raw = list(cfg_pipeline.get(channel, {}).get("steps", []) or [])
             n_steps = st.number_input(
                 f"Number of steps ({channel})",
                 min_value=0,
@@ -1292,7 +1358,10 @@ def _pipeline_controls(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
                     index=OP_NAMES.index(default_op),
                     key=f"{channel}_op_{i}",
                 )
-                params = _op_parameter_controls(channel, i, op)
+                default_params = {}
+                if i < len(default_steps_raw) and isinstance(default_steps_raw[i], dict) and str(default_steps_raw[i].get("op", "none")) == op:
+                    default_params = dict(default_steps_raw[i].get("params", {}) or {})
+                params = _op_parameter_controls(channel, i, op, default_params)
                 steps.append({"op": op, "params": params})
             pipeline[channel] = {"source": source, "steps": steps}
     return pipeline
@@ -1325,27 +1394,50 @@ def _channel_steps(pipeline: dict[str, Any], channel: str) -> list[dict[str, Any
 def _pipeline_uses_contralateral(pipeline: dict[str, Any]) -> bool:
     return any(_channel_source(pipeline, ch) == "contralateral_same_view_crop" for ch in ["R", "G", "B"])
 
-def _op_parameter_controls(channel: str, step: int, op: str) -> dict[str, Any]:
+def _clamp_float(value: Any, minimum: float, maximum: float, default: float) -> float:
+    try:
+        number = float(value)
+    except Exception:
+        number = float(default)
+    if not math.isfinite(number):
+        number = float(default)
+    return min(max(number, minimum), maximum)
+
+
+def _pair_from_params(params: dict[str, Any], key: str, default: tuple[float, float], minimum: float = 0.0, maximum: float = 100.0) -> tuple[float, float]:
+    value = params.get(key, default) if isinstance(params, dict) else default
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        value = default
+    lo = _clamp_float(value[0], minimum, maximum, default[0])
+    hi = _clamp_float(value[1], minimum, maximum, default[1])
+    if hi < lo:
+        lo, hi = hi, lo
+    return float(lo), float(hi)
+
+
+def _op_parameter_controls(channel: str, step: int, op: str, default_params: dict[str, Any] | None = None) -> dict[str, Any]:
+    params = dict(default_params or {})
     prefix = f"{channel}_{step}_{op}"
     if op in {"percentile_normalize", "percentile_clip_only"}:
-        default_window = (70.0, 100.0) if channel == "G" and step == 2 and op == "percentile_normalize" else (1.0, 99.0)
+        fallback_window = (70.0, 100.0) if channel == "G" and step == 2 and op == "percentile_normalize" else (1.0, 99.0)
+        default_window = _pair_from_params(params, "percentiles", fallback_window)
         help_text = (
-            "This is a normal percentile stretch. For the default G channel, the second percentile_normalize "
-            "uses [70, 100] to emphasize bright/high-density regions, replacing the old redundant "
-            "aggressive_upper_percentile_normalize operation."
-            if default_window == (70.0, 100.0) else None
+            "This is a normal percentile stretch. For bright-region channels, use a high window such as [50, 100] "
+            "or [70, 100]. When loaded from a manifest, this value comes from that manifest."
+            if default_window[0] >= 40.0 else None
         )
         lo, hi = st.slider("Percentile window", 0.0, 100.0, default_window, 0.5, key=f"{prefix}_win", help=help_text)
         return {"percentiles": [float(lo), float(hi)]}
     if op == "zscore_clip":
-        limit = st.slider("Z-score clip", 0.5, 10.0, 3.0, 0.5, key=f"{prefix}_z")
+        default_limit = _clamp_float(params.get("z_limit", 3.0), 0.5, 10.0, 3.0)
+        limit = st.slider("Z-score clip", 0.5, 10.0, default_limit, 0.5, key=f"{prefix}_z")
         return {"z_limit": float(limit)}
     if op == "standardize_to_target":
         target_mean = st.slider(
             "Target mean",
             min_value=0.0,
             max_value=1.0,
-            value=0.50,
+            value=_clamp_float(params.get("target_mean", 0.50), 0.0, 1.0, 0.50),
             step=0.01,
             key=f"{prefix}_target_mean",
             help="After dynamic ax+b standardization, this is the desired channel mean on the 0 to 1 scale.",
@@ -1354,23 +1446,24 @@ def _op_parameter_controls(channel: str, step: int, op: str) -> dict[str, Any]:
             "Target std",
             min_value=0.001,
             max_value=0.50,
-            value=0.20,
+            value=_clamp_float(params.get("target_std", 0.20), 0.001, 0.50, 0.20),
             step=0.005,
             key=f"{prefix}_target_std",
             help="After dynamic ax+b standardization, this is the desired channel standard deviation on the 0 to 1 scale.",
         )
+        default_stat_win = _pair_from_params(params, "stat_percentiles", (1.0, 99.0))
         stat_lo, stat_hi = st.slider(
             "Statistic percentile range",
             min_value=0.0,
             max_value=100.0,
-            value=(1.0, 99.0),
+            value=default_stat_win,
             step=0.5,
             key=f"{prefix}_stat_win",
             help="Mean and std are estimated from pixels inside this percentile range to reduce outlier influence.",
         )
         clip_output = st.checkbox(
             "Clip standardized output to [0, 1]",
-            value=True,
+            value=bool(params.get("clip_output", True)),
             key=f"{prefix}_clip_output",
             help="Recommended for export, otherwise later 8-bit conversion may apply another percentile window.",
         )
@@ -1381,36 +1474,56 @@ def _op_parameter_controls(channel: str, step: int, op: str) -> dict[str, Any]:
             "clip_output": bool(clip_output),
         }
     if op == "clahe":
-        clip = st.slider("CLAHE clip limit", 0.5, 8.0, 2.0, 0.5, key=f"{prefix}_clip")
-        tile = st.select_slider("CLAHE tile size", options=[4, 8, 16, 32], value=8, key=f"{prefix}_tile")
+        clip = st.slider("CLAHE clip limit", 0.5, 8.0, _clamp_float(params.get("clip_limit", 2.0), 0.5, 8.0, 2.0), 0.5, key=f"{prefix}_clip")
+        tile_options = [4, 8, 16, 32]
+        tile_default = int(params.get("tile_grid_size", 8) or 8)
+        if tile_default not in tile_options:
+            tile_default = 8
+        tile = st.select_slider("CLAHE tile size", options=tile_options, value=tile_default, key=f"{prefix}_tile")
         return {"clip_limit": float(clip), "tile_grid_size": int(tile)}
     if op == "gaussian_blur":
-        k = st.select_slider("Gaussian kernel", options=[3, 5, 7, 9, 11, 15, 21], value=5, key=f"{prefix}_k")
-        sigma = st.slider("Gaussian sigma", 0.0, 10.0, 1.0, 0.25, key=f"{prefix}_sigma")
+        k_options = [3, 5, 7, 9, 11, 15, 21]
+        k_default = int(params.get("ksize", 5) or 5)
+        if k_default not in k_options:
+            k_default = 5
+        k = st.select_slider("Gaussian kernel", options=k_options, value=k_default, key=f"{prefix}_k")
+        sigma = st.slider("Gaussian sigma", 0.0, 10.0, _clamp_float(params.get("sigma", 1.0), 0.0, 10.0, 1.0), 0.25, key=f"{prefix}_sigma")
         return {"ksize": int(k), "sigma": float(sigma)}
     if op == "median_blur":
-        k = st.select_slider("Median kernel", options=[3, 5, 7, 9, 11], value=3, key=f"{prefix}_k")
+        k_options = [3, 5, 7, 9, 11]
+        k_default = int(params.get("ksize", 3) or 3)
+        if k_default not in k_options:
+            k_default = 3
+        k = st.select_slider("Median kernel", options=k_options, value=k_default, key=f"{prefix}_k")
         return {"ksize": int(k)}
     if op == "sharpen":
-        amount = st.slider("Sharpen strength", 0.0, 5.0, 1.0, 0.25, key=f"{prefix}_amt")
+        amount = st.slider("Sharpen strength", 0.0, 5.0, _clamp_float(params.get("amount", 1.0), 0.0, 5.0, 1.0), 0.25, key=f"{prefix}_amt")
         return {"amount": float(amount)}
     if op == "unsharp_mask":
-        amount = st.slider("Unsharp amount", 0.0, 5.0, 1.5, 0.25, key=f"{prefix}_amt")
-        sigma = st.slider("Unsharp blur sigma", 0.25, 10.0, 2.0, 0.25, key=f"{prefix}_sigma")
+        amount = st.slider("Unsharp amount", 0.0, 5.0, _clamp_float(params.get("amount", 1.5), 0.0, 5.0, 1.5), 0.25, key=f"{prefix}_amt")
+        sigma = st.slider("Unsharp blur sigma", 0.25, 10.0, _clamp_float(params.get("sigma", 2.0), 0.25, 10.0, 2.0), 0.25, key=f"{prefix}_sigma")
         return {"amount": float(amount), "sigma": float(sigma)}
     if op == "sobel_gradient":
-        k = st.select_slider("Sobel kernel", options=[1, 3, 5, 7], value=3, key=f"{prefix}_k")
-        lo, hi = st.slider("Gradient window", 0.0, 100.0, (1.0, 99.0), 0.5, key=f"{prefix}_win")
+        k_options = [1, 3, 5, 7]
+        k_default = int(params.get("ksize", 3) or 3)
+        if k_default not in k_options:
+            k_default = 3
+        k = st.select_slider("Sobel kernel", options=k_options, value=k_default, key=f"{prefix}_k")
+        lo, hi = st.slider("Gradient window", 0.0, 100.0, _pair_from_params(params, "percentiles", (1.0, 99.0)), 0.5, key=f"{prefix}_win")
         return {"ksize": int(k), "percentiles": [float(lo), float(hi)]}
     if op == "laplacian":
-        k = st.select_slider("Laplacian kernel", options=[1, 3, 5, 7], value=3, key=f"{prefix}_k")
-        lo, hi = st.slider("Laplacian window", 0.0, 100.0, (1.0, 99.0), 0.5, key=f"{prefix}_win")
+        k_options = [1, 3, 5, 7]
+        k_default = int(params.get("ksize", 3) or 3)
+        if k_default not in k_options:
+            k_default = 3
+        k = st.select_slider("Laplacian kernel", options=k_options, value=k_default, key=f"{prefix}_k")
+        lo, hi = st.slider("Laplacian window", 0.0, 100.0, _pair_from_params(params, "percentiles", (1.0, 99.0)), 0.5, key=f"{prefix}_win")
         return {"ksize": int(k), "percentiles": [float(lo), float(hi)]}
     if op == "gamma":
-        gamma = st.slider("Gamma", 0.1, 5.0, 1.0, 0.1, key=f"{prefix}_gamma")
+        gamma = st.slider("Gamma", 0.1, 5.0, _clamp_float(params.get("gamma", 1.0), 0.1, 5.0, 1.0), 0.1, key=f"{prefix}_gamma")
         return {"gamma": float(gamma)}
     if op == "log":
-        gain = st.slider("Log gain", 0.1, 20.0, 5.0, 0.5, key=f"{prefix}_gain")
+        gain = st.slider("Log gain", 0.1, 20.0, _clamp_float(params.get("gain", 5.0), 0.1, 20.0, 5.0), 0.5, key=f"{prefix}_gain")
         return {"gain": float(gain)}
     return {}
 

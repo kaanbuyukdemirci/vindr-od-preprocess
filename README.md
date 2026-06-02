@@ -1301,3 +1301,12 @@ The GUI export panel now reports elapsed time and estimated remaining time durin
 ### v43 ETA fix
 
 The GUI export progress panel now estimates remaining time from the current active stage progress instead of the coarse overall export fraction. This is especially important because square-crop export dominates runtime while earlier setup stages are short.
+
+## v44 notes: manifest loading and defaults
+
+- Manifest/config loading now applies the full RGB preprocessing pipeline parameters, not only the operation names.
+  For example, loaded percentile windows such as `[50, 100]` or `[75, 100]` are now reflected in the GUI sliders.
+- High-level `image_export.rgb_scheme` values are converted into editable GUI channel pipelines when loaded.
+  For example, `intensity_equalized_gradient` appears as R intensity, G equalized intensity, and B Sobel-gradient channel steps.
+- The default `config/export_config.yaml` was reset to the user-provided configuration with `rgb_scheme: intensity_equalized_gradient`, breast crop enabled, train random crops, and val/test deterministic crops.
+
