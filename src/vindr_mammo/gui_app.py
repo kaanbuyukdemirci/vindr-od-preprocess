@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import math
@@ -83,6 +84,7 @@ def main() -> None:
     st.sidebar.subheader("RGB preprocessing pipeline")
     st.sidebar.caption("Build the output RGB crop channel by channel.")
     pipeline = _pipeline_controls(cfg)
+    _loaded_pipeline_debug_panel(cfg, pipeline)
     _export_current_preprocessing_yaml_panel(
         config_path=config_path,
         cfg=cfg,
@@ -308,7 +310,7 @@ def _apply_loaded_manifest_settings_if_any(cfg: dict[str, Any]) -> dict[str, Any
         else:
             st.caption("Full config snapshot was loaded, including paths.")
         if st.button("Clear loaded manifest settings", key="clear_loaded_manifest_settings", use_container_width=True):
-            for key in ["loaded_manifest_config_snapshot", "loaded_manifest_source", "loaded_manifest_keep_current_paths"]:
+            for key in ["loaded_manifest_config_snapshot", "loaded_manifest_source", "loaded_manifest_keep_current_paths", "loaded_manifest_widget_token"]:
                 st.session_state.pop(key, None)
             _clear_relevant_gui_widget_state()
             st.rerun()
@@ -322,6 +324,23 @@ def _deep_merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str
         else:
             base[key] = copy.deepcopy(value)
     return base
+
+
+def _config_widget_token(cfg: dict[str, Any]) -> str:
+    """Stable short token used to force Streamlit widgets to rebuild after loading settings."""
+    try:
+        text = json.dumps(_make_yaml_safe(cfg), sort_keys=True, default=str)
+    except Exception:
+        text = repr(cfg)
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
+
+
+def _active_widget_suffix() -> str:
+    """Return a suffix for widget keys. Changes when manifest/config settings are loaded."""
+    token = st.session_state.get("loaded_manifest_widget_token")
+    if token:
+        return f"__loaded_{token}"
+    return "__base"
 
 
 def _clear_relevant_gui_widget_state() -> None:
@@ -433,6 +452,7 @@ def _render_manifest_comparison_mode(cfg: dict[str, Any]) -> None:
                 st.session_state["loaded_manifest_config_snapshot"] = copy.deepcopy(snapshot)
                 st.session_state["loaded_manifest_source"] = _manifest_short_name(selected["manifest"], selected["source"])
                 st.session_state["loaded_manifest_keep_current_paths"] = bool(keep_paths)
+                st.session_state["loaded_manifest_widget_token"] = _config_widget_token(snapshot)
                 _clear_relevant_gui_widget_state()
                 st.success("Settings loaded. The app will rerun now.")
                 st.rerun()
@@ -458,8 +478,7 @@ def _load_manifests_from_inputs(path_text: str, uploaded_files: list[Any] | None
         source_path = Path(raw).expanduser()
         try:
             manifest_path = _resolve_manifest_path(source_path)
-            with manifest_path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = _load_manifest_or_config_file(manifest_path)
             results.append({"ok": True, "source": str(manifest_path), "manifest": data})
         except Exception as exc:
             results.append({"ok": False, "source": raw, "error": str(exc)})
@@ -467,11 +486,46 @@ def _load_manifests_from_inputs(path_text: str, uploaded_files: list[Any] | None
     for upload in uploaded_files or []:
         try:
             content = upload.getvalue().decode("utf-8")
-            data = json.loads(content)
+            data = _parse_manifest_or_config_text(content, getattr(upload, "name", "uploaded manifest"))
             results.append({"ok": True, "source": getattr(upload, "name", "uploaded manifest"), "manifest": data})
         except Exception as exc:
             results.append({"ok": False, "source": getattr(upload, "name", "uploaded manifest"), "error": str(exc)})
     return results
+
+
+def _load_manifest_or_config_file(path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    return _parse_manifest_or_config_text(text, str(path))
+
+
+def _parse_manifest_or_config_text(text: str, source: str) -> dict[str, Any]:
+    """Parse a manifest/export_summary JSON or a plain export_config YAML file.
+
+    Plain YAML config files are wrapped into a pseudo-manifest so the same
+    Load settings button can apply their settings.
+    """
+    data: Any
+    try:
+        data = json.loads(text)
+    except Exception:
+        data = yaml.safe_load(text)
+    if not isinstance(data, dict):
+        raise ValueError(f"Manifest/config is not a dictionary: {source}")
+    if "config_snapshot" in data or "summary" in data or "stage_timings" in data:
+        return data
+    # Treat a plain export_config.yaml as settings to load.
+    return {
+        "status": "config_yaml",
+        "output_root": ((data.get("paths") or {}).get("output_root") if isinstance(data.get("paths"), dict) else ""),
+        "summary": {
+            "rgb_scheme": ((data.get("image_export") or {}).get("rgb_scheme") if isinstance(data.get("image_export"), dict) else ""),
+            "square_crop_modes": {
+                split: ((data.get("square_crops") or {}).get(f"{split}_crop_mode") if isinstance(data.get("square_crops"), dict) else "")
+                for split in ["train", "val", "test"]
+            },
+        },
+        "config_snapshot": data,
+    }
 
 
 def _resolve_manifest_path(path: Path) -> Path:
@@ -1305,8 +1359,18 @@ def _custom_pipeline_from_image_export_config(cfg: dict[str, Any] | None) -> dic
     return {ch: {"source": "current_crop", "steps": copy.deepcopy(step)} for ch in ["R", "G", "B"]}
 
 
+def _loaded_pipeline_debug_panel(cfg: dict[str, Any], pipeline: dict[str, Any]) -> None:
+    if not st.session_state.get("loaded_manifest_config_snapshot"):
+        return
+    with st.sidebar.expander("Loaded RGB pipeline check", expanded=False):
+        snapshot_pipeline = _custom_pipeline_from_image_export_config(cfg)
+        st.caption("This is the RGB pipeline currently being used by the GUI after loading settings.")
+        st.code(yaml.safe_dump(_make_yaml_safe(snapshot_pipeline), sort_keys=False, allow_unicode=True, width=100), language="yaml")
+
+
 def _pipeline_controls(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     cfg_pipeline = _custom_pipeline_from_image_export_config(cfg)
+    widget_suffix = _active_widget_suffix()
     default_channel_sources = {
         "R": str(cfg_pipeline.get("R", {}).get("source", "current_crop")),
         "G": str(cfg_pipeline.get("G", {}).get("source", "current_crop")),
@@ -1331,7 +1395,7 @@ def _pipeline_controls(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
                 f"Source ({channel})",
                 options=list(source_options.values()),
                 index=list(source_options.keys()).index(default_source),
-                key=f"{channel}_source",
+                key=f"{channel}_source{widget_suffix}",
                 help=(
                     "Use the selected crop, or use the same crop coordinates from the opposite breast "
                     "with the same view position in the same study. The opposite-breast source is computed "
@@ -1345,7 +1409,7 @@ def _pipeline_controls(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
                 min_value=0,
                 max_value=10,
                 value=len(default_channel_steps[channel]),
-                key=f"{channel}_n_steps",
+                key=f"{channel}_n_steps{widget_suffix}",
             )
             steps = []
             for i in range(int(n_steps)):
@@ -1356,12 +1420,12 @@ def _pipeline_controls(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
                     f"Step {i + 1}",
                     OP_NAMES,
                     index=OP_NAMES.index(default_op),
-                    key=f"{channel}_op_{i}",
+                    key=f"{channel}_op_{i}{widget_suffix}",
                 )
                 default_params = {}
                 if i < len(default_steps_raw) and isinstance(default_steps_raw[i], dict) and str(default_steps_raw[i].get("op", "none")) == op:
                     default_params = dict(default_steps_raw[i].get("params", {}) or {})
-                params = _op_parameter_controls(channel, i, op, default_params)
+                params = _op_parameter_controls(channel, i, op, default_params, widget_suffix=widget_suffix)
                 steps.append({"op": op, "params": params})
             pipeline[channel] = {"source": source, "steps": steps}
     return pipeline
@@ -1415,9 +1479,15 @@ def _pair_from_params(params: dict[str, Any], key: str, default: tuple[float, fl
     return float(lo), float(hi)
 
 
-def _op_parameter_controls(channel: str, step: int, op: str, default_params: dict[str, Any] | None = None) -> dict[str, Any]:
+def _op_parameter_controls(
+    channel: str,
+    step: int,
+    op: str,
+    default_params: dict[str, Any] | None = None,
+    widget_suffix: str = "",
+) -> dict[str, Any]:
     params = dict(default_params or {})
-    prefix = f"{channel}_{step}_{op}"
+    prefix = f"{channel}_{step}_{op}{widget_suffix}"
     if op in {"percentile_normalize", "percentile_clip_only"}:
         fallback_window = (70.0, 100.0) if channel == "G" and step == 2 and op == "percentile_normalize" else (1.0, 99.0)
         default_window = _pair_from_params(params, "percentiles", fallback_window)
