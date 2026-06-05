@@ -293,28 +293,78 @@ def _show_visualization_outputs(output_dir: Path, *, result: Any | None = None) 
 
 
 def _apply_loaded_manifest_settings_if_any(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Merge a loaded manifest config snapshot into the active GUI config."""
-    loaded = st.session_state.get("loaded_manifest_config_snapshot")
-    if not isinstance(loaded, dict):
+    """Apply a loaded manifest/config snapshot to the active GUI config.
+
+    The loaded config must be treated as the source of truth. Widget state in
+    Streamlit can survive reruns, so this function also exposes an explicit
+    refresh button that rebuilds all config-backed widgets from the loaded
+    snapshot.
+    """
+    raw_loaded = st.session_state.get("loaded_manifest_config_snapshot")
+    if not isinstance(raw_loaded, dict):
         return cfg
-    keep_paths = bool(st.session_state.get("loaded_manifest_keep_current_paths", True))
-    loaded_cfg = copy.deepcopy(loaded)
-    if keep_paths:
-        loaded_cfg.pop("paths", None)
-    merged = _deep_merge_dict(copy.deepcopy(cfg), loaded_cfg)
+
+    keep_paths = bool(st.session_state.get("loaded_manifest_keep_current_paths", False))
+    effective_loaded = st.session_state.get("loaded_manifest_effective_config_snapshot")
+    if not isinstance(effective_loaded, dict):
+        effective_loaded = copy.deepcopy(raw_loaded)
+        if keep_paths:
+            effective_loaded["paths"] = copy.deepcopy(cfg.get("paths", {}) or {})
+        st.session_state["loaded_manifest_effective_config_snapshot"] = copy.deepcopy(effective_loaded)
+
+    # Merge into the base config so missing newly-added keys still have defaults,
+    # but loaded values always win for export-relevant settings.
+    merged = _deep_merge_dict(copy.deepcopy(cfg), copy.deepcopy(effective_loaded))
+
     with st.sidebar.expander("Loaded manifest settings", expanded=False):
         source = st.session_state.get("loaded_manifest_source", "manifest")
         st.success(f"Using settings loaded from: {source}")
         if keep_paths:
-            st.caption("Current config paths were kept. Preprocessing, crop, vendor, and image-export settings were loaded.")
+            st.caption("Current config paths were kept. All other preprocessing, crop, vendor, annotation, and RGB settings were loaded.")
         else:
             st.caption("Full config snapshot was loaded, including paths.")
-        if st.button("Clear loaded manifest settings", key="clear_loaded_manifest_settings", use_container_width=True):
-            for key in ["loaded_manifest_config_snapshot", "loaded_manifest_effective_config_snapshot", "loaded_manifest_source", "loaded_manifest_keep_current_paths", "loaded_manifest_widget_token"]:
-                st.session_state.pop(key, None)
-            _clear_relevant_gui_widget_state()
-            st.rerun()
+        st.caption(
+            "If a control still looks stale, click Refresh loaded settings. This clears the relevant Streamlit widget state "
+            "and rebuilds all controls from the loaded config."
+        )
+        refresh_col, clear_col = st.columns(2)
+        with refresh_col:
+            if st.button("Refresh loaded settings", key="refresh_loaded_manifest_settings", use_container_width=True):
+                _refresh_loaded_config_widget_state(effective_loaded)
+                st.rerun()
+        with clear_col:
+            if st.button("Clear loaded settings", key="clear_loaded_manifest_settings", use_container_width=True):
+                for key in [
+                    "loaded_manifest_config_snapshot",
+                    "loaded_manifest_effective_config_snapshot",
+                    "loaded_manifest_source",
+                    "loaded_manifest_keep_current_paths",
+                    "loaded_manifest_widget_token",
+                    "loaded_manifest_refresh_counter",
+                ]:
+                    st.session_state.pop(key, None)
+                _clear_relevant_gui_widget_state()
+                st.rerun()
     return merged
+
+
+def _refresh_loaded_config_widget_state(effective_config: dict[str, Any] | None = None) -> None:
+    """Force config-backed widgets to rebuild from the loaded config.
+
+    This fixes the common Streamlit issue where a widget keeps an old value
+    because it has the same key after a rerun. We intentionally change the
+    token even if the loaded manifest is the same file.
+    """
+    if effective_config is None or not isinstance(effective_config, dict):
+        effective_config = st.session_state.get("loaded_manifest_effective_config_snapshot")
+    if not isinstance(effective_config, dict):
+        effective_config = st.session_state.get("loaded_manifest_config_snapshot")
+    if not isinstance(effective_config, dict):
+        return
+    counter = int(st.session_state.get("loaded_manifest_refresh_counter", 0) or 0) + 1
+    st.session_state["loaded_manifest_refresh_counter"] = counter
+    st.session_state["loaded_manifest_widget_token"] = f"{_config_widget_token(effective_config)}_{counter}"
+    _clear_relevant_gui_widget_state()
 
 
 def _deep_merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -360,14 +410,20 @@ def _widget_key(base: str) -> str:
 
 def _clear_relevant_gui_widget_state() -> None:
     prefixes = [
-        "R_", "G_", "B_", "gui_export_", "fixed_preprocess_",
-        "gui_display_", "crop_", "manifest_",
+        "R_", "G_", "B_",
+        "gui_export_", "fixed_preprocess_", "gui_display_",
+        "crop_", "crop_size", "crop_stride", "crop_proposal",
+        "refresh_preview_",
     ]
+    # Do not clear manifest_compare_paths or upload widgets here, because users
+    # often refresh while staying on the manifest page. The loaded config token
+    # already forces config-backed widgets to be recreated.
     exact_keys = {
         "Visible RGB channels", "Show individual processed channels",
     }
     for key in list(st.session_state.keys()):
-        if key in exact_keys or any(str(key).startswith(prefix) for prefix in prefixes):
+        key_s = str(key)
+        if key in exact_keys or any(key_s.startswith(prefix) for prefix in prefixes):
             st.session_state.pop(key, None)
 
 
@@ -474,8 +530,9 @@ def _render_manifest_comparison_mode(cfg: dict[str, Any]) -> None:
                 st.session_state["loaded_manifest_effective_config_snapshot"] = effective_snapshot
                 st.session_state["loaded_manifest_source"] = _manifest_short_name(selected["manifest"], selected["source"])
                 st.session_state["loaded_manifest_keep_current_paths"] = bool(keep_paths)
-                st.session_state["loaded_manifest_widget_token"] = _config_widget_token(effective_snapshot)
-                _clear_relevant_gui_widget_state()
+                # Force a fresh set of widget keys every time a manifest/config is loaded,
+                # even if the same manifest is loaded again.
+                _refresh_loaded_config_widget_state(effective_snapshot)
                 st.success("Settings loaded. The app will rerun now.")
                 st.rerun()
     with load_cols[1]:
@@ -1146,11 +1203,53 @@ def _display_controls() -> dict[str, Any]:
     }
 
 
+def _render_loaded_crop_config_debug(crop_cfg: dict[str, Any], policy: dict[str, Any]) -> None:
+    """Show the crop/export settings currently loaded from the active config."""
+    if not _is_loaded_config_active():
+        return
+    crop_preview = {
+        "crop_size": crop_cfg.get("crop_size"),
+        "stride": crop_cfg.get("stride"),
+        "crop_modes": {split: crop_cfg.get(f"{split}_crop_mode") for split in ["train", "val", "test"]},
+        "deterministic_selection_mode": {split: _selection_mode_from_config(crop_cfg, split) for split in ["train", "val", "test"]},
+        "deterministic_include_empty": {
+            split: bool(crop_cfg.get(f"{split}_deterministic_include_empty", crop_cfg.get("deterministic_include_empty", True)))
+            for split in ["train", "val", "test"]
+        },
+        "target_positive_ratio": {
+            split: crop_cfg.get(f"{split}_deterministic_target_positive_ratio", crop_cfg.get("deterministic_target_positive_ratio", crop_cfg.get("positive_fraction")))
+            for split in ["train", "val", "test"]
+        },
+        "foreground_filter": {
+            "deterministic_require_foreground": crop_cfg.get("deterministic_require_foreground"),
+            "deterministic_min_foreground_fraction": crop_cfg.get("deterministic_min_foreground_fraction"),
+            "deterministic_foreground_threshold": crop_cfg.get("deterministic_foreground_threshold"),
+            "train_deterministic_require_foreground": crop_cfg.get("train_deterministic_require_foreground"),
+            "val_deterministic_require_foreground": crop_cfg.get("val_deterministic_require_foreground"),
+            "test_deterministic_require_foreground": crop_cfg.get("test_deterministic_require_foreground"),
+        },
+        "random_crop_options": {
+            "positive_fraction": crop_cfg.get("positive_fraction"),
+            "random_crops_per_annotation": crop_cfg.get("random_crops_per_annotation"),
+            "center_shift_fraction": crop_cfg.get("center_shift_fraction"),
+            "seed": crop_cfg.get("seed"),
+        },
+        "crop_annotation_policy": copy.deepcopy(policy),
+    }
+    with st.sidebar.expander("Loaded crop settings check", expanded=False):
+        st.caption("This is the crop configuration currently read from the active config before export.")
+        st.code(yaml.safe_dump(_make_yaml_safe(crop_preview), sort_keys=False, allow_unicode=True, width=120), language="yaml")
+        if st.button("Refresh crop controls from loaded config", key="refresh_preview_crop_controls", use_container_width=True):
+            _refresh_loaded_config_widget_state()
+            st.rerun()
+
+
 def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     st.sidebar.divider()
     st.sidebar.subheader("Crop controls")
     crop_cfg = cfg.get("square_crops", {})
     policy = cfg.get("crop_annotation_policy", {})
+    _render_loaded_crop_config_debug(crop_cfg, policy)
 
     crop_size = st.sidebar.number_input(
         "Crop size n",
@@ -1226,7 +1325,7 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 "Random crops to preview",
                 min_value=1,
                 max_value=500,
-                value=20,
+                value=int(random_preview_count),
                 step=1,
                 key=_widget_key("crop_random_preview_count"),
             )
@@ -1762,6 +1861,9 @@ def _export_dataset_from_gui_panel(
                 "A manifest/config is loaded. Defaults in this panel now come from the loaded config. "
                 "Enable strict replay to export directly from the loaded config snapshot, ignoring any stale or edited GUI widgets."
             )
+            if st.button("Refresh all export controls from loaded config", key="gui_export_refresh_loaded_config", use_container_width=True):
+                _refresh_loaded_config_widget_state()
+                st.rerun()
             strict_replay_loaded = st.checkbox(
                 "Strict replay loaded config, ignore GUI control edits",
                 value=True,

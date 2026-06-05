@@ -1310,3 +1310,9 @@ The GUI export progress panel now estimates remaining time from the current acti
   For example, `intensity_equalized_gradient` appears as R intensity, G equalized intensity, and B Sobel-gradient channel steps.
 - The default `config/export_config.yaml` was reset to the user-provided configuration with `rgb_scheme: intensity_equalized_gradient`, breast crop enabled, train random crops, and val/test deterministic crops.
 
+
+## v48 note, manifest loading and crop-control refresh
+
+Manifest/config loading now treats the loaded `config_snapshot` as the source of truth for export-related settings. The GUI includes refresh buttons in the loaded-manifest panel, crop settings panel, and export panel to rebuild Streamlit widgets from the loaded config. This is useful when Streamlit session state has stale widget values after loading or reloading a manifest.
+
+A new `Loaded crop settings check` sidebar expander shows the crop-size, stride, split crop modes, deterministic selection modes, target positive ratios, foreground filtering options, random-crop options, and crop annotation policy currently active from the loaded config.
