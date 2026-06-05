@@ -310,7 +310,7 @@ def _apply_loaded_manifest_settings_if_any(cfg: dict[str, Any]) -> dict[str, Any
         else:
             st.caption("Full config snapshot was loaded, including paths.")
         if st.button("Clear loaded manifest settings", key="clear_loaded_manifest_settings", use_container_width=True):
-            for key in ["loaded_manifest_config_snapshot", "loaded_manifest_source", "loaded_manifest_keep_current_paths", "loaded_manifest_widget_token"]:
+            for key in ["loaded_manifest_config_snapshot", "loaded_manifest_effective_config_snapshot", "loaded_manifest_source", "loaded_manifest_keep_current_paths", "loaded_manifest_widget_token"]:
                 st.session_state.pop(key, None)
             _clear_relevant_gui_widget_state()
             st.rerun()
@@ -341,6 +341,21 @@ def _active_widget_suffix() -> str:
     if token:
         return f"__loaded_{token}"
     return "__base"
+
+
+def _is_loaded_config_active() -> bool:
+    """True when the GUI is being driven by a loaded manifest/config snapshot."""
+    return isinstance(st.session_state.get("loaded_manifest_config_snapshot"), dict)
+
+
+def _widget_key(base: str) -> str:
+    """Widget key that changes whenever a manifest/config is loaded.
+
+    Streamlit widget state persists across reruns. If keys are reused after
+    loading a manifest, old widget values can override the loaded config.
+    Every config-backed widget should use this helper.
+    """
+    return f"{base}{_active_widget_suffix()}"
 
 
 def _clear_relevant_gui_widget_state() -> None:
@@ -436,10 +451,13 @@ def _render_manifest_comparison_mode(cfg: dict[str, Any]) -> None:
     selected_label = st.selectbox("Manifest to load", options, key="manifest_load_select")
     selected_index = options.index(selected_label)
     keep_paths = st.checkbox(
-        "Keep current data/output paths",
-        value=True,
+        "Keep current data/output paths instead of manifest paths",
+        value=False,
         key="manifest_load_keep_paths",
-        help="Recommended. Loads preprocessing/crop/RGB/vendor settings, but keeps the current config paths to avoid overwriting old dataset folders.",
+        help=(
+            "For strict replay, leave this unchecked so paths are loaded too. "
+            "Check it only when you want the same settings but a different data/output location."
+        ),
     )
     load_cols = st.columns(2)
     with load_cols[0]:
@@ -449,10 +467,14 @@ def _render_manifest_comparison_mode(cfg: dict[str, Any]) -> None:
             if not isinstance(snapshot, dict) or not snapshot:
                 st.error("This manifest does not contain a config_snapshot block to load.")
             else:
+                effective_snapshot = copy.deepcopy(snapshot)
+                if keep_paths:
+                    effective_snapshot["paths"] = copy.deepcopy(cfg.get("paths", {}) or {})
                 st.session_state["loaded_manifest_config_snapshot"] = copy.deepcopy(snapshot)
+                st.session_state["loaded_manifest_effective_config_snapshot"] = effective_snapshot
                 st.session_state["loaded_manifest_source"] = _manifest_short_name(selected["manifest"], selected["source"])
                 st.session_state["loaded_manifest_keep_current_paths"] = bool(keep_paths)
-                st.session_state["loaded_manifest_widget_token"] = _config_widget_token(snapshot)
+                st.session_state["loaded_manifest_widget_token"] = _config_widget_token(effective_snapshot)
                 _clear_relevant_gui_widget_state()
                 st.success("Settings loaded. The app will rerun now.")
                 st.rerun()
@@ -1029,7 +1051,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     pp["invert_to_black_background"] = st.sidebar.checkbox(
         "Invert MONOCHROME1 to black background",
         value=bool(pp.get("invert_to_black_background", True)),
-        key="fixed_preprocess_invert_to_black_background",
+        key=_widget_key("fixed_preprocess_invert_to_black_background"),
         help=(
             "If enabled, only DICOM images tagged MONOCHROME1 are inverted. "
             "MONOCHROME2 images are left unchanged."
@@ -1038,7 +1060,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     pp["crop_breast"] = st.sidebar.checkbox(
         "Crop to breast foreground",
         value=bool(pp.get("crop_breast", False)),
-        key="fixed_preprocess_crop_breast",
+        key=_widget_key("fixed_preprocess_crop_breast"),
         help=(
             "Find the breast foreground and remove as much pure background as possible. "
             "Default is off so deterministic full-image crop experiments are not silently altered."
@@ -1047,7 +1069,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     pp["mirror_right_to_left"] = st.sidebar.checkbox(
         "Mirror right-entering breasts to left-entering",
         value=bool(pp.get("mirror_right_to_left", True)),
-        key="fixed_preprocess_mirror_right_to_left",
+        key=_widget_key("fixed_preprocess_mirror_right_to_left"),
         help="If the breast foreground is mostly on the right side, flip horizontally and update boxes.",
     )
     pp["crop_padding"] = st.sidebar.number_input(
@@ -1056,7 +1078,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         max_value=512,
         step=5,
         value=int(pp.get("crop_padding", 20)),
-        key="fixed_preprocess_crop_padding",
+        key=_widget_key("fixed_preprocess_crop_padding"),
         help="Padding added around the detected breast foreground crop.",
     )
 
@@ -1064,7 +1086,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         "Breast crop threshold",
         ["auto", "manual"],
         index=0 if pp.get("crop_threshold", None) is None else 1,
-        key="fixed_preprocess_crop_threshold_mode",
+        key=_widget_key("fixed_preprocess_crop_threshold_mode"),
         horizontal=True,
         help="Auto usually works best. Manual is useful for debugging foreground segmentation.",
     )
@@ -1073,7 +1095,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
             "Manual threshold value",
             value=float(pp.get("crop_threshold", 0.0) or 0.0),
             step=0.01,
-            key="fixed_preprocess_crop_threshold_value",
+            key=_widget_key("fixed_preprocess_crop_threshold_value"),
             format="%.6f",
         )
     else:
@@ -1084,7 +1106,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         min_value=0.0,
         max_value=0.05,
         value=float(pp.get("min_component_area_fraction", 0.001)),
-        key="fixed_preprocess_min_component_area_fraction",
+        key=_widget_key("fixed_preprocess_min_component_area_fraction"),
         step=0.0005,
         format="%.4f",
         help="Small connected components below this relative image area are ignored while finding the breast crop.",
@@ -1106,6 +1128,7 @@ def _display_controls() -> dict[str, Any]:
         "Visible RGB channels",
         options=["R", "G", "B"],
         default=["R", "G", "B"],
+        key=_widget_key("gui_display_visible_channels"),
         help=(
             "Controls only the GUI display of the processed RGB crop. Hidden channels "
             "are set to zero, which makes it easier to debug individual channel pipelines."
@@ -1114,6 +1137,7 @@ def _display_controls() -> dict[str, Any]:
     show_channel_panels = st.sidebar.checkbox(
         "Show individual processed channels",
         value=True,
+        key=_widget_key("gui_display_show_channel_panels"),
         help="Show R, G, and B as separate grayscale panels below the main images.",
     )
     return {
@@ -1134,6 +1158,7 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         max_value=4096,
         step=128,
         value=int(crop_cfg.get("crop_size", 1024)),
+        key=_widget_key("crop_size_n"),
     )
     stride = st.sidebar.number_input(
         "Deterministic stride",
@@ -1141,12 +1166,15 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         max_value=4096,
         step=64,
         value=int(crop_cfg.get("stride", 512)),
+        key=_widget_key("crop_stride"),
     )
 
+    default_crop_mode = "stochastic random" if str(crop_cfg.get("train_crop_mode", "deterministic")) == "random" else "deterministic sliding"
     crop_mode = st.sidebar.radio(
         "Crop proposal mode",
         ["deterministic sliding", "stochastic random"],
-        index=0,
+        index=["deterministic sliding", "stochastic random"].index(default_crop_mode),
+        key=_widget_key("crop_proposal_mode"),
         help=(
             "Deterministic uses the normal sliding-window grid. Stochastic samples random "
             "windows and can be biased toward masses. This is for GUI inspection only unless "
@@ -1154,32 +1182,42 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         ),
     )
 
-    only_mass_crops = st.sidebar.checkbox("Show only crops with visible mass", value=True)
+    default_only_mass = _selection_mode_from_config(crop_cfg, "train") == "mass_only"
+    only_mass_crops = st.sidebar.checkbox("Show only crops with visible mass", value=default_only_mass, key=_widget_key("crop_only_mass_crops"))
     positivity_threshold = st.sidebar.slider(
         "Positive crop threshold, visible mass fraction",
         min_value=0.0,
         max_value=1.0,
-        value=0.30,
+        value=float(policy.get("min_box_visibility", 0.30)),
         step=0.05,
+        key=_widget_key("crop_positivity_threshold"),
         help="A crop is considered positive if at least one mass box has this fraction visible inside the crop.",
     )
     # This is a GUI display/debug option, so default it to enabled even when the
     # export annotation policy is strict. Users can still turn it off manually.
-    if "gui_display_partial_boxes_after_clipping" not in st.session_state:
-        st.session_state["gui_display_partial_boxes_after_clipping"] = True
+    partial_key = _widget_key("gui_display_partial_boxes_after_clipping")
+    if partial_key not in st.session_state:
+        st.session_state[partial_key] = bool(policy.get("allow_partial_annotations", True)) if _is_loaded_config_active() else True
     allow_partial = st.sidebar.checkbox(
         "Display partial boxes after clipping",
-        key="gui_display_partial_boxes_after_clipping",
+        key=partial_key,
         help=(
             "GUI-only debugging default. When enabled, boxes that intersect the crop boundary "
             "are clipped and drawn if they satisfy the visibility threshold. This does not "
             "change config/export_config.yaml unless you explicitly export and apply the GUI YAML."
         ),
     )
-    min_box_visibility = st.sidebar.slider("Minimum box visibility to draw/keep", 0.0, 1.0, float(policy.get("min_box_visibility", 0.30)), 0.05)
+    min_box_visibility = st.sidebar.slider(
+        "Minimum box visibility to draw/keep",
+        0.0,
+        1.0,
+        float(policy.get("min_box_visibility", 0.30)),
+        0.05,
+        key=_widget_key("crop_min_box_visibility"),
+    )
 
-    random_preview_count = 20
-    random_positive_fraction = 0.80
+    random_preview_count = int(crop_cfg.get("random_crops_per_annotation", 20) or 20)
+    random_positive_fraction = float(crop_cfg.get("positive_fraction", 0.80))
     random_seed = int(crop_cfg.get("seed", 123))
     center_shift_fraction = float(crop_cfg.get("center_shift_fraction", 0.25))
     if crop_mode == "stochastic random":
@@ -1190,6 +1228,7 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 max_value=500,
                 value=20,
                 step=1,
+                key=_widget_key("crop_random_preview_count"),
             )
             random_positive_fraction = st.slider(
                 "Random positive fraction",
@@ -1197,6 +1236,7 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 max_value=1.0,
                 value=float(crop_cfg.get("positive_fraction", 0.80)),
                 step=0.05,
+                key=_widget_key("crop_random_positive_fraction"),
                 help="Probability of requesting a mass-positive random crop when the image has masses.",
             )
             center_shift_fraction = st.slider(
@@ -1205,13 +1245,15 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 max_value=1.0,
                 value=float(crop_cfg.get("center_shift_fraction", 0.25)),
                 step=0.05,
+                key=_widget_key("crop_center_shift_fraction"),
             )
-            random_seed = st.number_input("Random preview seed", min_value=0, max_value=999999, value=random_seed, step=1)
+            random_seed = st.number_input("Random preview seed", min_value=0, max_value=999999, value=random_seed, step=1, key=_widget_key("crop_random_seed"))
 
     with st.sidebar.expander("Foreground-ratio crop filter", expanded=False):
         require_foreground = st.checkbox(
             "Require crop to contain breast foreground",
             value=bool(crop_cfg.get("deterministic_require_foreground", False)),
+            key=_widget_key("crop_require_foreground"),
             help=(
                 "Reject crop windows whose foreground/breast-pixel fraction is below the threshold. "
                 "This is useful if you turn off the fixed breast crop and want square crops to remove pure background windows."
@@ -1223,12 +1265,14 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
             max_value=1.0,
             value=float(crop_cfg.get("deterministic_min_foreground_fraction", 0.05)),
             step=0.01,
+            key=_widget_key("crop_min_foreground_fraction"),
         )
         fg_threshold_mode = st.radio(
             "Foreground threshold for square crops",
             ["auto", "manual"],
             index=0 if crop_cfg.get("deterministic_foreground_threshold", None) is None else 1,
             horizontal=True,
+            key=_widget_key("crop_foreground_threshold_mode"),
         )
         if fg_threshold_mode == "manual":
             foreground_threshold = st.number_input(
@@ -1236,12 +1280,14 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 value=float(crop_cfg.get("deterministic_foreground_threshold", 0.0) or 0.0),
                 step=0.01,
                 format="%.6f",
+                key=_widget_key("crop_foreground_threshold_value"),
             )
         else:
             foreground_threshold = None
         foreground_mask_preview = st.checkbox(
             "Show foreground mask preview for selected crop",
             value=False,
+            key=_widget_key("crop_foreground_mask_preview"),
             help="Shows which crop pixels counted as breast foreground.",
         )
 
@@ -1252,8 +1298,8 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         "stride": int(stride),
         "allow_partial_annotations": bool(allow_partial),
         "min_box_visibility": float(min_box_visibility),
-        "reject_partial_windows": not bool(allow_partial),
-        "negative_max_box_visibility": 0.0,
+        "reject_partial_windows": bool(policy.get("reject_partial_windows", not bool(allow_partial))) if _is_loaded_config_active() else not bool(allow_partial),
+        "negative_max_box_visibility": float(policy.get("negative_max_box_visibility", 0.0)),
         "pad_if_needed": True,
         "pad_value": 0.0,
         "positive_fraction": float(random_positive_fraction),
@@ -1616,6 +1662,13 @@ def _selection_mode_from_config(crop_cfg: dict[str, Any], split: str) -> str:
         "positive_ratio": "positive_ratio",
         "all mass + sampled non-mass": "positive_ratio",
         "all_mass_plus_sampled_non_mass": "positive_ratio",
+        "finding_images_all_windows": "finding_images_all_windows",
+        "finding_images_only_all_windows": "finding_images_all_windows",
+        "findings_images_all_windows": "finding_images_all_windows",
+        "finding images only, all crops": "finding_images_all_windows",
+        "finding images only, all windows": "finding_images_all_windows",
+        "images with findings, all crops": "finding_images_all_windows",
+        "positive images, all crops": "finding_images_all_windows",
     }
     if mode in aliases:
         return aliases[mode]
@@ -1624,11 +1677,17 @@ def _selection_mode_from_config(crop_cfg: dict[str, Any], split: str) -> str:
 
 
 def _deterministic_selection_controls(crop_cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    options = ["mass only", "all", "all mass + sampled non-mass"]
+    options = [
+        "mass only",
+        "all",
+        "all mass + sampled non-mass",
+        "finding images only, all crops",
+    ]
     mode_to_label = {
         "mass_only": "mass only",
         "all": "all",
         "positive_ratio": "all mass + sampled non-mass",
+        "finding_images_all_windows": "finding images only, all crops",
     }
     payload: dict[str, dict[str, Any]] = {}
     cols = st.columns(3)
@@ -1640,11 +1699,13 @@ def _deterministic_selection_controls(crop_cfg: dict[str, Any]) -> dict[str, dic
                 f"{split.title()} windows",
                 options,
                 index=options.index(label),
-                key=f"gui_export_{split}_deterministic_selection_mode",
+                key=_widget_key(f"gui_export_{split}_deterministic_selection_mode"),
                 help=(
                     "mass only exports only crops with visible mass. all exports every deterministic window. "
                     "all mass + sampled non-mass keeps all positive windows and samples enough negative windows "
-                    "to approach the target positive crop ratio for that split."
+                    "to approach the target positive crop ratio for that split. "
+                    "finding images only, all crops skips source images with no findings, but keeps every crop "
+                    "from source images that contain at least one mass/finding."
                 ),
             )
             target_ratio = float(crop_cfg.get(f"{split}_deterministic_target_positive_ratio", crop_cfg.get("deterministic_target_positive_ratio", crop_cfg.get("positive_fraction", 0.80))))
@@ -1655,13 +1716,14 @@ def _deterministic_selection_controls(crop_cfg: dict[str, Any]) -> dict[str, dic
                     max_value=1.0,
                     value=min(max(target_ratio, 0.01), 1.0),
                     step=0.01,
-                    key=f"gui_export_{split}_target_positive_ratio",
+                    key=_widget_key(f"gui_export_{split}_target_positive_ratio"),
                 )
             payload[split] = {
                 "mode": {
                     "mass only": "mass_only",
                     "all": "all",
                     "all mass + sampled non-mass": "positive_ratio",
+                    "finding images only, all crops": "finding_images_all_windows",
                 }[selected_label],
                 "target_positive_ratio": float(target_ratio),
             }
@@ -1672,13 +1734,14 @@ def _apply_deterministic_selection_to_config(square: dict[str, Any], payload: di
     for split in ["train", "val", "test"]:
         split_payload = payload.get(split, {})
         mode = str(split_payload.get("mode", "all")).strip().casefold()
-        if mode not in {"mass_only", "all", "positive_ratio"}:
+        if mode not in {"mass_only", "all", "positive_ratio", "finding_images_all_windows"}:
             mode = "all"
         ratio = float(split_payload.get("target_positive_ratio", square.get("positive_fraction", 0.80)))
         ratio = min(max(ratio, 0.01), 1.0)
         square[f"{split}_deterministic_selection_mode"] = mode
         square[f"{split}_deterministic_target_positive_ratio"] = ratio
         # Backward-compatible field used by older code and summaries.
+        # finding_images_all_windows keeps empty crops, but only from source images with findings.
         square[f"{split}_deterministic_include_empty"] = mode != "mass_only"
 
 
@@ -1692,47 +1755,81 @@ def _export_dataset_from_gui_panel(
     """Run a dataset export directly from the GUI using current controls."""
     st.sidebar.divider()
     with st.sidebar.expander("Export dataset from GUI", expanded=False):
+        loaded_active = _is_loaded_config_active()
+        strict_replay_loaded = False
+        if loaded_active:
+            st.info(
+                "A manifest/config is loaded. Defaults in this panel now come from the loaded config. "
+                "Enable strict replay to export directly from the loaded config snapshot, ignoring any stale or edited GUI widgets."
+            )
+            strict_replay_loaded = st.checkbox(
+                "Strict replay loaded config, ignore GUI control edits",
+                value=True,
+                key=_widget_key("gui_export_strict_replay_loaded_config"),
+                help=(
+                    "Recommended when you want a loaded manifest/config to reproduce the same export settings. "
+                    "The output path and clean-output checkbox below are still applied so you can avoid overwriting old data."
+                ),
+            )
         st.caption(
             "Create a dataset using the current fixed preprocessing, crop controls, vendor filter, "
             "and RGB channel pipeline. This runs the same exporter as main.py, but with a GUI-built config."
         )
+        export_cfg_defaults = dict(cfg.get("export", {}) or {})
         current_output = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/preprocessed-vindr-v3")))
         output_parent = st.text_input(
             "Export parent folder",
             value=str(current_output.parent),
             help="The dataset folder will be created inside this parent folder.",
-            key="gui_export_parent_folder",
+            key=_widget_key("gui_export_parent_folder"),
         )
         dataset_name = st.text_input(
             "Dataset folder name",
             value=current_output.name if current_output.name else "preprocessed-vindr-gui",
             help="Final output path is parent/name. Example: /mnt/t9/preprocessed-vindr-v4.",
-            key="gui_export_dataset_name",
+            key=_widget_key("gui_export_dataset_name"),
         )
         output_root = Path(output_parent) / dataset_name
         st.code(str(output_root), language="text")
         clean_output = st.checkbox(
             "Delete output folder before export",
-            value=False,
-            key="gui_export_clean_output",
+            value=bool(export_cfg_defaults.get("clean_output_root", False)),
+            key=_widget_key("gui_export_clean_output"),
             help="Enable only when you are sure the target folder can be removed.",
+        )
+        save_square = st.checkbox(
+            "Export square_crops dataset",
+            value=bool(export_cfg_defaults.get("save_square_crops", True)),
+            key=_widget_key("gui_export_square_crops"),
+        )
+        save_baseline = st.checkbox(
+            "Also export baseline_uncropped dataset",
+            value=bool(export_cfg_defaults.get("save_baseline_uncropped", False)),
+            key=_widget_key("gui_export_baseline"),
         )
 
         vendors = _available_vendors(records_df)
+        vendor_cfg = dict(cfg.get("vendor_filter", {}) or {})
+        vendor_options = ["all vendors", "selected vendors only"]
+        default_vendor_label = "selected vendors only" if bool(vendor_cfg.get("enabled", False)) else "all vendors"
         vendor_mode = st.radio(
             "Vendor/device export filter",
-            ["all vendors", "selected vendors only"],
+            vendor_options,
+            index=vendor_options.index(default_vendor_label),
             horizontal=True,
-            key="gui_export_vendor_mode",
+            key=_widget_key("gui_export_vendor_mode"),
         )
         selected_vendors: list[str] = []
         if vendor_mode == "selected vendors only":
-            default_vendors = _default_comparison_vendors(records_df, min(5, len(vendors)))
+            configured_vendors = [str(v) for v in (vendor_cfg.get("include_vendors") or [])]
+            default_vendors = [v for v in configured_vendors if v in vendors]
+            if not default_vendors:
+                default_vendors = _default_comparison_vendors(records_df, min(5, len(vendors)))
             selected_vendors = st.multiselect(
                 "Vendors/devices to include",
                 options=vendors,
                 default=[v for v in default_vendors if v in vendors] or (vendors[:1] if vendors else []),
-                key="gui_export_selected_vendors",
+                key=_widget_key("gui_export_selected_vendors"),
                 help="Only source images from these detected devices will be included in train/val/test before crop export.",
             )
             if not selected_vendors:
@@ -1741,37 +1838,85 @@ def _export_dataset_from_gui_panel(
         st.markdown("**Split-specific deterministic crop selection**")
         st.caption(
             "For each split, deterministic sliding windows can be exported as all windows, mass windows only, "
-            "or all mass windows plus sampled non-mass windows to target a positive crop ratio."
+            "all mass windows plus sampled non-mass windows, or all windows from images that contain findings."
         )
         crop_cfg = dict(cfg.get("square_crops", {}) or {})
         selection_payload = _deterministic_selection_controls(crop_cfg)
 
+        crop_export_modes = ["deterministic sliding for all splits", "train stochastic, val/test deterministic"]
+        if str(crop_cfg.get("train_crop_mode", "deterministic")) == "random" and str(crop_cfg.get("val_crop_mode", "deterministic")) == "deterministic" and str(crop_cfg.get("test_crop_mode", "deterministic")) == "deterministic":
+            default_export_mode = "train stochastic, val/test deterministic"
+        else:
+            default_export_mode = "deterministic sliding for all splits"
         export_mode = st.radio(
             "Crop export mode",
-            ["deterministic sliding for all splits", "train stochastic, val/test deterministic"],
-            index=0,
-            key="gui_export_crop_mode",
-            help="The split-specific deterministic selection controls above apply when a split is deterministic. For most experiments here, keep deterministic.",
+            crop_export_modes,
+            index=crop_export_modes.index(default_export_mode),
+            key=_widget_key("gui_export_crop_mode"),
+            help="The split-specific deterministic selection controls above apply when a split is deterministic.",
         )
-        save_baseline = st.checkbox("Also export baseline_uncropped dataset", value=False, key="gui_export_baseline")
-        confirm = st.checkbox("I checked the output path and want to start export", value=False, key="gui_export_confirm")
+        confirm = st.checkbox("I checked the output path and want to start export", value=False, key=_widget_key("gui_export_confirm"))
+
+        with st.expander("Effective loaded/export settings preview", expanded=False):
+            if strict_replay_loaded:
+                preview_cfg = _strict_replay_export_config(output_root=output_root, clean_output=clean_output)
+            else:
+                preview_cfg = _build_gui_export_config(
+                    cfg=cfg,
+                    output_root=output_root,
+                    clean_output=clean_output,
+                    selected_vendors=selected_vendors if vendor_mode == "selected vendors only" else [],
+                    deterministic_selection=selection_payload,
+                    export_mode=export_mode,
+                    save_square=save_square,
+                    save_baseline=save_baseline,
+                    crop_controls=crop_controls,
+                    pipeline=pipeline,
+                )
+            st.code(yaml.safe_dump(_make_yaml_safe(preview_cfg), sort_keys=False, allow_unicode=True, width=120), language="yaml")
 
         if st.button("Start exporting dataset", type="primary", use_container_width=True, disabled=not confirm):
             if vendor_mode == "selected vendors only" and not selected_vendors:
                 st.error("No vendors selected. Select at least one vendor before exporting.")
                 return
-            export_cfg = _build_gui_export_config(
-                cfg=cfg,
-                output_root=output_root,
-                clean_output=clean_output,
-                selected_vendors=selected_vendors if vendor_mode == "selected vendors only" else [],
-                deterministic_selection=selection_payload,
-                export_mode=export_mode,
-                save_baseline=save_baseline,
-                crop_controls=crop_controls,
-                pipeline=pipeline,
-            )
+            if not save_square and not save_baseline:
+                st.error("Nothing selected to export. Enable square_crops and/or baseline_uncropped.")
+                return
+            if strict_replay_loaded:
+                export_cfg = _strict_replay_export_config(output_root=output_root, clean_output=clean_output)
+            else:
+                export_cfg = _build_gui_export_config(
+                    cfg=cfg,
+                    output_root=output_root,
+                    clean_output=clean_output,
+                    selected_vendors=selected_vendors if vendor_mode == "selected vendors only" else [],
+                    deterministic_selection=selection_payload,
+                    export_mode=export_mode,
+                    save_square=save_square,
+                    save_baseline=save_baseline,
+                    crop_controls=crop_controls,
+                    pipeline=pipeline,
+                )
             _run_export_with_streamlit_progress(export_cfg)
+
+
+
+def _strict_replay_export_config(*, output_root: Path, clean_output: bool) -> dict[str, Any]:
+    """Return the loaded config snapshot with only safe output controls applied.
+
+    This is intended for exact manifest/config replay. It bypasses GUI-derived
+    crop, vendor, preprocessing, and RGB pipeline widgets, because those widgets
+    can be stale or manually edited.
+    """
+    loaded = st.session_state.get("loaded_manifest_effective_config_snapshot")
+    if not isinstance(loaded, dict):
+        loaded = st.session_state.get("loaded_manifest_config_snapshot")
+    if not isinstance(loaded, dict):
+        raise RuntimeError("No loaded manifest/config snapshot is available for strict replay.")
+    out = copy.deepcopy(loaded)
+    out.setdefault("paths", {})["output_root"] = str(output_root)
+    out.setdefault("export", {})["clean_output_root"] = bool(clean_output)
+    return out
 
 
 def _build_gui_export_config(
@@ -1782,6 +1927,7 @@ def _build_gui_export_config(
     selected_vendors: list[str],
     deterministic_selection: dict[str, dict[str, Any]],
     export_mode: str,
+    save_square: bool,
     save_baseline: bool,
     crop_controls: dict[str, Any],
     pipeline: dict[str, Any],
@@ -1789,9 +1935,9 @@ def _build_gui_export_config(
     out = copy.deepcopy(cfg)
     out.setdefault("paths", {})["output_root"] = str(output_root)
     out.setdefault("export", {})["clean_output_root"] = bool(clean_output)
-    out.setdefault("export", {})["save_square_crops"] = True
+    out.setdefault("export", {})["save_square_crops"] = bool(save_square)
     out.setdefault("export", {})["save_baseline_uncropped"] = bool(save_baseline)
-    out.setdefault("export", {})["save_empty_label_files"] = True
+    out.setdefault("export", {})["save_empty_label_files"] = bool(out.get("export", {}).get("save_empty_label_files", True))
 
     out["vendor_filter"] = {
         "enabled": bool(selected_vendors),
@@ -1811,7 +1957,7 @@ def _build_gui_export_config(
         square["val_crop_mode"] = "deterministic"
         square["test_crop_mode"] = "deterministic"
     _apply_deterministic_selection_to_config(square, deterministic_selection)
-    square["deterministic_include_empty"] = True
+    square["deterministic_include_empty"] = bool(square.get("deterministic_include_empty", True))
     square["deterministic_require_foreground"] = bool(crop_controls.get("require_foreground", False))
     square["deterministic_min_foreground_fraction"] = float(crop_controls.get("min_foreground_fraction", 0.05))
     square["deterministic_foreground_threshold"] = crop_controls.get("foreground_threshold", None)

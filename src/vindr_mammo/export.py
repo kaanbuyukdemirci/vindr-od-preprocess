@@ -676,6 +676,13 @@ def _deterministic_selection_mode(crop_cfg: dict[str, Any], split_name: str) -> 
         "positive_ratio": "positive_ratio",
         "all_mass_plus_sampled_non_mass": "positive_ratio",
         "all mass + sampled non-mass": "positive_ratio",
+        "finding_images_all_windows": "finding_images_all_windows",
+        "finding_images_only_all_windows": "finding_images_all_windows",
+        "findings_images_all_windows": "finding_images_all_windows",
+        "finding images, all windows": "finding_images_all_windows",
+        "finding images only, all windows": "finding_images_all_windows",
+        "images with findings, all windows": "finding_images_all_windows",
+        "positive images, all windows": "finding_images_all_windows",
     }
     if mode in aliases:
         return aliases[mode]
@@ -769,16 +776,21 @@ def _windows_for_export_split(
 
         selection_mode = _deterministic_selection_mode(crop_cfg, split_name)
         target_positive_ratio = _deterministic_target_positive_ratio(crop_cfg, split_name)
-        include_empty = selection_mode != "mass_only"
+        include_empty = selection_mode not in {"mass_only"}
+        source_image_has_finding = bool(mass_boxes.detach().cpu().reshape(-1, 4).shape[0] > 0)
 
         # Compute positivity before any selection so the positive-ratio mode can
         # keep all mass windows and then globally sample non-mass windows.
+        # The finding-images mode keeps all windows from images that contain at
+        # least one mass/finding anywhere, but skips source images with no mass.
         positive_by_window = {
             w: bool(window_has_positive_mass(w, mass_boxes, crop_options))
             for w in windows
         }
         if selection_mode == "mass_only":
             windows = [w for w in windows if positive_by_window.get(w, False)]
+        elif selection_mode == "finding_images_all_windows" and not source_image_has_finding:
+            windows = []
 
         foreground_filter_enabled = bool(_split_crop_cfg(
             crop_cfg,
@@ -822,6 +834,7 @@ def _windows_for_export_split(
                     "deterministic_include_empty": int(include_empty),
                     "deterministic_selection_mode": selection_mode,
                     "deterministic_target_positive_ratio": float(target_positive_ratio),
+                    "source_image_has_finding": int(source_image_has_finding),
                     "is_positive_window": int(bool(positive_by_window.get(w, False))),
                     "foreground_filter_enabled": int(foreground_filter_enabled),
                     "min_foreground_fraction": float(min_foreground_fraction),
@@ -1898,6 +1911,9 @@ def _sample_stats_row(
             {
                 "crop_window_xyxy": "" if window is None else str(tuple(int(v) for v in window)),
                 "crop_mode": crop_info.get("crop_mode"),
+                "deterministic_selection_mode": crop_info.get("deterministic_selection_mode", ""),
+                "source_image_has_finding": crop_info.get("source_image_has_finding", ""),
+                "is_positive_window": crop_info.get("is_positive_window", ""),
                 "requested_positive": crop_info.get("requested_positive"),
                 "accepted": crop_info.get("accepted"),
                 "foreground_filter_enabled": crop_info.get("foreground_filter_enabled", ""),

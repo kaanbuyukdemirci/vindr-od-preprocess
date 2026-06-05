@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vindr-mammo-reader"
-version = "0.31.0"
+version = "0.47.0"
 description = "VinDr-Mammo PyTorch dataset, preprocessing, export, visualization, and preprocessing-inspection GUI tools for mass detection."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -333,19 +333,21 @@ The GUI writes the usual visualization files under `<export_root>/visualizations
 
 The GUI export panel now shows elapsed time and an estimated remaining time next to the Streamlit progress bar. The estimate is based on the current overall export fraction, so it becomes more stable after the first few export steps.
 
-For deterministic square-crop exports, each split can now use one of three selection modes:
+For deterministic square-crop exports, each split can now use one of four selection modes:
 
 - `mass_only`: keep only deterministic windows with at least one visible mass.
 - `all`: keep every deterministic sliding-window crop.
 - `positive_ratio`: keep all mass-positive deterministic windows, then sample non-mass windows to approach the requested positive crop ratio for that split.
+- `finding_images_all_windows`: skip source images with no mass/finding, but keep every deterministic crop from source images that contain at least one mass/finding somewhere.
 
 The corresponding YAML keys are:
 
 ```yaml
 square_crops:
+  # Allowed: mass_only, all, positive_ratio, finding_images_all_windows
   train_deterministic_selection_mode: mass_only
   val_deterministic_selection_mode: all
-  test_deterministic_selection_mode: all
+  test_deterministic_selection_mode: finding_images_all_windows
 
   train_deterministic_target_positive_ratio: 0.80
   val_deterministic_target_positive_ratio: 0.80
@@ -364,3 +366,20 @@ This mode also has a `Load settings into GUI session` button. It loads the selec
 ### v43 ETA fix
 
 The GUI export progress panel now estimates remaining time from the current active stage progress instead of the coarse overall export fraction. This is especially important because square-crop export dominates runtime while earlier setup stages are short.
+
+
+## Manifest/config loading and strict replay
+
+The **Manifest comparison / load settings** mode can load either an exported
+`manifest.json`, `export_summary.json`, or a resolved `export_config_resolved.yaml`.
+When a settings file is loaded, the GUI rebuilds config-backed widgets from the
+loaded `config_snapshot`, including fixed preprocessing, crop controls, vendor
+filtering, deterministic crop selection, annotation policy, and RGB channel
+pipelines.
+
+The **Export dataset from GUI** panel now includes **Strict replay loaded config,
+ignore GUI control edits**. Leave this enabled if the goal is to reproduce a
+loaded manifest/config. In strict replay, export uses the loaded config snapshot
+directly and only applies the output path and clean-output checkbox from the
+export panel. This avoids stale Streamlit widget state changing the RGB pipeline
+or crop settings after loading.

@@ -1295,7 +1295,7 @@ The Streamlit GUI includes a **Dataset visualizations** mode. Enter an exported 
 
 ### v41 GUI export additions
 
-The GUI export panel now reports elapsed time and estimated remaining time during dataset export. It also supports split-specific deterministic crop selection modes: `mass_only`, `all`, and `positive_ratio`. In `positive_ratio` mode, all mass-positive deterministic windows are kept and non-mass windows are sampled to approach the requested positive crop ratio for train, validation, or test independently.
+The GUI export panel now reports elapsed time and estimated remaining time during dataset export. It also supports split-specific deterministic crop selection modes: `mass_only`, `all`, `positive_ratio`, and `finding_images_all_windows`. In `positive_ratio` mode, all mass-positive deterministic windows are kept and non-mass windows are sampled to approach the requested positive crop ratio for train, validation, or test independently. In `finding_images_all_windows` mode, source images with no mass/finding are skipped, but every deterministic crop from source images with at least one mass/finding is kept, including crop windows that do not themselves contain the mass.
 
 
 ### v43 ETA fix
