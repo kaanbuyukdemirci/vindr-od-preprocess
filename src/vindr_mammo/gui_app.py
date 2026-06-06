@@ -860,7 +860,7 @@ def _current_preprocessing_yaml_payload(
             "foreground_threshold": crop_controls.get("foreground_threshold"),
             "random_preview_count": crop_controls.get("random_preview_count"),
             "random_seed": crop_controls.get("random_seed"),
-            "random_positive_fraction": crop_options.get("positive_fraction"),
+            "preview_random_positive_fraction": crop_options.get("positive_fraction"),
             "center_shift_fraction": crop_options.get("center_shift_fraction"),
             "allow_partial_annotations": crop_options.get("allow_partial_annotations"),
             "min_box_visibility": crop_options.get("min_box_visibility"),
@@ -893,7 +893,8 @@ def _current_preprocessing_yaml_payload(
                 "deterministic_require_foreground": crop_controls.get("require_foreground"),
                 "deterministic_min_foreground_fraction": crop_controls.get("min_foreground_fraction"),
                 "deterministic_foreground_threshold": crop_controls.get("foreground_threshold"),
-                "positive_fraction": crop_options.get("positive_fraction"),
+                # Export mass-vs-empty balance is intentionally not written from the preview sidebar.
+                # Set it in the Export dataset panel, which writes split-specific *_positive_fraction fields.
                 "center_shift_fraction": crop_options.get("center_shift_fraction"),
             },
             "image_export": {
@@ -1255,7 +1256,12 @@ def _render_loaded_crop_config_debug(crop_cfg: dict[str, Any], policy: dict[str,
 
 def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     st.sidebar.divider()
-    st.sidebar.subheader("Crop controls")
+    st.sidebar.subheader("Crop preview and shared crop geometry")
+    st.sidebar.caption(
+        "Crop size, stride, bbox-safe parameters, and annotation policy are shared with export. "
+        "Controls explicitly marked PREVIEW ONLY affect only what you browse in this GUI. "
+        "Train/val/test crop mode and the mass-vs-empty export ratio are set only in the Export dataset panel."
+    )
     crop_cfg = cfg.get("square_crops", {})
     policy = cfg.get("crop_annotation_policy", {})
     _render_loaded_crop_config_debug(crop_cfg, policy)
@@ -1286,27 +1292,40 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         default_crop_mode = "deterministic sliding"
     crop_mode_options = ["deterministic sliding", "stochastic random", "bbox-safe breast-biased random"]
     crop_mode = st.sidebar.radio(
-        "Crop proposal mode",
+        "PREVIEW ONLY, crop proposal mode",
         crop_mode_options,
         index=crop_mode_options.index(default_crop_mode),
         key=_widget_key("crop_proposal_mode"),
         help=(
-            "Deterministic uses the normal sliding-window grid. Stochastic samples random "
-            "windows and can be biased toward masses. Bbox-safe random also requires visible "
-            "annotations to be away from crop boundaries and chooses among breast-rich candidates."
+            "This controls only the crop shown in the inspector. Export crop modes are chosen separately "
+            "for train, val, and test in the Export dataset panel. Deterministic means sliding windows. "
+            "Stochastic random samples around masses. Bbox-safe random also rejects visible annotations "
+            "inside the forbidden boundary band."
         ),
     )
 
     default_only_mass = _selection_mode_from_config(crop_cfg, "train") == "mass_only"
-    only_mass_crops = st.sidebar.checkbox("Show only crops with visible mass", value=default_only_mass, key=_widget_key("crop_only_mass_crops"))
+    only_mass_crops = st.sidebar.checkbox(
+        "PREVIEW ONLY, show only crops with visible mass",
+        value=default_only_mass,
+        key=_widget_key("crop_only_mass_crops"),
+        help=(
+            "This only filters the crop list shown in the GUI. It does not decide whether the exported "
+            "dataset is mass-only, natural-ratio, or 50/50. Use Export dataset from GUI for that."
+        ),
+    )
     positivity_threshold = st.sidebar.slider(
-        "Positive crop threshold, visible mass fraction",
+        "PREVIEW ONLY, positive crop threshold",
         min_value=0.0,
         max_value=1.0,
         value=float(policy.get("min_box_visibility", 0.30)),
         step=0.05,
         key=_widget_key("crop_positivity_threshold"),
-        help="A crop is considered positive if at least one mass box has this fraction visible inside the crop.",
+        help=(
+            "Preview-only threshold. Example: 0.30 means a crop is counted as positive in the GUI "
+            "when at least 30% of one mass box is visible. Export label filtering uses the annotation "
+            "policy below, and export class balance is set in the Export dataset panel."
+        ),
     )
     # This is a GUI display/debug option, so default it to enabled even when the
     # export annotation policy is strict. Users can still turn it off manually.
@@ -1332,7 +1351,7 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     )
 
     random_preview_count = int(crop_cfg.get("random_crops_per_annotation", 20) or 20)
-    random_positive_fraction = float(crop_cfg.get("positive_fraction", 0.80))
+    random_positive_fraction = float(crop_cfg.get("positive_fraction", 0.50))
     random_seed = int(crop_cfg.get("seed", 123))
     center_shift_fraction = float(crop_cfg.get("center_shift_fraction", 0.25))
     if crop_mode in {"stochastic random", "bbox-safe breast-biased random"}:
@@ -1346,13 +1365,16 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 key=_widget_key("crop_random_preview_count"),
             )
             random_positive_fraction = st.slider(
-                "Random positive fraction",
+                "PREVIEW ONLY, random positive request probability",
                 min_value=0.0,
                 max_value=1.0,
-                value=float(crop_cfg.get("positive_fraction", 0.80)),
+                value=float(crop_cfg.get("preview_positive_fraction", crop_cfg.get("positive_fraction", 0.50))),
                 step=0.05,
                 key=_widget_key("crop_random_positive_fraction"),
-                help="Probability of requesting a mass-positive random crop when the image has masses.",
+                help=(
+                    "Preview only. Example: 0.50 asks the GUI sampler for about half mass crops and half empty crops "
+                    "when random previewing is possible. The export 50/50 setting is in the Export dataset panel."
+                ),
             )
             center_shift_fraction = st.slider(
                 "Mass-center random shift fraction",
@@ -1381,8 +1403,9 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 step=0.01,
                 key=_widget_key("crop_bbox_safe_boundary_margin_fraction"),
                 help=(
-                    "If this is 0.15, any visible annotation must be fully inside the central 70% "
-                    "of the crop. In other words, no visible box edge may fall in the outer 15% margin."
+                    "Example: 0.15 means the outer 15% of the crop on every side is forbidden. "
+                    "For a 1024 crop, visible mass boxes must be fully inside x=154..870 and y=154..870. "
+                    "If a mass box touches that forbidden band, bbox-safe mode rejects the crop."
                 ),
             )
             bbox_safe_random_shift_fraction = st.slider(
@@ -1392,7 +1415,10 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 value=float(bbox_safe_random_shift_fraction),
                 step=0.05,
                 key=_widget_key("crop_bbox_safe_random_shift_fraction"),
-                help="Random shift around the chosen annotation center, relative to crop size.",
+                help=(
+                    "How much randomness is allowed around the target mass. Example: 0.35 with a 1024 crop "
+                    "allows candidate crop centers to vary by about 358 pixels, while still obeying the hard boundary rule."
+                ),
             )
             bbox_safe_candidate_count = int(st.number_input(
                 "Candidate windows per crop",
@@ -1401,7 +1427,10 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 value=int(bbox_safe_candidate_count),
                 step=10,
                 key=_widget_key("crop_bbox_safe_candidate_count"),
-                help="More candidates increases the chance of satisfying boundary and breast-coverage constraints, but is slower.",
+                help=(
+                    "How many candidate windows are tested for each requested crop. Example: 120 tries usually gives enough choices "
+                    "to find a crop that keeps the box away from the border and includes more breast tissue. Higher is safer but slower."
+                ),
             ))
             bbox_safe_top_k = int(st.number_input(
                 "Randomly choose among top K candidates",
@@ -1410,7 +1439,10 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 value=int(bbox_safe_top_k),
                 step=1,
                 key=_widget_key("crop_bbox_safe_top_k"),
-                help="Keeps randomness while preferring breast-rich candidates.",
+                help=(
+                    "The sampler ranks valid candidates by breast coverage and bias scores, then randomly picks among the best K. "
+                    "Example: K=1 is most deterministic; K=8 keeps randomness while still preferring good crops."
+                ),
             ))
             bbox_safe_breast_bias_strength = st.slider(
                 "Breast foreground bias strength",
@@ -1419,6 +1451,10 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 value=float(bbox_safe_breast_bias_strength),
                 step=0.1,
                 key=_widget_key("crop_bbox_safe_breast_bias_strength"),
+                help=(
+                    "How strongly valid crops are scored by breast-pixel coverage. 0 ignores breast coverage. "
+                    "1 is a useful default. Larger values push crops toward more breast tissue after the hard bbox rule is satisfied."
+                ),
             )
             bbox_safe_left_bias_strength = st.slider(
                 "Left/chest-wall alignment bias strength",
@@ -1427,7 +1463,10 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 value=float(bbox_safe_left_bias_strength),
                 step=0.1,
                 key=_widget_key("crop_bbox_safe_left_bias_strength"),
-                help="After right-to-left mirroring, this prefers windows closer to the left edge, which usually preserves more breast/chest-wall context.",
+                help=(
+                    "After right-to-left mirroring, the chest wall is usually on the left. 0 disables this. "
+                    "0.25 gently prefers left-aligned crops so more chest-wall/breast context is retained."
+                ),
             )
             bbox_safe_projection_bias_strength = st.slider(
                 "X-projection peak bias strength",
@@ -1436,7 +1475,10 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 value=float(bbox_safe_projection_bias_strength),
                 step=0.1,
                 key=_widget_key("crop_bbox_safe_projection_bias_strength"),
-                help="Prefers windows that include the peak of the breast foreground projection along the x-axis.",
+                help=(
+                    "Scores valid crops higher when they include the strongest x-axis breast foreground peak. "
+                    "This helps avoid crops that technically contain the mass but mostly show background."
+                ),
             )
 
     with st.sidebar.expander("Foreground-ratio crop filter", expanded=False):
@@ -1445,8 +1487,8 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
             value=bool(crop_cfg.get("deterministic_require_foreground", False)),
             key=_widget_key("crop_require_foreground"),
             help=(
-                "Reject crop windows whose foreground/breast-pixel fraction is below the threshold. "
-                "This is useful if you turn off the fixed breast crop and want square crops to remove pure background windows."
+                "Reject crop windows whose breast-pixel fraction is below the threshold. Example: with minimum=0.05, "
+                "at least 5% of the crop must look like breast foreground. This is shared with export when enabled."
             ),
         )
         min_foreground_fraction = st.slider(
@@ -1880,11 +1922,31 @@ def _selection_mode_from_config(crop_cfg: dict[str, Any], split: str) -> str:
     return "all" if include_empty else "mass_only"
 
 
-def _deterministic_selection_controls(crop_cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+
+
+def _split_target_positive_ratio_from_config(crop_cfg: dict[str, Any], split: str) -> float:
+    """Read the target mass-positive crop ratio for any export crop mode."""
+    keys = [
+        f"{split}_positive_fraction",
+        f"{split}_bbox_safe_positive_fraction",
+        f"{split}_deterministic_target_positive_ratio",
+        "positive_fraction",
+        "deterministic_target_positive_ratio",
+    ]
+    for key in keys:
+        if key in crop_cfg and crop_cfg.get(key) is not None:
+            try:
+                return min(max(float(crop_cfg.get(key)), 0.01), 1.0)
+            except Exception:
+                pass
+    return 0.50
+
+def _deterministic_selection_controls(crop_cfg: dict[str, Any], split_crop_modes: dict[str, str] | None = None) -> dict[str, dict[str, Any]]:
+    split_crop_modes = dict(split_crop_modes or {})
     options = [
+        "all mass + sampled non-mass",
         "mass only",
         "all",
-        "all mass + sampled non-mass",
         "finding images only, all crops",
     ]
     mode_to_label = {
@@ -1898,29 +1960,40 @@ def _deterministic_selection_controls(crop_cfg: dict[str, Any]) -> dict[str, dic
     for split, col in zip(["train", "val", "test"], cols):
         with col:
             current_mode = _selection_mode_from_config(crop_cfg, split)
-            label = mode_to_label.get(current_mode, "all")
+            label = mode_to_label.get(current_mode, "all mass + sampled non-mass")
+            split_mode = str(split_crop_modes.get(split, crop_cfg.get(f"{split}_crop_mode", "deterministic"))).strip().casefold()
+            split_options = list(options)
+            if split_mode in {"random", "bbox_safe_random"}:
+                # Random generators do not have a natural sliding-window "all" mode.
+                # Their export balance is controlled by the target ratio only.
+                label = "all mass + sampled non-mass"
+                split_options = ["all mass + sampled non-mass"]
             selected_label = st.radio(
-                f"{split.title()} windows",
-                options,
-                index=options.index(label),
+                f"{split.title()} export mass/empty selection",
+                split_options,
+                index=split_options.index(label),
                 key=_widget_key(f"gui_export_{split}_deterministic_selection_mode"),
                 help=(
-                    "mass only exports only crops with visible mass. all exports every deterministic window. "
-                    "all mass + sampled non-mass keeps all positive windows and samples enough negative windows "
-                    "to approach the target positive crop ratio for that split. "
-                    "finding images only, all crops skips source images with no findings, but keeps every crop "
-                    "from source images that contain at least one mass/finding."
+                    "This is the export dataset balance control. For random and bbox-safe random splits, use "
+                    "'all mass + sampled non-mass' and the target slider below. Example: target 0.50 means about one "
+                    "empty crop for each mass crop. For deterministic sliding splits, the same option keeps all mass-positive "
+                    "windows and samples enough empty windows to approach the target ratio. 'all' keeps the natural sliding-window "
+                    "ratio, which is often mostly empty. 'mass only' exports no empty crops."
                 ),
             )
-            target_ratio = float(crop_cfg.get(f"{split}_deterministic_target_positive_ratio", crop_cfg.get("deterministic_target_positive_ratio", crop_cfg.get("positive_fraction", 0.80))))
+            target_ratio = _split_target_positive_ratio_from_config(crop_cfg, split)
             if selected_label == "all mass + sampled non-mass":
                 target_ratio = st.slider(
-                    f"{split.title()} target positive ratio",
+                    f"{split.title()} target mass-positive crop ratio",
                     min_value=0.01,
                     max_value=1.0,
                     value=min(max(target_ratio, 0.01), 1.0),
                     step=0.01,
                     key=_widget_key(f"gui_export_{split}_target_positive_ratio"),
+                    help=(
+                        "Example: 0.50 means approximately 50% crops with at least one mass and 50% empty crops. "
+                        "0.80 means approximately 80% mass crops and 20% empty crops. The exact achieved ratio is saved in summary.csv."
+                    ),
                 )
             payload[split] = {
                 "mode": {
@@ -1940,10 +2013,15 @@ def _apply_deterministic_selection_to_config(square: dict[str, Any], payload: di
         mode = str(split_payload.get("mode", "all")).strip().casefold()
         if mode not in {"mass_only", "all", "positive_ratio", "finding_images_all_windows"}:
             mode = "all"
-        ratio = float(split_payload.get("target_positive_ratio", square.get("positive_fraction", 0.80)))
+        ratio = float(split_payload.get("target_positive_ratio", square.get("positive_fraction", 0.50)))
         ratio = min(max(ratio, 0.01), 1.0)
         square[f"{split}_deterministic_selection_mode"] = mode
         square[f"{split}_deterministic_target_positive_ratio"] = ratio
+        # The same target is also used by random and bbox-safe random export modes.
+        # This removes the old ambiguity where the sidebar preview positive_fraction
+        # and the export positive-ratio slider could disagree.
+        square[f"{split}_positive_fraction"] = ratio
+        square[f"{split}_bbox_safe_positive_fraction"] = ratio
         # Backward-compatible field used by older code and summaries.
         # finding_images_all_windows keeps empty crops, but only from source images with findings.
         square[f"{split}_deterministic_include_empty"] = mode != "mass_only"
@@ -2085,10 +2163,10 @@ def _export_dataset_from_gui_panel(
                 st.warning("Select at least one vendor, or switch to all vendors.")
 
         crop_cfg = dict(cfg.get("square_crops", {}) or {})
-        st.markdown("**Split-specific crop proposal mode**")
+        st.markdown("**Export crop generator per split**")
         st.caption(
-            "Choose the crop generator independently for train, val, and test. Deterministic selection controls below "
-            "only apply to splits whose crop mode is deterministic sliding."
+            "This is the only place that decides which crop generator is used for train, val, and test export. "
+            "The sidebar crop mode is only for previewing one image."
         )
         split_crop_modes = _split_crop_mode_controls(crop_cfg)
 
@@ -2108,12 +2186,12 @@ def _export_dataset_from_gui_panel(
                 "projection_bias_strength": crop_controls.get("bbox_safe_projection_bias_strength"),
             })
 
-        st.markdown("**Split-specific deterministic crop selection**")
+        st.markdown("**Export mass/empty balance per split**")
         st.caption(
-            "For deterministic splits, sliding windows can be exported as all windows, mass windows only, "
-            "all mass windows plus sampled non-mass windows, or all windows from images that contain findings."
+            "Use this when you want 50% mass crops and 50% empty crops. For random and bbox-safe random, the target ratio "
+            "controls how many empty random crops are added. For deterministic sliding, it controls which empty windows are sampled."
         )
-        selection_payload = _deterministic_selection_controls(crop_cfg)
+        selection_payload = _deterministic_selection_controls(crop_cfg, split_crop_modes)
         confirm = st.checkbox("I checked the output path and want to start export", value=False, key=_widget_key("gui_export_confirm"))
 
         with st.expander("Effective loaded/export settings preview", expanded=False):
@@ -2217,7 +2295,9 @@ def _build_gui_export_config(
     square["deterministic_require_foreground"] = bool(crop_controls.get("require_foreground", False))
     square["deterministic_min_foreground_fraction"] = float(crop_controls.get("min_foreground_fraction", 0.05))
     square["deterministic_foreground_threshold"] = crop_controls.get("foreground_threshold", None)
-    square["positive_fraction"] = float(crop_options.get("positive_fraction", square.get("positive_fraction", 0.80)))
+    # Global fallback for older configs and non-GUI exports. GUI export writes split-specific
+    # *_positive_fraction values above, so the export panel is the source of truth.
+    square["positive_fraction"] = float(square.get("positive_fraction", 0.50))
     square["center_shift_fraction"] = float(crop_options.get("center_shift_fraction", square.get("center_shift_fraction", 0.25)))
     for key in [
         "bbox_safe_boundary_margin_fraction",
@@ -2491,8 +2571,13 @@ def _render_single_mode(
     result = _prepare_sample(dataset, int(selected_row["record_index"]), crop_controls, crop_index=None, need_contralateral=False)
     crops = result["crops"]
     if not crops:
-        st.write(f"Crops available after crop filter: **0**")
-        st.warning("This image has no crops under the current crop filter/positivity threshold.")
+        failed_count = len(result.get("failed_crops", []) or [])
+        st.write(f"Valid crops available after preview filter: **0**")
+        st.warning(
+            f"No valid crops passed the current filters. Showing the selected image with a failed crop preview instead "
+            f"({failed_count} rejected candidate crops tracked)."
+        )
+        _show_sample(result, pipeline, show_annotations=show_annotations, display_window=display_window, display_controls=display_controls)
         return
 
     crop_info_col, crop_idx_col = st.columns([2.0, 1.0], vertical_alignment="bottom")
@@ -2567,8 +2652,10 @@ def _render_comparison_mode(
             crop_label_col, crop_idx_col = st.columns([1.15, 0.85], vertical_alignment="bottom")
             crop_label_col.caption(f"{crop_count} crops")
             if crop_count == 0:
-                crop_idx_col.caption("No crop index")
-                results.append(None)
+                failed_count = len(tmp.get("failed_crops", []) or [])
+                crop_idx_col.caption("failed preview")
+                col.warning(f"0 valid crops, showing failed preview ({failed_count} rejected)")
+                results.append(tmp)
                 continue
             cidx = crop_idx_col.number_input(
                 "Crop idx",
@@ -2997,6 +3084,7 @@ def _prepare_sample(
     if crop_controls.get("mode") in {"random", "bbox_safe_random"}:
         rng = np.random.default_rng(int(crop_controls.get("random_seed", 123)) + int(record_index))
         windows = []
+        failed_windows: list[dict[str, Any]] = []
         random_options = dict(crop_controls["crop_options"])
         random_options["mode"] = str(crop_controls.get("mode", "random"))
         preview_count = int(crop_controls.get("random_preview_count", 20))
@@ -3019,6 +3107,12 @@ def _prepare_sample(
                         rng=rng,
                     )
                     if bool(random_options.get("bbox_safe_skip_unsafe_fallbacks", True)) and not bool(_info.get("accepted", True)):
+                        failed_windows.append({
+                            "window": w,
+                            "failed": True,
+                            "failure_reason": str(_info.get("bbox_safe_failure_reason", "bbox_safe_candidate_failed")),
+                            "sampler_info": dict(_info),
+                        })
                         continue
                     windows.append(w)
             else:
@@ -3032,6 +3126,12 @@ def _prepare_sample(
                         rng=rng,
                     )
                     if bool(random_options.get("bbox_safe_skip_unsafe_fallbacks", True)) and boxes_for_sampling.shape[0] > 0 and not bool(_info.get("accepted", True)):
+                        failed_windows.append({
+                            "window": w,
+                            "failed": True,
+                            "failure_reason": str(_info.get("bbox_safe_failure_reason", "bbox_safe_clean_candidate_failed")),
+                            "sampler_info": dict(_info),
+                        })
                         continue
                     windows.append(w)
         else:
@@ -3046,8 +3146,10 @@ def _prepare_sample(
                 windows.append(w)
     else:
         windows = sliding_square_windows(width, height, crop_controls["crop_size"], crop_controls["stride"])
+        failed_windows: list[dict[str, Any]] = []
 
     crops = []
+    failed_crops: list[dict[str, Any]] = list(failed_windows)
     for w in windows:
         max_vis = 0.0
         if mass_boxes.numel() > 0:
@@ -3055,6 +3157,13 @@ def _prepare_sample(
             max_vis = float(vis.max().item()) if vis.numel() > 0 else 0.0
         is_positive = max_vis >= float(crop_controls["positivity_threshold"])
         if crop_controls["only_mass_crops"] and not is_positive:
+            failed_crops.append({
+                "window": w,
+                "max_visibility": max_vis,
+                "positive_by_slider": is_positive,
+                "failed": True,
+                "failure_reason": "preview_filter_requires_visible_mass",
+            })
             continue
         foreground_fraction = None
         if bool(crop_controls.get("require_foreground", False)):
@@ -3066,6 +3175,14 @@ def _prepare_sample(
                 pad_value=float(crop_controls["crop_options"].get("pad_value", 0.0)),
             )
             if foreground_fraction < float(crop_controls.get("min_foreground_fraction", 0.05)):
+                failed_crops.append({
+                    "window": w,
+                    "max_visibility": max_vis,
+                    "positive_by_slider": is_positive,
+                    "foreground_fraction": foreground_fraction,
+                    "failed": True,
+                    "failure_reason": "foreground_fraction_below_threshold",
+                })
                 continue
         crops.append({
             "window": w,
@@ -3081,6 +3198,9 @@ def _prepare_sample(
     foreground_mask_crop = None
     if crops:
         selected = crops[int(crop_index or 0) % len(crops)]
+    elif failed_crops:
+        selected = failed_crops[int(crop_index or 0) % len(failed_crops)]
+    if selected is not None:
         image_tensor = torch.from_numpy(np.ascontiguousarray(image)).unsqueeze(0)
         crop_result = crop_image_and_boxes_to_window(
             image_tensor,
@@ -3138,7 +3258,9 @@ def _prepare_sample(
         **loaded,
         "title": title,
         "crops": crops,
+        "failed_crops": failed_crops,
         "selected_crop": selected,
+        "showing_failed_crop": bool(selected is not None and selected.get("failed", False)),
         "crop_image": crop_image,
         "crop_boxes": crop_boxes,
         "crop_mass_boxes": crop_mass_boxes,
@@ -3167,7 +3289,11 @@ def _show_sample(
     full = result["image"]
     crop = result["crop_image"]
     if crop is None:
-        st.warning("No crop selected.")
+        st.warning("No crop could be prepared for this image, even as a failed preview.")
+        full_boxes = result.get("mass_boxes") if show_annotations else None
+        full_gray = _to_uint8_percentile(full, display_window)
+        st.write(result.get("title", "Selected image"))
+        st.image(_draw_boxes(_gray_to_rgb(full_gray), full_boxes, color=(255, 80, 80)), caption="Fixed-preprocessed grayscale image, no crop available", use_container_width=True)
         return
     full_boxes = result["mass_boxes"] if show_annotations else None
     crop_boxes = result["crop_mass_boxes"] if show_annotations else None
@@ -3189,8 +3315,15 @@ def _show_sample(
     proc_draw = _draw_boxes(processed_rgb_display.copy(), crop_boxes, color=(255, 80, 80))
 
     st.write(result["title"])
+    if bool(result.get("showing_failed_crop", False)):
+        reason = str(selected.get("failure_reason", "current filters rejected this crop"))
+        st.warning(
+            "No valid crop passed the current preview/export-style filters for this image. "
+            f"Showing a failed crop instead. Reason: {reason}."
+        )
     if window is not None:
-        st.caption(f"Selected crop window xyxy={tuple(int(v) for v in window)} | max mass visibility={selected.get('max_visibility', 0.0):.3f}")
+        status = "FAILED" if bool(selected.get("failed", False)) else "valid"
+        st.caption(f"Selected crop window xyxy={tuple(int(v) for v in window)} | status={status} | max mass visibility={selected.get('max_visibility', 0.0):.3f}")
 
     cols = st.columns(3)
     cols[0].image(full_draw, caption="Fixed-preprocessed grayscale image with selected crop window", use_container_width=True)
@@ -3219,7 +3352,14 @@ def _show_sample(
     with st.expander("Metadata and statistics", expanded=not compact):
         stat_df = _stats_table(full, crop, processed_rgb)
         st.dataframe(stat_df, use_container_width=True)
-        st.json(_compact_metadata(result["target_summary"], processing_meta))
+        meta_payload = _compact_metadata(result["target_summary"], processing_meta)
+        if bool(result.get("showing_failed_crop", False)):
+            meta_payload["failed_crop_preview"] = {
+                "reason": str(selected.get("failure_reason", "unknown")),
+                "valid_crops_after_filter": int(len(result.get("crops", []) or [])),
+                "failed_candidates_tracked": int(len(result.get("failed_crops", []) or [])),
+            }
+        st.json(meta_payload)
         st.caption(
             "The old pixel-intensity distribution plot was removed. Use compare mode for "
             "numeric distribution distances and standardized statistic differences."

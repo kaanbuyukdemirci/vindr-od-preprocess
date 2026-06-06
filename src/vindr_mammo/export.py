@@ -728,13 +728,39 @@ def _deterministic_target_positive_ratio(crop_cfg: dict[str, Any], split_name: s
         crop_cfg,
         split_name,
         "deterministic_target_positive_ratio",
-        crop_cfg.get("deterministic_target_positive_ratio", crop_cfg.get("positive_fraction", 0.80)),
+        crop_cfg.get("deterministic_target_positive_ratio", crop_cfg.get("positive_fraction", 0.50)),
     )
     try:
         ratio = float(value)
     except Exception:
-        ratio = 0.80
+        ratio = 0.50
     return min(max(ratio, 0.01), 1.0)
+
+
+def _target_positive_fraction(crop_cfg: dict[str, Any], split_name: str, *, bbox_safe: bool = False) -> float:
+    """Target mass-positive crop ratio for random, bbox-safe, and legacy configs.
+
+    0.50 means approximately one empty crop for each mass-positive crop.
+    Split-specific values written by the GUI take precedence over global fallbacks.
+    """
+    keys = []
+    if bbox_safe:
+        keys.append(f"{split_name}_bbox_safe_positive_fraction")
+    keys.extend([
+        f"{split_name}_positive_fraction",
+        f"{split_name}_deterministic_target_positive_ratio",
+    ])
+    if bbox_safe:
+        keys.append("bbox_safe_positive_fraction")
+    keys.extend(["positive_fraction", "deterministic_target_positive_ratio"])
+    for key in keys:
+        if key in crop_cfg and crop_cfg.get(key) is not None:
+            try:
+                ratio = float(crop_cfg.get(key))
+                return min(max(ratio, 0.01), 1.0)
+            except Exception:
+                continue
+    return 0.50
 
 
 def _select_positive_ratio_candidates(
@@ -877,7 +903,7 @@ def _windows_for_export_split(
         boxes = mass_boxes.detach().cpu().to(torch.float32).reshape(-1, 4)
         windows: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
         crops_per_ann = int(crop_cfg.get("bbox_safe_crops_per_annotation", crop_cfg.get("random_crops_per_annotation", 5)))
-        positive_fraction = float(crop_cfg.get("bbox_safe_positive_fraction", crop_cfg.get("positive_fraction", 0.80)))
+        positive_fraction = _target_positive_fraction(crop_cfg, split_name, bbox_safe=True)
 
         safe_options = dict(crop_options)
         for key in [
@@ -907,7 +933,7 @@ def _windows_for_export_split(
                 )
                 if bool(crop_cfg.get("bbox_safe_skip_unsafe_fallbacks", True)) and not bool(info.get("accepted", True)):
                     continue
-                windows.append((window, {"crop_mode": "bbox_safe_random", "annotation_index": int(ann_index), **info}))
+                windows.append((window, {"crop_mode": "bbox_safe_random", "annotation_index": int(ann_index), "target_positive_fraction": float(positive_fraction), **info}))
 
         num_positive = len(windows)
         if num_positive > 0 and positive_fraction > 0:
@@ -934,14 +960,14 @@ def _windows_for_export_split(
             )
             if bool(crop_cfg.get("bbox_safe_skip_unsafe_fallbacks", True)) and boxes.shape[0] > 0 and not bool(info.get("accepted", True)):
                 continue
-            windows.append((window, {"crop_mode": "bbox_safe_random_clean", **info}))
+            windows.append((window, {"crop_mode": "bbox_safe_random_clean", "target_positive_fraction": float(positive_fraction), **info}))
         return windows
 
     # Random mode. Positive crops are centered around annotations.
     boxes = mass_boxes.detach().cpu().to(torch.float32).reshape(-1, 4)
     windows: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
     crops_per_ann = int(crop_cfg.get("random_crops_per_annotation", 5))
-    positive_fraction = float(crop_cfg.get("positive_fraction", 0.80))
+    positive_fraction = _target_positive_fraction(crop_cfg, split_name, bbox_safe=False)
 
     for ann_index, box in enumerate(boxes):
         for _ in range(max(0, crops_per_ann)):
@@ -953,7 +979,7 @@ def _windows_for_export_split(
                 options=crop_options,
                 rng=rng,
             )
-            windows.append((window, {"crop_mode": "random", "annotation_index": int(ann_index), **info}))
+            windows.append((window, {"crop_mode": "random", "annotation_index": int(ann_index), "target_positive_fraction": float(positive_fraction), **info}))
 
     num_positive = len(windows)
     if num_positive > 0 and positive_fraction > 0:
@@ -963,7 +989,7 @@ def _windows_for_export_split(
 
     if boxes.shape[0] == 0:
         # Important: if the user requests an overall train positive fraction such
-        # as 0.80, do not automatically add one negative crop from every normal
+        # as 0.50, do not automatically add one negative crop from every normal
         # image. Otherwise the global positive percentage can become much lower
         # than requested because VinDr-Mammo has many images without mass boxes.
         # Set balance_train_positive_fraction_globally=False to restore the old
@@ -983,7 +1009,7 @@ def _windows_for_export_split(
             options=clean_options,
             rng=rng,
         )
-        windows.append((window, {"crop_mode": "random_clean", **info}))
+        windows.append((window, {"crop_mode": "random_clean", "target_positive_fraction": float(positive_fraction), **info}))
     return windows
 
 

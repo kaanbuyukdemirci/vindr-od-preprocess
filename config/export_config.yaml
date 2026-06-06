@@ -7,7 +7,7 @@ paths:
   data_root: "/mnt/t9/vindr"
 
   # All exported images, labels, COCO JSON files, stats, and metadata are saved here.
-  output_root: "/mnt/t9/preprocessed-vindr-v2"
+  output_root: "/mnt/t9/preprocessed-vindr-v51"
 
 runtime:
   show_progress: true
@@ -109,20 +109,25 @@ square_crops:
   # training crop attempts centered near that mass, with random shifts.
   random_crops_per_annotation: 5
 
-  # If true, positive_fraction is interpreted as the approximate GLOBAL ratio
-  # of mass-positive training crops, not as a per-image rule. With this enabled,
-  # images with no mass do not automatically add one negative crop each, because
-  # that would drag the final positive percentage far below 80%.
+  # Export class-balance defaults. 0.50 means approximately 50% mass-positive crops
+  # and 50% empty/non-mass crops. The GUI export panel is now the single place to
+  # change this per split. These YAML fields are the command-line/default fallback.
   balance_train_positive_fraction_globally: true
   random_crops_per_negative_image_when_balancing: 0
-
-  # Used only when balance_train_positive_fraction_globally=false, or when an
-  # image has no mass and you explicitly want negative-only training crops.
   random_crops_per_negative_image: 1
-
-  # Approximate requested positive crop percentage for the training square-crop
-  # export. The exact achieved value is written to square_crops/stats/summary.csv.
-  positive_fraction: 0.80
+  positive_fraction: 0.50
+  train_positive_fraction: 0.50
+  val_positive_fraction: 0.50
+  test_positive_fraction: 0.50
+  train_bbox_safe_positive_fraction: 0.50
+  val_bbox_safe_positive_fraction: 0.50
+  test_bbox_safe_positive_fraction: 0.50
+  train_deterministic_selection_mode: "positive_ratio"
+  val_deterministic_selection_mode: "positive_ratio"
+  test_deterministic_selection_mode: "positive_ratio"
+  train_deterministic_target_positive_ratio: 0.50
+  val_deterministic_target_positive_ratio: 0.50
+  test_deterministic_target_positive_ratio: 0.50
   center_shift_fraction: 0.25
   max_random_tries: 80
 
@@ -167,7 +172,7 @@ dataset:
 visualizations:
   # Fast plots from the already exported CSV/JSON files. This does not read DICOMs
   # and does not regenerate crops. Run visualize_export.py from the VSCode Run button.
-  output_dir: "/mnt/t9/preprocessed-vindr-v2/visualizations"
+  output_dir: "/mnt/t9/preprocessed-vindr-v51/visualizations"
   include_square_crops: true
   include_baseline_uncropped: true
   write_html_report: true

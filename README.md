@@ -1335,7 +1335,29 @@ left/chest-wall and x-projection peak bias. The setting
 `bbox_safe_boundary_margin_fraction` controls the forbidden boundary zone.
 
 
-### v50 bbox-safe hard-boundary fix
+### v51 GUI clarity and failed-crop preview fix
+
+Changes added after v50:
+
+- The GUI no longer hides an image when all crop candidates are rejected by the current crop filter. It shows the selected image and a failed crop preview with a clear reason, such as `preview_filter_requires_visible_mass`, `foreground_fraction_below_threshold`, or a bbox-safe failure reason.
+- The sidebar crop mode and positive probability controls are now explicitly marked `PREVIEW ONLY`. They affect browsing/inspection, not the exported train/val/test crop generator.
+- The `Export dataset from GUI` panel is now the single place to set train/val/test crop modes and the mass-vs-empty export balance.
+- Default export balance is now 0.50, meaning approximately 50% mass-positive crops and 50% empty crops. The exact achieved ratio is still written to `summary.csv`.
+- Random, bbox-safe random, and deterministic crop modes now all read split-specific export target ratios from the GUI/YAML.
+
+Example for a 50/50 export:
+
+```yaml
+square_crops:
+  train_positive_fraction: 0.50
+  val_positive_fraction: 0.50
+  test_positive_fraction: 0.50
+  train_deterministic_selection_mode: positive_ratio
+  val_deterministic_selection_mode: positive_ratio
+  test_deterministic_selection_mode: positive_ratio
+```
+
+## v50 bbox-safe hard-boundary fix
 
 `bbox_safe_random` now treats the boundary rule as a hard export constraint. Set:
 
