@@ -95,6 +95,15 @@ square_crops:
   crop_size: 1024
   stride: 512
 
+  # Crop proposal mode per split. Options:
+  #   deterministic: normal sliding-window grid
+  #   random: stochastic mass-centered crops
+  #   bbox_safe_random: stochastic crops around annotations, rejecting crops where
+  #     visible boxes are near crop boundaries and preferring breast-rich windows
+  train_crop_mode: "random"
+  val_crop_mode: "deterministic"
+  test_crop_mode: "deterministic"
+
   # Training split uses random crops. Validation and test use deterministic sliding crops.
   # random_crops_per_annotation=5 means each mass annotation creates five positive
   # training crop attempts centered near that mass, with random shifts.
@@ -116,6 +125,19 @@ square_crops:
   positive_fraction: 0.80
   center_shift_fraction: 0.25
   max_random_tries: 80
+
+  # BBox-safe breast-biased random crop options. Used when any split has
+  # *_crop_mode: "bbox_safe_random". boundary_margin_fraction=0.15 means visible
+  # annotations must be fully inside the central 70% of the crop, not in the
+  # outer 15% boundary margin.
+  bbox_safe_boundary_margin_fraction: 0.15
+  bbox_safe_random_shift_fraction: 0.35
+  bbox_safe_candidate_count: 120
+  bbox_safe_top_k: 8
+  bbox_safe_breast_bias_strength: 1.0
+  bbox_safe_left_bias_strength: 0.25
+  bbox_safe_projection_bias_strength: 0.25
+  bbox_safe_foreground_threshold: null
   seed: 123
 
   # Validation/test deterministic crop options.

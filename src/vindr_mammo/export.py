@@ -32,6 +32,8 @@ except Exception:  # pragma: no cover
 
 from .crops import (
     crop_image_and_boxes_to_window,
+    sample_bbox_safe_breast_biased_square_window,
+    sample_breast_biased_clean_square_window,
     sample_box_centered_square_window,
     sample_random_square_window,
     sliding_square_windows,
@@ -423,9 +425,9 @@ def export_square_crop_datasets(
 
     The crop mode for each split is controlled by ``square_crops`` config keys:
 
-    * ``train_crop_mode``: ``"random"`` or ``"deterministic"``.
-    * ``val_crop_mode``: usually ``"deterministic"``.
-    * ``test_crop_mode``: usually ``"deterministic"``.
+    * ``train_crop_mode``: ``"random"``, ``"deterministic"``, or ``"bbox_safe_random"``.
+    * ``val_crop_mode``: usually ``"deterministic"``, but can also use ``"bbox_safe_random"``.
+    * ``test_crop_mode``: usually ``"deterministic"``, but can also use ``"bbox_safe_random"``.
 
     Earlier versions always used random, mass-centered training crops and
     deterministic validation/test crops. That can create a strong distribution
@@ -761,9 +763,9 @@ def _windows_for_export_split(
 ) -> list[tuple[tuple[int, int, int, int], dict[str, Any]]]:
     """Return crop windows for one image according to train/val/test policy."""
     split_mode = str(crop_cfg.get(f"{split_name}_crop_mode", "random" if split_name == "train" else "deterministic")).casefold().strip()
-    if split_mode not in {"random", "deterministic"}:
+    if split_mode not in {"random", "deterministic", "bbox_safe_random"}:
         raise ValueError(
-            f"square_crops.{split_name}_crop_mode must be 'random' or 'deterministic', got {split_mode!r}."
+            f"square_crops.{split_name}_crop_mode must be 'random', 'deterministic', or 'bbox_safe_random', got {split_mode!r}."
         )
 
     if split_mode == "deterministic":
@@ -843,6 +845,66 @@ def _windows_for_export_split(
             )
             for w in windows
         ]
+
+
+    if split_mode == "bbox_safe_random":
+        boxes = mass_boxes.detach().cpu().to(torch.float32).reshape(-1, 4)
+        windows: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
+        crops_per_ann = int(crop_cfg.get("bbox_safe_crops_per_annotation", crop_cfg.get("random_crops_per_annotation", 5)))
+        positive_fraction = float(crop_cfg.get("bbox_safe_positive_fraction", crop_cfg.get("positive_fraction", 0.80)))
+
+        safe_options = dict(crop_options)
+        for key in [
+            "bbox_safe_boundary_margin_fraction",
+            "bbox_safe_random_shift_fraction",
+            "bbox_safe_candidate_count",
+            "bbox_safe_top_k",
+            "bbox_safe_breast_bias_strength",
+            "bbox_safe_left_bias_strength",
+            "bbox_safe_projection_bias_strength",
+            "bbox_safe_foreground_threshold",
+        ]:
+            if key in crop_cfg:
+                safe_options[key] = crop_cfg.get(key)
+
+        for ann_index, box in enumerate(boxes):
+            for _ in range(max(0, crops_per_ann)):
+                window, info = sample_bbox_safe_breast_biased_square_window(
+                    image_width=image_width,
+                    image_height=image_height,
+                    image_tensor=image_tensor,
+                    box_xyxy=box,
+                    all_mass_boxes=boxes,
+                    options=safe_options,
+                    rng=rng,
+                )
+                windows.append((window, {"crop_mode": "bbox_safe_random", "annotation_index": int(ann_index), **info}))
+
+        num_positive = len(windows)
+        if num_positive > 0 and positive_fraction > 0:
+            num_negative = int(round(num_positive * max(0.0, 1.0 - positive_fraction) / positive_fraction))
+        else:
+            num_negative = int(crop_cfg.get("bbox_safe_random_crops_per_negative_image", crop_cfg.get("random_crops_per_negative_image", 1)))
+
+        if boxes.shape[0] == 0:
+            if bool(crop_cfg.get("balance_train_positive_fraction_globally", True)):
+                num_negative = int(crop_cfg.get("random_crops_per_negative_image_when_balancing", 0))
+            else:
+                num_negative = int(crop_cfg.get("bbox_safe_random_crops_per_negative_image", crop_cfg.get("random_crops_per_negative_image", 1)))
+
+        clean_options = dict(safe_options)
+        clean_options["positive_fraction"] = 0.0
+        for _ in range(max(0, num_negative)):
+            window, info = sample_breast_biased_clean_square_window(
+                image_width=image_width,
+                image_height=image_height,
+                image_tensor=image_tensor,
+                mass_boxes=boxes,
+                options=clean_options,
+                rng=rng,
+            )
+            windows.append((window, {"crop_mode": "bbox_safe_random_clean", **info}))
+        return windows
 
     # Random mode. Positive crops are centered around annotations.
     boxes = mass_boxes.detach().cpu().to(torch.float32).reshape(-1, 4)
@@ -1919,6 +1981,12 @@ def _sample_stats_row(
                 "foreground_filter_enabled": crop_info.get("foreground_filter_enabled", ""),
                 "foreground_fraction": crop_info.get("foreground_fraction", ""),
                 "min_foreground_fraction": crop_info.get("min_foreground_fraction", ""),
+                "bbox_safe_boundary_margin_fraction": crop_info.get("bbox_safe_boundary_margin_fraction", ""),
+                "bbox_safe_boundary_margin_px": crop_info.get("bbox_safe_boundary_margin_px", ""),
+                "bbox_safe_visible_boxes": crop_info.get("bbox_safe_visible_boxes", ""),
+                "bbox_safe_boxes_inside_margin": crop_info.get("bbox_safe_boxes_inside_margin", ""),
+                "bbox_safe_foreground_fraction": crop_info.get("bbox_safe_foreground_fraction", ""),
+                "bbox_safe_score": crop_info.get("bbox_safe_score", ""),
             }
         )
     return row
@@ -1983,6 +2051,9 @@ def _flatten_metadata_row(row: dict[str, Any]) -> dict[str, Any]:
         "foreground_filter_enabled": crop.get("foreground_filter_enabled", ""),
         "foreground_fraction": crop.get("foreground_fraction", ""),
         "min_foreground_fraction": crop.get("min_foreground_fraction", ""),
+        "bbox_safe_boundary_margin_fraction": crop.get("bbox_safe_boundary_margin_fraction", ""),
+        "bbox_safe_foreground_fraction": crop.get("bbox_safe_foreground_fraction", ""),
+        "bbox_safe_score": crop.get("bbox_safe_score", ""),
         "manufacturer": first_meta.get("Manufacturer", first_meta.get("manufacturer", dicom_meta.get("Manufacturer", ""))),
         "manufacturer_model_name": first_meta.get("ManufacturerModelName", first_meta.get("manufacturer_model_name", dicom_meta.get("ManufacturerModelName", ""))),
         "photometric_interpretation": dicom_meta.get("PhotometricInterpretation", ""),

@@ -31,6 +31,8 @@ except Exception as exc:  # pragma: no cover
 from .crops import (
     box_visibility_in_window,
     crop_image_and_boxes_to_window,
+    sample_bbox_safe_breast_biased_square_window,
+    sample_breast_biased_clean_square_window,
     sample_random_square_window,
     sliding_square_windows,
 )
@@ -1233,6 +1235,13 @@ def _render_loaded_crop_config_debug(crop_cfg: dict[str, Any], policy: dict[str,
             "random_crops_per_annotation": crop_cfg.get("random_crops_per_annotation"),
             "center_shift_fraction": crop_cfg.get("center_shift_fraction"),
             "seed": crop_cfg.get("seed"),
+            "bbox_safe_boundary_margin_fraction": crop_cfg.get("bbox_safe_boundary_margin_fraction"),
+            "bbox_safe_random_shift_fraction": crop_cfg.get("bbox_safe_random_shift_fraction"),
+            "bbox_safe_candidate_count": crop_cfg.get("bbox_safe_candidate_count"),
+            "bbox_safe_top_k": crop_cfg.get("bbox_safe_top_k"),
+            "bbox_safe_breast_bias_strength": crop_cfg.get("bbox_safe_breast_bias_strength"),
+            "bbox_safe_left_bias_strength": crop_cfg.get("bbox_safe_left_bias_strength"),
+            "bbox_safe_projection_bias_strength": crop_cfg.get("bbox_safe_projection_bias_strength"),
         },
         "crop_annotation_policy": copy.deepcopy(policy),
     }
@@ -1268,16 +1277,23 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         key=_widget_key("crop_stride"),
     )
 
-    default_crop_mode = "stochastic random" if str(crop_cfg.get("train_crop_mode", "deterministic")) == "random" else "deterministic sliding"
+    train_mode_for_default = str(crop_cfg.get("train_crop_mode", "deterministic")).strip().casefold()
+    if train_mode_for_default == "random":
+        default_crop_mode = "stochastic random"
+    elif train_mode_for_default == "bbox_safe_random":
+        default_crop_mode = "bbox-safe breast-biased random"
+    else:
+        default_crop_mode = "deterministic sliding"
+    crop_mode_options = ["deterministic sliding", "stochastic random", "bbox-safe breast-biased random"]
     crop_mode = st.sidebar.radio(
         "Crop proposal mode",
-        ["deterministic sliding", "stochastic random"],
-        index=["deterministic sliding", "stochastic random"].index(default_crop_mode),
+        crop_mode_options,
+        index=crop_mode_options.index(default_crop_mode),
         key=_widget_key("crop_proposal_mode"),
         help=(
             "Deterministic uses the normal sliding-window grid. Stochastic samples random "
-            "windows and can be biased toward masses. This is for GUI inspection only unless "
-            "you also use the corresponding export config options."
+            "windows and can be biased toward masses. Bbox-safe random also requires visible "
+            "annotations to be away from crop boundaries and chooses among breast-rich candidates."
         ),
     )
 
@@ -1319,7 +1335,7 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     random_positive_fraction = float(crop_cfg.get("positive_fraction", 0.80))
     random_seed = int(crop_cfg.get("seed", 123))
     center_shift_fraction = float(crop_cfg.get("center_shift_fraction", 0.25))
-    if crop_mode == "stochastic random":
+    if crop_mode in {"stochastic random", "bbox-safe breast-biased random"}:
         with st.sidebar.expander("Stochastic crop options", expanded=True):
             random_preview_count = st.number_input(
                 "Random crops to preview",
@@ -1347,6 +1363,81 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 key=_widget_key("crop_center_shift_fraction"),
             )
             random_seed = st.number_input("Random preview seed", min_value=0, max_value=999999, value=random_seed, step=1, key=_widget_key("crop_random_seed"))
+
+    bbox_safe_boundary_margin_fraction = float(crop_cfg.get("bbox_safe_boundary_margin_fraction", 0.15))
+    bbox_safe_random_shift_fraction = float(crop_cfg.get("bbox_safe_random_shift_fraction", crop_cfg.get("center_shift_fraction", 0.25)))
+    bbox_safe_candidate_count = int(crop_cfg.get("bbox_safe_candidate_count", 120))
+    bbox_safe_top_k = int(crop_cfg.get("bbox_safe_top_k", 8))
+    bbox_safe_breast_bias_strength = float(crop_cfg.get("bbox_safe_breast_bias_strength", 1.0))
+    bbox_safe_left_bias_strength = float(crop_cfg.get("bbox_safe_left_bias_strength", 0.25))
+    bbox_safe_projection_bias_strength = float(crop_cfg.get("bbox_safe_projection_bias_strength", 0.25))
+    if crop_mode == "bbox-safe breast-biased random":
+        with st.sidebar.expander("BBox-safe breast-biased crop options", expanded=True):
+            bbox_safe_boundary_margin_fraction = st.slider(
+                "Annotation boundary exclusion fraction",
+                min_value=0.0,
+                max_value=0.45,
+                value=float(bbox_safe_boundary_margin_fraction),
+                step=0.01,
+                key=_widget_key("crop_bbox_safe_boundary_margin_fraction"),
+                help=(
+                    "If this is 0.15, any visible annotation must be fully inside the central 70% "
+                    "of the crop. In other words, no visible box edge may fall in the outer 15% margin."
+                ),
+            )
+            bbox_safe_random_shift_fraction = st.slider(
+                "BBox-safe random shift fraction",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(bbox_safe_random_shift_fraction),
+                step=0.05,
+                key=_widget_key("crop_bbox_safe_random_shift_fraction"),
+                help="Random shift around the chosen annotation center, relative to crop size.",
+            )
+            bbox_safe_candidate_count = int(st.number_input(
+                "Candidate windows per crop",
+                min_value=10,
+                max_value=2000,
+                value=int(bbox_safe_candidate_count),
+                step=10,
+                key=_widget_key("crop_bbox_safe_candidate_count"),
+                help="More candidates increases the chance of satisfying boundary and breast-coverage constraints, but is slower.",
+            ))
+            bbox_safe_top_k = int(st.number_input(
+                "Randomly choose among top K candidates",
+                min_value=1,
+                max_value=100,
+                value=int(bbox_safe_top_k),
+                step=1,
+                key=_widget_key("crop_bbox_safe_top_k"),
+                help="Keeps randomness while preferring breast-rich candidates.",
+            ))
+            bbox_safe_breast_bias_strength = st.slider(
+                "Breast foreground bias strength",
+                min_value=0.0,
+                max_value=5.0,
+                value=float(bbox_safe_breast_bias_strength),
+                step=0.1,
+                key=_widget_key("crop_bbox_safe_breast_bias_strength"),
+            )
+            bbox_safe_left_bias_strength = st.slider(
+                "Left/chest-wall alignment bias strength",
+                min_value=0.0,
+                max_value=5.0,
+                value=float(bbox_safe_left_bias_strength),
+                step=0.1,
+                key=_widget_key("crop_bbox_safe_left_bias_strength"),
+                help="After right-to-left mirroring, this prefers windows closer to the left edge, which usually preserves more breast/chest-wall context.",
+            )
+            bbox_safe_projection_bias_strength = st.slider(
+                "X-projection peak bias strength",
+                min_value=0.0,
+                max_value=5.0,
+                value=float(bbox_safe_projection_bias_strength),
+                step=0.1,
+                key=_widget_key("crop_bbox_safe_projection_bias_strength"),
+                help="Prefers windows that include the peak of the breast foreground projection along the x-axis.",
+            )
 
     with st.sidebar.expander("Foreground-ratio crop filter", expanded=False):
         require_foreground = st.checkbox(
@@ -1392,7 +1483,7 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
 
     crop_options = {
         "enabled": True,
-        "mode": "random" if crop_mode == "stochastic random" else "deterministic",
+        "mode": "bbox_safe_random" if crop_mode == "bbox-safe breast-biased random" else ("random" if crop_mode == "stochastic random" else "deterministic"),
         "crop_size": int(crop_size),
         "stride": int(stride),
         "allow_partial_annotations": bool(allow_partial),
@@ -1404,11 +1495,18 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         "positive_fraction": float(random_positive_fraction),
         "center_shift_fraction": float(center_shift_fraction),
         "max_random_tries": int(crop_cfg.get("max_random_tries", 80)),
+        "bbox_safe_boundary_margin_fraction": float(bbox_safe_boundary_margin_fraction),
+        "bbox_safe_random_shift_fraction": float(bbox_safe_random_shift_fraction),
+        "bbox_safe_candidate_count": int(bbox_safe_candidate_count),
+        "bbox_safe_top_k": int(bbox_safe_top_k),
+        "bbox_safe_breast_bias_strength": float(bbox_safe_breast_bias_strength),
+        "bbox_safe_left_bias_strength": float(bbox_safe_left_bias_strength),
+        "bbox_safe_projection_bias_strength": float(bbox_safe_projection_bias_strength),
     }
     return {
         "crop_size": int(crop_size),
         "stride": int(stride),
-        "mode": "random" if crop_mode == "stochastic random" else "deterministic",
+        "mode": "bbox_safe_random" if crop_mode == "bbox-safe breast-biased random" else ("random" if crop_mode == "stochastic random" else "deterministic"),
         "random_preview_count": int(random_preview_count),
         "random_seed": int(random_seed),
         "only_mass_crops": bool(only_mass_crops),
@@ -1417,6 +1515,13 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         "min_foreground_fraction": float(min_foreground_fraction),
         "foreground_threshold": foreground_threshold,
         "foreground_mask_preview": bool(foreground_mask_preview),
+        "bbox_safe_boundary_margin_fraction": float(bbox_safe_boundary_margin_fraction),
+        "bbox_safe_random_shift_fraction": float(bbox_safe_random_shift_fraction),
+        "bbox_safe_candidate_count": int(bbox_safe_candidate_count),
+        "bbox_safe_top_k": int(bbox_safe_top_k),
+        "bbox_safe_breast_bias_strength": float(bbox_safe_breast_bias_strength),
+        "bbox_safe_left_bias_strength": float(bbox_safe_left_bias_strength),
+        "bbox_safe_projection_bias_strength": float(bbox_safe_projection_bias_strength),
         "crop_options": crop_options,
     }
 
@@ -1844,6 +1949,48 @@ def _apply_deterministic_selection_to_config(square: dict[str, Any], payload: di
         square[f"{split}_deterministic_include_empty"] = mode != "mass_only"
 
 
+
+
+def _crop_mode_label_from_config(crop_cfg: dict[str, Any], split: str) -> str:
+    mode = str(crop_cfg.get(f"{split}_crop_mode", "random" if split == "train" else "deterministic")).strip().casefold()
+    mapping = {
+        "deterministic": "deterministic sliding",
+        "random": "stochastic random",
+        "bbox_safe_random": "bbox-safe breast-biased random",
+    }
+    return mapping.get(mode, "deterministic sliding")
+
+
+def _split_crop_mode_controls(crop_cfg: dict[str, Any]) -> dict[str, str]:
+    """Controls for train/val/test crop proposal mode used during export."""
+    labels = [
+        "deterministic sliding",
+        "stochastic random",
+        "bbox-safe breast-biased random",
+    ]
+    label_to_mode = {
+        "deterministic sliding": "deterministic",
+        "stochastic random": "random",
+        "bbox-safe breast-biased random": "bbox_safe_random",
+    }
+    out: dict[str, str] = {}
+    cols = st.columns(3)
+    for split, col in zip(["train", "val", "test"], cols):
+        with col:
+            label = _crop_mode_label_from_config(crop_cfg, split)
+            selected = st.selectbox(
+                f"{split.title()} crop mode",
+                labels,
+                index=labels.index(label) if label in labels else 0,
+                key=_widget_key(f"gui_export_{split}_crop_mode"),
+                help=(
+                    "bbox-safe breast-biased random samples around annotations, rejects crops where visible "
+                    "annotations are near the crop boundary, and prefers windows with more breast foreground."
+                ),
+            )
+            out[split] = label_to_mode[selected]
+    return out
+
 def _export_dataset_from_gui_panel(
     *,
     cfg: dict[str, Any],
@@ -1937,26 +2084,36 @@ def _export_dataset_from_gui_panel(
             if not selected_vendors:
                 st.warning("Select at least one vendor, or switch to all vendors.")
 
+        crop_cfg = dict(cfg.get("square_crops", {}) or {})
+        st.markdown("**Split-specific crop proposal mode**")
+        st.caption(
+            "Choose the crop generator independently for train, val, and test. Deterministic selection controls below "
+            "only apply to splits whose crop mode is deterministic sliding."
+        )
+        split_crop_modes = _split_crop_mode_controls(crop_cfg)
+
+        with st.expander("BBox-safe breast-biased random export parameters", expanded=False):
+            st.caption(
+                "Used by any split set to bbox-safe breast-biased random. Visible annotations must be fully inside the "
+                "central safe region of the crop, and candidate windows are biased toward more breast foreground."
+            )
+            # These controls are read from the main Crop controls sidebar, then copied into the export config.
+            st.write({
+                "boundary_margin_fraction": crop_controls.get("bbox_safe_boundary_margin_fraction"),
+                "random_shift_fraction": crop_controls.get("bbox_safe_random_shift_fraction"),
+                "candidate_count": crop_controls.get("bbox_safe_candidate_count"),
+                "top_k": crop_controls.get("bbox_safe_top_k"),
+                "breast_bias_strength": crop_controls.get("bbox_safe_breast_bias_strength"),
+                "left_bias_strength": crop_controls.get("bbox_safe_left_bias_strength"),
+                "projection_bias_strength": crop_controls.get("bbox_safe_projection_bias_strength"),
+            })
+
         st.markdown("**Split-specific deterministic crop selection**")
         st.caption(
-            "For each split, deterministic sliding windows can be exported as all windows, mass windows only, "
+            "For deterministic splits, sliding windows can be exported as all windows, mass windows only, "
             "all mass windows plus sampled non-mass windows, or all windows from images that contain findings."
         )
-        crop_cfg = dict(cfg.get("square_crops", {}) or {})
         selection_payload = _deterministic_selection_controls(crop_cfg)
-
-        crop_export_modes = ["deterministic sliding for all splits", "train stochastic, val/test deterministic"]
-        if str(crop_cfg.get("train_crop_mode", "deterministic")) == "random" and str(crop_cfg.get("val_crop_mode", "deterministic")) == "deterministic" and str(crop_cfg.get("test_crop_mode", "deterministic")) == "deterministic":
-            default_export_mode = "train stochastic, val/test deterministic"
-        else:
-            default_export_mode = "deterministic sliding for all splits"
-        export_mode = st.radio(
-            "Crop export mode",
-            crop_export_modes,
-            index=crop_export_modes.index(default_export_mode),
-            key=_widget_key("gui_export_crop_mode"),
-            help="The split-specific deterministic selection controls above apply when a split is deterministic.",
-        )
         confirm = st.checkbox("I checked the output path and want to start export", value=False, key=_widget_key("gui_export_confirm"))
 
         with st.expander("Effective loaded/export settings preview", expanded=False):
@@ -1969,7 +2126,7 @@ def _export_dataset_from_gui_panel(
                     clean_output=clean_output,
                     selected_vendors=selected_vendors if vendor_mode == "selected vendors only" else [],
                     deterministic_selection=selection_payload,
-                    export_mode=export_mode,
+                    split_crop_modes=split_crop_modes,
                     save_square=save_square,
                     save_baseline=save_baseline,
                     crop_controls=crop_controls,
@@ -1993,7 +2150,7 @@ def _export_dataset_from_gui_panel(
                     clean_output=clean_output,
                     selected_vendors=selected_vendors if vendor_mode == "selected vendors only" else [],
                     deterministic_selection=selection_payload,
-                    export_mode=export_mode,
+                    split_crop_modes=split_crop_modes,
                     save_square=save_square,
                     save_baseline=save_baseline,
                     crop_controls=crop_controls,
@@ -2028,7 +2185,7 @@ def _build_gui_export_config(
     clean_output: bool,
     selected_vendors: list[str],
     deterministic_selection: dict[str, dict[str, Any]],
-    export_mode: str,
+    split_crop_modes: dict[str, str],
     save_square: bool,
     save_baseline: bool,
     crop_controls: dict[str, Any],
@@ -2050,14 +2207,11 @@ def _build_gui_export_config(
     square = out.setdefault("square_crops", {})
     square["crop_size"] = int(crop_controls.get("crop_size", square.get("crop_size", 1024)))
     square["stride"] = int(crop_controls.get("stride", square.get("stride", 512)))
-    if export_mode == "train stochastic, val/test deterministic":
-        square["train_crop_mode"] = "random"
-        square["val_crop_mode"] = "deterministic"
-        square["test_crop_mode"] = "deterministic"
-    else:
-        square["train_crop_mode"] = "deterministic"
-        square["val_crop_mode"] = "deterministic"
-        square["test_crop_mode"] = "deterministic"
+    for split in ["train", "val", "test"]:
+        mode = str(split_crop_modes.get(split, square.get(f"{split}_crop_mode", "deterministic"))).strip().casefold()
+        if mode not in {"deterministic", "random", "bbox_safe_random"}:
+            mode = "deterministic"
+        square[f"{split}_crop_mode"] = mode
     _apply_deterministic_selection_to_config(square, deterministic_selection)
     square["deterministic_include_empty"] = bool(square.get("deterministic_include_empty", True))
     square["deterministic_require_foreground"] = bool(crop_controls.get("require_foreground", False))
@@ -2065,6 +2219,17 @@ def _build_gui_export_config(
     square["deterministic_foreground_threshold"] = crop_controls.get("foreground_threshold", None)
     square["positive_fraction"] = float(crop_options.get("positive_fraction", square.get("positive_fraction", 0.80)))
     square["center_shift_fraction"] = float(crop_options.get("center_shift_fraction", square.get("center_shift_fraction", 0.25)))
+    for key in [
+        "bbox_safe_boundary_margin_fraction",
+        "bbox_safe_random_shift_fraction",
+        "bbox_safe_candidate_count",
+        "bbox_safe_top_k",
+        "bbox_safe_breast_bias_strength",
+        "bbox_safe_left_bias_strength",
+        "bbox_safe_projection_bias_strength",
+    ]:
+        if key in crop_options:
+            square[key] = crop_options[key]
 
     out["crop_annotation_policy"] = {
         "allow_partial_annotations": bool(crop_options.get("allow_partial_annotations", False)),
@@ -2829,20 +2994,49 @@ def _prepare_sample(
     boxes = torch.as_tensor(loaded["all_boxes"], dtype=torch.float32)
     mass_boxes = torch.as_tensor(loaded["mass_boxes"], dtype=torch.float32)
     height, width = image.shape
-    if crop_controls.get("mode") == "random":
+    if crop_controls.get("mode") in {"random", "bbox_safe_random"}:
         rng = np.random.default_rng(int(crop_controls.get("random_seed", 123)) + int(record_index))
         windows = []
         random_options = dict(crop_controls["crop_options"])
-        random_options["mode"] = "random"
-        for _ in range(int(crop_controls.get("random_preview_count", 20))):
-            w, _info = sample_random_square_window(
-                image_width=width,
-                image_height=height,
-                mass_boxes=mass_boxes,
-                options=random_options,
-                rng=rng,
-            )
-            windows.append(w)
+        random_options["mode"] = str(crop_controls.get("mode", "random"))
+        preview_count = int(crop_controls.get("random_preview_count", 20))
+        if crop_controls.get("mode") == "bbox_safe_random":
+            image_tensor = torch.as_tensor(image, dtype=torch.float32).reshape(1, height, width)
+            boxes_for_sampling = mass_boxes.detach().cpu().reshape(-1, 4)
+            if boxes_for_sampling.shape[0] > 0:
+                for i in range(preview_count):
+                    box = boxes_for_sampling[int(i % boxes_for_sampling.shape[0])]
+                    w, _info = sample_bbox_safe_breast_biased_square_window(
+                        image_width=width,
+                        image_height=height,
+                        image_tensor=image_tensor,
+                        box_xyxy=box,
+                        all_mass_boxes=boxes_for_sampling,
+                        options=random_options,
+                        rng=rng,
+                    )
+                    windows.append(w)
+            else:
+                for _ in range(preview_count):
+                    w, _info = sample_breast_biased_clean_square_window(
+                        image_width=width,
+                        image_height=height,
+                        image_tensor=image_tensor,
+                        mass_boxes=boxes_for_sampling,
+                        options=random_options,
+                        rng=rng,
+                    )
+                    windows.append(w)
+        else:
+            for _ in range(preview_count):
+                w, _info = sample_random_square_window(
+                    image_width=width,
+                    image_height=height,
+                    mass_boxes=mass_boxes,
+                    options=random_options,
+                    rng=rng,
+                )
+                windows.append(w)
     else:
         windows = sliding_square_windows(width, height, crop_controls["crop_size"], crop_controls["stride"])
 

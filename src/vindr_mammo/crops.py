@@ -24,6 +24,18 @@ DEFAULT_CROP_OPTIONS: dict[str, Any] = {
     "pad_if_needed": True,             # pad small crops/images to n x n
     "pad_value": 0.0,
     "max_random_tries": 80,
+    # BBox-safe, breast-biased random crop mode. The annotation boxes that are
+    # visible in the crop must be fully inside the crop-safe inner region, not
+    # near the crop boundary. A candidate pool is sampled randomly and then
+    # biased toward windows containing more breast foreground.
+    "bbox_safe_boundary_margin_fraction": 0.15,
+    "bbox_safe_random_shift_fraction": 0.35,
+    "bbox_safe_candidate_count": 120,
+    "bbox_safe_top_k": 8,
+    "bbox_safe_breast_bias_strength": 1.0,
+    "bbox_safe_left_bias_strength": 0.25,
+    "bbox_safe_projection_bias_strength": 0.25,
+    "bbox_safe_foreground_threshold": None,
     "deterministic_include_empty": True,
     "deterministic_max_windows_per_image": None,
     "seed": None,
@@ -45,8 +57,8 @@ def make_crop_options(options: dict[str, Any] | None) -> dict[str, Any]:
     if options:
         out.update(options)
     out["mode"] = str(out.get("mode", "random")).casefold().strip()
-    if out["mode"] not in {"random", "deterministic"}:
-        raise ValueError("crop_options['mode'] must be 'random' or 'deterministic'.")
+    if out["mode"] not in {"random", "deterministic", "bbox_safe_random"}:
+        raise ValueError("crop_options['mode'] must be 'random', 'deterministic', or 'bbox_safe_random'.")
     out["crop_size"] = int(out["crop_size"])
     out["stride"] = int(out["stride"])
     if out["crop_size"] <= 0:
@@ -340,6 +352,275 @@ def _random_positive_window(
     y0 = min(max(0, y0), max(0, int(image_height) - n))
     return (x0, y0, x0 + n, y0 + n)
 
+
+
+
+def sample_bbox_safe_breast_biased_square_window(
+    *,
+    image_width: int,
+    image_height: int,
+    image_tensor: torch.Tensor,
+    box_xyxy: torch.Tensor | list[float] | tuple[float, float, float, float],
+    all_mass_boxes: torch.Tensor,
+    options: dict[str, Any],
+    rng: np.random.Generator,
+) -> tuple[tuple[int, int, int, int], dict[str, Any]]:
+    """Sample a random crop where visible boxes are away from crop boundaries.
+
+    This is a bbox-aware strategy for object-detection export. It samples a
+    random candidate pool around a selected annotation, rejects candidates where
+    any visible annotation is clipped or lands inside the boundary margin, and
+    then randomly chooses among the best breast-foreground candidates. The result
+    is random, but constrained so masses are not placed near the crop edge.
+    """
+    opts = make_crop_options(options)
+    n = int(opts["crop_size"])
+    boxes = _as_boxes(all_mass_boxes)
+    box = torch.as_tensor(box_xyxy, dtype=torch.float32).reshape(4)
+    max_tries = int(opts.get("max_random_tries", 80))
+    candidate_count = max(1, int(opts.get("bbox_safe_candidate_count", max_tries)))
+    candidate_count = max(candidate_count, max_tries)
+    top_k = max(1, int(opts.get("bbox_safe_top_k", 8)))
+    margin_fraction = float(opts.get("bbox_safe_boundary_margin_fraction", 0.15))
+    margin_px = max(0.0, min(0.49, margin_fraction)) * float(n)
+    shift = float(opts.get("bbox_safe_random_shift_fraction", opts.get("center_shift_fraction", 0.25))) * float(n)
+
+    image_np = _image_tensor_to_2d_numpy(image_tensor)
+    foreground_mask = _foreground_mask_for_crop_sampling(image_np, opts.get("bbox_safe_foreground_threshold", None))
+    projection = foreground_mask.sum(axis=0).astype(np.float32) if foreground_mask.size else np.zeros((max(1, int(image_width)),), dtype=np.float32)
+    peak_x = int(np.argmax(projection)) if projection.size and float(projection.max()) > 0 else int(image_width) // 2
+
+    cx0 = float((box[0] + box[2]) / 2.0)
+    cy0 = float((box[1] + box[3]) / 2.0)
+    max_x = max(0, int(image_width) - n)
+    max_y = max(0, int(image_height) - n)
+    candidates: list[tuple[float, tuple[int, int, int, int], dict[str, Any]]] = []
+    last_window = None
+
+    for _ in range(candidate_count):
+        cx = cx0 + float(rng.uniform(-shift, shift))
+        cy = cy0 + float(rng.uniform(-shift, shift))
+        x0 = int(round(cx - n / 2.0))
+        y0 = int(round(cy - n / 2.0))
+        x0 = min(max(0, x0), max_x)
+        y0 = min(max(0, y0), max_y)
+        window = (x0, y0, x0 + n, y0 + n)
+        last_window = window
+        ok, safety_info = _window_satisfies_bbox_safe_margin(window, boxes, box, margin_px)
+        if not ok:
+            continue
+        fg = _foreground_fraction_from_mask(foreground_mask, window, n)
+        left_score = 1.0 - (float(x0) / float(max_x)) if max_x > 0 else 1.0
+        projection_score = _projection_peak_score(peak_x, window, n)
+        score = (
+            float(opts.get("bbox_safe_breast_bias_strength", 1.0)) * fg
+            + float(opts.get("bbox_safe_left_bias_strength", 0.25)) * left_score
+            + float(opts.get("bbox_safe_projection_bias_strength", 0.25)) * projection_score
+        )
+        info = {
+            "requested_positive": True,
+            "accepted": True,
+            "centered_on_annotation": True,
+            "bbox_safe_boundary_margin_fraction": float(margin_fraction),
+            "bbox_safe_boundary_margin_px": float(margin_px),
+            "bbox_safe_foreground_fraction": float(fg),
+            "bbox_safe_left_score": float(left_score),
+            "bbox_safe_projection_score": float(projection_score),
+            "bbox_safe_score": float(score),
+            **safety_info,
+        }
+        candidates.append((score, window, info))
+
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        top = candidates[: min(top_k, len(candidates))]
+        # Randomly choose among the best candidates so this remains stochastic,
+        # while still preferring high-breast-foreground crops.
+        idx = int(rng.integers(0, len(top)))
+        return top[idx][1], top[idx][2]
+
+    # Fallback: choose the best valid window on a coarse deterministic grid. This
+    # keeps the export robust if random sampling misses a narrow feasible region.
+    grid_candidates: list[tuple[float, tuple[int, int, int, int], dict[str, Any]]] = []
+    for x0 in _coarse_positions(max_x, max(8, n // 4)):
+        for y0 in _coarse_positions(max_y, max(8, n // 4)):
+            window = (int(x0), int(y0), int(x0 + n), int(y0 + n))
+            ok, safety_info = _window_satisfies_bbox_safe_margin(window, boxes, box, margin_px)
+            if not ok:
+                continue
+            fg = _foreground_fraction_from_mask(foreground_mask, window, n)
+            left_score = 1.0 - (float(x0) / float(max_x)) if max_x > 0 else 1.0
+            projection_score = _projection_peak_score(peak_x, window, n)
+            score = fg + 0.25 * left_score + 0.25 * projection_score
+            grid_candidates.append((score, window, {"requested_positive": True, "accepted": True, "bbox_safe_grid_fallback": True, "bbox_safe_foreground_fraction": float(fg), **safety_info}))
+    if grid_candidates:
+        grid_candidates.sort(key=lambda item: item[0], reverse=True)
+        return grid_candidates[0][1], grid_candidates[0][2]
+
+    # Last-resort fallback: ordinary centered crop. This is marked as not fully
+    # accepted so the user can audit it in samples.csv/metadata.
+    if last_window is None:
+        last_window = _random_positive_window(
+            image_width=image_width,
+            image_height=image_height,
+            crop_size=n,
+            mass_boxes=box.reshape(1, 4),
+            center_on_mass=True,
+            center_shift_fraction=0.0,
+            rng=rng,
+        )
+    return last_window, {
+        "requested_positive": True,
+        "accepted": False,
+        "centered_on_annotation": True,
+        "bbox_safe_failed": True,
+        "fallback_after_tries": int(candidate_count),
+        "bbox_safe_boundary_margin_fraction": float(margin_fraction),
+        "bbox_safe_boundary_margin_px": float(margin_px),
+    }
+
+
+def sample_breast_biased_clean_square_window(
+    *,
+    image_width: int,
+    image_height: int,
+    image_tensor: torch.Tensor,
+    mass_boxes: torch.Tensor,
+    options: dict[str, Any],
+    rng: np.random.Generator,
+) -> tuple[tuple[int, int, int, int], dict[str, Any]]:
+    """Sample a clean negative crop biased toward breast foreground."""
+    opts = make_crop_options(options)
+    n = int(opts["crop_size"])
+    boxes = _as_boxes(mass_boxes)
+    max_tries = max(1, int(opts.get("max_random_tries", 80)))
+    candidate_count = max(max_tries, int(opts.get("bbox_safe_candidate_count", max_tries)))
+    image_np = _image_tensor_to_2d_numpy(image_tensor)
+    foreground_mask = _foreground_mask_for_crop_sampling(image_np, opts.get("bbox_safe_foreground_threshold", None))
+    projection = foreground_mask.sum(axis=0).astype(np.float32) if foreground_mask.size else np.zeros((max(1, int(image_width)),), dtype=np.float32)
+    peak_x = int(np.argmax(projection)) if projection.size and float(projection.max()) > 0 else int(image_width) // 2
+    max_x = max(0, int(image_width) - n)
+    best: tuple[float, tuple[int, int, int, int], dict[str, Any]] | None = None
+    for _ in range(candidate_count):
+        window = _random_any_window(image_width, image_height, n, rng)
+        if not window_is_clean(window, boxes, opts):
+            continue
+        x0 = window[0]
+        fg = _foreground_fraction_from_mask(foreground_mask, window, n)
+        left_score = 1.0 - (float(x0) / float(max_x)) if max_x > 0 else 1.0
+        projection_score = _projection_peak_score(peak_x, window, n)
+        score = fg + 0.25 * left_score + 0.25 * projection_score
+        info = {
+            "requested_positive": False,
+            "accepted": True,
+            "bbox_safe_foreground_fraction": float(fg),
+            "bbox_safe_left_score": float(left_score),
+            "bbox_safe_projection_score": float(projection_score),
+            "bbox_safe_score": float(score),
+        }
+        if best is None or score > best[0]:
+            best = (score, window, info)
+    if best is not None:
+        return best[1], best[2]
+    window = _random_any_window(image_width, image_height, n, rng)
+    return window, {"requested_positive": False, "accepted": False, "bbox_safe_clean_fallback": True, "fallback_after_tries": int(candidate_count)}
+
+
+def _window_satisfies_bbox_safe_margin(
+    window_xyxy: tuple[int, int, int, int],
+    boxes: torch.Tensor,
+    target_box: torch.Tensor,
+    margin_px: float,
+) -> tuple[bool, dict[str, Any]]:
+    """Return whether every visible annotation is safely inside the crop."""
+    boxes = _as_boxes(boxes)
+    if boxes.numel() == 0:
+        return False, {"bbox_safe_visible_boxes": 0, "bbox_safe_boxes_inside_margin": 0}
+    x0, y0, x1, y1 = [float(v) for v in window_xyxy]
+    vis = box_visibility_in_window(boxes, window_xyxy)
+    visible = vis > 0.0
+    if not bool(visible.any().item()):
+        return False, {"bbox_safe_visible_boxes": 0, "bbox_safe_boxes_inside_margin": 0}
+
+    # The target box must be visible and safe. This prevents a crop from being
+    # accepted only because a different mass happens to be safely inside.
+    target = target_box.detach().cpu().to(dtype=torch.float32).reshape(1, 4)
+    target_vis = box_visibility_in_window(target, window_xyxy)
+    if target_vis.numel() == 0 or float(target_vis.max().item()) <= 0.0:
+        return False, {"bbox_safe_visible_boxes": int(visible.sum().item()), "bbox_safe_target_visible": 0}
+
+    visible_boxes = boxes[visible]
+    sx0 = visible_boxes[:, 0] - x0
+    sy0 = visible_boxes[:, 1] - y0
+    sx1 = visible_boxes[:, 2] - x0
+    sy1 = visible_boxes[:, 3] - y0
+    crop_w = x1 - x0
+    crop_h = y1 - y0
+    full_inside = (visible_boxes[:, 0] >= x0) & (visible_boxes[:, 1] >= y0) & (visible_boxes[:, 2] <= x1) & (visible_boxes[:, 3] <= y1)
+    inside_margin = (sx0 >= margin_px) & (sy0 >= margin_px) & (sx1 <= crop_w - margin_px) & (sy1 <= crop_h - margin_px)
+    safe = full_inside & inside_margin
+    ok = bool(safe.all().item())
+    return ok, {
+        "bbox_safe_visible_boxes": int(visible.sum().item()),
+        "bbox_safe_boxes_inside_margin": int(safe.sum().item()),
+        "bbox_safe_margin_ok": int(ok),
+        "bbox_safe_min_visibility_visible_boxes": float(vis[visible].min().item()) if bool(visible.any().item()) else 0.0,
+    }
+
+
+def _image_tensor_to_2d_numpy(image_tensor: torch.Tensor) -> np.ndarray:
+    arr = image_tensor.detach().cpu().squeeze().numpy().astype(np.float32, copy=False)
+    if arr.ndim != 2:
+        arr = np.asarray(arr).reshape(arr.shape[-2], arr.shape[-1]).astype(np.float32, copy=False)
+    return arr
+
+
+def _foreground_mask_for_crop_sampling(image_np: np.ndarray, threshold: Any) -> np.ndarray:
+    arr = np.asarray(image_np, dtype=np.float32)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return np.zeros(arr.shape, dtype=bool)
+    if threshold is None:
+        positive = finite[finite > 0]
+        if positive.size > 0:
+            thr = max(float(np.percentile(positive, 1.0)) * 0.25, 1e-8)
+        else:
+            thr = float(np.percentile(finite, 5.0))
+    else:
+        thr = float(threshold)
+    return np.isfinite(arr) & (arr > thr)
+
+
+def _foreground_fraction_from_mask(mask: np.ndarray, window_xyxy: tuple[int, int, int, int], crop_size: int) -> float:
+    x0, y0, x1, y1 = [int(v) for v in window_xyxy]
+    h, w = mask.shape[:2]
+    src_x0 = max(0, x0)
+    src_y0 = max(0, y0)
+    src_x1 = min(w, x1)
+    src_y1 = min(h, y1)
+    if src_x1 <= src_x0 or src_y1 <= src_y0:
+        return 0.0
+    count = float(mask[src_y0:src_y1, src_x0:src_x1].sum())
+    return count / float(max(1, int(crop_size) * int(crop_size)))
+
+
+def _projection_peak_score(peak_x: int, window_xyxy: tuple[int, int, int, int], crop_size: int) -> float:
+    x0, _y0, x1, _y1 = [int(v) for v in window_xyxy]
+    if x0 <= int(peak_x) <= x1:
+        return 1.0
+    center = 0.5 * (float(x0) + float(x1))
+    distance = abs(float(peak_x) - center)
+    return max(0.0, 1.0 - distance / float(max(1, crop_size)))
+
+
+def _coarse_positions(max_start: int, step: int) -> list[int]:
+    max_start = int(max_start)
+    if max_start <= 0:
+        return [0]
+    vals = list(range(0, max_start + 1, max(1, int(step))))
+    if vals[-1] != max_start:
+        vals.append(max_start)
+    return vals
 
 def _window_cuts_any_box(window_xyxy: tuple[int, int, int, int], boxes: torch.Tensor) -> bool:
     boxes = _as_boxes(boxes)

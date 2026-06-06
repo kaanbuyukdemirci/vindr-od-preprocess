@@ -1316,3 +1316,20 @@ The GUI export progress panel now estimates remaining time from the current acti
 Manifest/config loading now treats the loaded `config_snapshot` as the source of truth for export-related settings. The GUI includes refresh buttons in the loaded-manifest panel, crop settings panel, and export panel to rebuild Streamlit widgets from the loaded config. This is useful when Streamlit session state has stale widget values after loading or reloading a manifest.
 
 A new `Loaded crop settings check` sidebar expander shows the crop-size, stride, split crop modes, deterministic selection modes, target positive ratios, foreground filtering options, random-crop options, and crop annotation policy currently active from the loaded config.
+
+### New crop mode: bbox-safe breast-biased random crops
+
+A new crop proposal mode is available for train, validation, and test:
+
+```yaml
+square_crops:
+  train_crop_mode: bbox_safe_random
+  val_crop_mode: bbox_safe_random
+  test_crop_mode: bbox_safe_random
+```
+
+This mode samples random crops around annotations, but rejects crops where any
+visible mass annotation is clipped or lands too close to the crop boundary. It
+then prefers candidates that contain more breast foreground, with optional
+left/chest-wall and x-projection peak bias. The setting
+`bbox_safe_boundary_margin_fraction` controls the forbidden boundary zone.

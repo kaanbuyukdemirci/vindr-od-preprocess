@@ -383,3 +383,37 @@ loaded manifest/config. In strict replay, export uses the loaded config snapshot
 directly and only applies the output path and clean-output checkbox from the
 export panel. This avoids stale Streamlit widget state changing the RGB pipeline
 or crop settings after loading.
+
+## BBox-safe breast-biased random crop mode
+
+The GUI/exporter now includes a third crop proposal mode: `bbox_safe_random`.
+This mode is intended for mammography crops where the mass should not be close
+to the crop border.
+
+For each selected annotation, the exporter samples a random candidate pool around
+that annotation, rejects any candidate where a visible annotation is clipped or
+falls inside the configured boundary margin, scores the remaining candidates by
+breast foreground coverage, left/chest-wall alignment, and x-projection peak
+coverage, then randomly chooses among the top-scoring candidates. This preserves
+randomness while enforcing the boundary rule.
+
+Key YAML options:
+
+```yaml
+square_crops:
+  train_crop_mode: bbox_safe_random
+  val_crop_mode: bbox_safe_random
+  test_crop_mode: bbox_safe_random
+
+  bbox_safe_boundary_margin_fraction: 0.15
+  bbox_safe_random_shift_fraction: 0.35
+  bbox_safe_candidate_count: 120
+  bbox_safe_top_k: 8
+  bbox_safe_breast_bias_strength: 1.0
+  bbox_safe_left_bias_strength: 0.25
+  bbox_safe_projection_bias_strength: 0.25
+```
+
+If `bbox_safe_boundary_margin_fraction` is `0.15`, then every visible annotation
+must be fully inside the central 70 percent of the crop. The outer 15 percent on
+each side is treated as a forbidden boundary zone for annotations.
