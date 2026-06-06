@@ -1333,3 +1333,15 @@ visible mass annotation is clipped or lands too close to the crop boundary. It
 then prefers candidates that contain more breast foreground, with optional
 left/chest-wall and x-projection peak bias. The setting
 `bbox_safe_boundary_margin_fraction` controls the forbidden boundary zone.
+
+
+### v50 bbox-safe hard-boundary fix
+
+`bbox_safe_random` now treats the boundary rule as a hard export constraint. Set:
+
+```yaml
+square_crops:
+  bbox_safe_skip_unsafe_fallbacks: true
+```
+
+With this enabled, if no crop can keep the visible annotations fully inside the safe inner region, the exporter skips that crop instead of writing a fallback. The exporter also performs a final validation on the actual crop-coordinate boxes before saving labels. This prevents annotations from touching or entering the forbidden boundary band.

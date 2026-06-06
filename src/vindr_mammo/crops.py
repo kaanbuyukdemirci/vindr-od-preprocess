@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+import math
 
 import numpy as np
 import torch
@@ -36,6 +37,9 @@ DEFAULT_CROP_OPTIONS: dict[str, Any] = {
     "bbox_safe_left_bias_strength": 0.25,
     "bbox_safe_projection_bias_strength": 0.25,
     "bbox_safe_foreground_threshold": None,
+    # If True, bbox_safe_random may report an unsafe fallback, but exporters and
+    # previews should skip it instead of writing a crop that violates the margin.
+    "bbox_safe_skip_unsafe_fallbacks": True,
     "deterministic_include_empty": True,
     "deterministic_max_windows_per_image": None,
     "seed": None,
@@ -323,6 +327,74 @@ def _random_any_window(width: int, height: int, crop_size: int, rng: np.random.G
     y0 = int(rng.integers(0, max_y + 1)) if max_y > 0 else 0
     return (x0, y0, x0 + n, y0 + n)
 
+def _safe_origin_interval_for_box(
+    box: torch.Tensor,
+    crop_size: int,
+    margin_px: float,
+    max_origin: int,
+    *,
+    axis: int,
+) -> tuple[int, int] | None:
+    """Return crop-origin interval that keeps a box inside the safe inner area."""
+    n = float(crop_size)
+    b0 = float(box[0 if axis == 0 else 1])
+    b1 = float(box[2 if axis == 0 else 3])
+    lo = int(math.ceil(b1 - (n - float(margin_px))))
+    hi = int(math.floor(b0 - float(margin_px)))
+    lo = max(0, lo)
+    hi = min(int(max_origin), hi)
+    if lo > hi:
+        return None
+    return lo, hi
+
+
+def _coarse_positions_between(min_start: int, max_start: int, step: int) -> list[int]:
+    min_start = int(min_start)
+    max_start = int(max_start)
+    if max_start <= min_start:
+        return [min_start]
+    vals = list(range(min_start, max_start + 1, max(1, int(step))))
+    if vals[-1] != max_start:
+        vals.append(max_start)
+    return vals
+
+
+def _bbox_safe_failed_window(
+    *,
+    image_width: int,
+    image_height: int,
+    crop_size: int,
+    box: torch.Tensor,
+    rng: np.random.Generator,
+    candidate_count: int,
+    margin_fraction: float,
+    margin_px: float,
+    reason: str,
+    last_window: tuple[int, int, int, int] | None = None,
+) -> tuple[tuple[int, int, int, int], dict[str, Any]]:
+    """Return an unsafe fallback window, explicitly marked so callers can skip it."""
+    if last_window is None:
+        last_window = _random_positive_window(
+            image_width=image_width,
+            image_height=image_height,
+            crop_size=crop_size,
+            mass_boxes=box.reshape(1, 4),
+            center_on_mass=True,
+            center_shift_fraction=0.0,
+            rng=rng,
+        )
+    return last_window, {
+        "requested_positive": True,
+        "accepted": False,
+        "centered_on_annotation": True,
+        "bbox_safe_failed": True,
+        "bbox_safe_failure_reason": str(reason),
+        "fallback_after_tries": int(candidate_count),
+        "bbox_safe_boundary_margin_fraction": float(margin_fraction),
+        "bbox_safe_boundary_margin_px": float(margin_px),
+    }
+
+
 
 def _random_positive_window(
     *,
@@ -397,13 +469,38 @@ def sample_bbox_safe_breast_biased_square_window(
     candidates: list[tuple[float, tuple[int, int, int, int], dict[str, Any]]] = []
     last_window = None
 
+    feasible_x = _safe_origin_interval_for_box(box, n, margin_px, max_x, axis=0)
+    feasible_y = _safe_origin_interval_for_box(box, n, margin_px, max_y, axis=1)
+    if feasible_x is None or feasible_y is None:
+        return _bbox_safe_failed_window(
+            image_width=image_width,
+            image_height=image_height,
+            crop_size=n,
+            box=box,
+            rng=rng,
+            candidate_count=candidate_count,
+            margin_fraction=margin_fraction,
+            margin_px=margin_px,
+            reason="target_box_cannot_fit_inside_safe_margin",
+        )
+
+    x_lo, x_hi = feasible_x
+    y_lo, y_hi = feasible_y
+
     for _ in range(candidate_count):
-        cx = cx0 + float(rng.uniform(-shift, shift))
-        cy = cy0 + float(rng.uniform(-shift, shift))
-        x0 = int(round(cx - n / 2.0))
-        y0 = int(round(cy - n / 2.0))
-        x0 = min(max(0, x0), max_x)
-        y0 = min(max(0, y0), max_y)
+        # Sample only from origins that make the target annotation margin-safe.
+        # This avoids clamping a crop to the image edge and accidentally placing
+        # the target box in the forbidden boundary band.
+        if rng.random() < 0.75:
+            cx = cx0 + float(rng.uniform(-shift, shift))
+            cy = cy0 + float(rng.uniform(-shift, shift))
+            x0 = int(round(cx - n / 2.0))
+            y0 = int(round(cy - n / 2.0))
+            x0 = min(max(x_lo, x0), x_hi)
+            y0 = min(max(y_lo, y0), y_hi)
+        else:
+            x0 = int(rng.integers(x_lo, x_hi + 1)) if x_hi > x_lo else int(x_lo)
+            y0 = int(rng.integers(y_lo, y_hi + 1)) if y_hi > y_lo else int(y_lo)
         window = (x0, y0, x0 + n, y0 + n)
         last_window = window
         ok, safety_info = _window_satisfies_bbox_safe_margin(window, boxes, box, margin_px)
@@ -441,9 +538,10 @@ def sample_bbox_safe_breast_biased_square_window(
 
     # Fallback: choose the best valid window on a coarse deterministic grid. This
     # keeps the export robust if random sampling misses a narrow feasible region.
+    # The grid is still restricted to target-safe origins.
     grid_candidates: list[tuple[float, tuple[int, int, int, int], dict[str, Any]]] = []
-    for x0 in _coarse_positions(max_x, max(8, n // 4)):
-        for y0 in _coarse_positions(max_y, max(8, n // 4)):
+    for x0 in _coarse_positions_between(x_lo, x_hi, max(8, n // 4)):
+        for y0 in _coarse_positions_between(y_lo, y_hi, max(8, n // 4)):
             window = (int(x0), int(y0), int(x0 + n), int(y0 + n))
             ok, safety_info = _window_satisfies_bbox_safe_margin(window, boxes, box, margin_px)
             if not ok:
@@ -457,27 +555,18 @@ def sample_bbox_safe_breast_biased_square_window(
         grid_candidates.sort(key=lambda item: item[0], reverse=True)
         return grid_candidates[0][1], grid_candidates[0][2]
 
-    # Last-resort fallback: ordinary centered crop. This is marked as not fully
-    # accepted so the user can audit it in samples.csv/metadata.
-    if last_window is None:
-        last_window = _random_positive_window(
-            image_width=image_width,
-            image_height=image_height,
-            crop_size=n,
-            mass_boxes=box.reshape(1, 4),
-            center_on_mass=True,
-            center_shift_fraction=0.0,
-            rng=rng,
-        )
-    return last_window, {
-        "requested_positive": True,
-        "accepted": False,
-        "centered_on_annotation": True,
-        "bbox_safe_failed": True,
-        "fallback_after_tries": int(candidate_count),
-        "bbox_safe_boundary_margin_fraction": float(margin_fraction),
-        "bbox_safe_boundary_margin_px": float(margin_px),
-    }
+    return _bbox_safe_failed_window(
+        image_width=image_width,
+        image_height=image_height,
+        crop_size=n,
+        box=box,
+        rng=rng,
+        candidate_count=candidate_count,
+        margin_fraction=margin_fraction,
+        margin_px=margin_px,
+        reason="no_candidate_satisfied_all_visible_boxes",
+        last_window=last_window,
+    )
 
 
 def sample_breast_biased_clean_square_window(
@@ -524,6 +613,110 @@ def sample_breast_biased_clean_square_window(
         return best[1], best[2]
     window = _random_any_window(image_width, image_height, n, rng)
     return window, {"requested_positive": False, "accepted": False, "bbox_safe_clean_fallback": True, "fallback_after_tries": int(candidate_count)}
+
+
+def validate_bbox_safe_window(
+    window_xyxy: tuple[int, int, int, int],
+    boxes: torch.Tensor,
+    *,
+    crop_size: int,
+    margin_fraction: float,
+    target_box: torch.Tensor | None = None,
+) -> tuple[bool, dict[str, Any]]:
+    """Validate the hard bbox-safe rule for a proposed export crop.
+
+    All visible boxes must be completely inside the crop and fully outside the
+    forbidden boundary band. If target_box is provided, that target box must also
+    be visible and safe.
+    """
+    margin_px = max(0.0, min(0.49, float(margin_fraction))) * float(crop_size)
+    boxes = _as_boxes(boxes)
+    if boxes.numel() == 0:
+        return True, {
+            "bbox_safe_boundary_margin_fraction": float(margin_fraction),
+            "bbox_safe_boundary_margin_px": float(margin_px),
+            "bbox_safe_visible_boxes": 0,
+            "bbox_safe_boxes_inside_margin": 0,
+            "bbox_safe_margin_ok": 1,
+        }
+    if target_box is not None:
+        target = torch.as_tensor(target_box, dtype=torch.float32).reshape(4)
+        ok, info = _window_satisfies_bbox_safe_margin(window_xyxy, boxes, target, margin_px)
+        info.update({
+            "bbox_safe_boundary_margin_fraction": float(margin_fraction),
+            "bbox_safe_boundary_margin_px": float(margin_px),
+        })
+        return ok, info
+
+    x0, y0, x1, y1 = [float(v) for v in window_xyxy]
+    vis = box_visibility_in_window(boxes, window_xyxy)
+    visible = vis > 0.0
+    if not bool(visible.any().item()):
+        return True, {
+            "bbox_safe_boundary_margin_fraction": float(margin_fraction),
+            "bbox_safe_boundary_margin_px": float(margin_px),
+            "bbox_safe_visible_boxes": 0,
+            "bbox_safe_boxes_inside_margin": 0,
+            "bbox_safe_margin_ok": 1,
+        }
+    visible_boxes = boxes[visible]
+    sx0 = visible_boxes[:, 0] - x0
+    sy0 = visible_boxes[:, 1] - y0
+    sx1 = visible_boxes[:, 2] - x0
+    sy1 = visible_boxes[:, 3] - y0
+    crop_w = x1 - x0
+    crop_h = y1 - y0
+    full_inside = (
+        (visible_boxes[:, 0] >= x0)
+        & (visible_boxes[:, 1] >= y0)
+        & (visible_boxes[:, 2] <= x1)
+        & (visible_boxes[:, 3] <= y1)
+    )
+    inside_margin = (
+        (sx0 >= margin_px)
+        & (sy0 >= margin_px)
+        & (sx1 <= crop_w - margin_px)
+        & (sy1 <= crop_h - margin_px)
+    )
+    safe = full_inside & inside_margin
+    ok = bool(safe.all().item())
+    return ok, {
+        "bbox_safe_boundary_margin_fraction": float(margin_fraction),
+        "bbox_safe_boundary_margin_px": float(margin_px),
+        "bbox_safe_visible_boxes": int(visible.sum().item()),
+        "bbox_safe_boxes_inside_margin": int(safe.sum().item()),
+        "bbox_safe_margin_ok": int(ok),
+        "bbox_safe_min_visibility_visible_boxes": float(vis[visible].min().item()) if bool(visible.any().item()) else 0.0,
+    }
+
+
+def exported_boxes_satisfy_bbox_safe_margin(
+    boxes: torch.Tensor,
+    *,
+    crop_size: int,
+    margin_fraction: float,
+) -> tuple[bool, dict[str, Any]]:
+    """Validate already shifted crop-coordinate boxes before writing labels."""
+    boxes = _as_boxes(boxes)
+    margin_px = max(0.0, min(0.49, float(margin_fraction))) * float(crop_size)
+    if boxes.numel() == 0:
+        return True, {
+            "bbox_safe_exported_boxes": 0,
+            "bbox_safe_exported_boxes_inside_margin": 0,
+            "bbox_safe_export_margin_ok": 1,
+        }
+    safe = (
+        (boxes[:, 0] >= margin_px)
+        & (boxes[:, 1] >= margin_px)
+        & (boxes[:, 2] <= float(crop_size) - margin_px)
+        & (boxes[:, 3] <= float(crop_size) - margin_px)
+    )
+    ok = bool(safe.all().item())
+    return ok, {
+        "bbox_safe_exported_boxes": int(boxes.shape[0]),
+        "bbox_safe_exported_boxes_inside_margin": int(safe.sum().item()),
+        "bbox_safe_export_margin_ok": int(ok),
+    }
 
 
 def _window_satisfies_bbox_safe_margin(

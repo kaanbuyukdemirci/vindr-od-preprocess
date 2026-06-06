@@ -17,7 +17,7 @@ from .dataset import (
     vindr_mammo_collate,
 )
 
-__version__ = "0.31.0"
+__version__ = "0.32.0"
 
 __all__ = [
     "VindrMammoDataset",

@@ -417,3 +417,15 @@ square_crops:
 If `bbox_safe_boundary_margin_fraction` is `0.15`, then every visible annotation
 must be fully inside the central 70 percent of the crop. The outer 15 percent on
 each side is treated as a forbidden boundary zone for annotations.
+
+
+### v50 bbox-safe hard-boundary fix
+
+`bbox_safe_random` now treats the boundary rule as a hard export constraint. Set:
+
+```yaml
+square_crops:
+  bbox_safe_skip_unsafe_fallbacks: true
+```
+
+With this enabled, if no crop can keep the visible annotations fully inside the safe inner region, the exporter skips that crop instead of writing a fallback. The exporter also performs a final validation on the actual crop-coordinate boxes before saving labels. This prevents annotations from touching or entering the forbidden boundary band.

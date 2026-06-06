@@ -3004,7 +3004,10 @@ def _prepare_sample(
             image_tensor = torch.as_tensor(image, dtype=torch.float32).reshape(1, height, width)
             boxes_for_sampling = mass_boxes.detach().cpu().reshape(-1, 4)
             if boxes_for_sampling.shape[0] > 0:
-                for i in range(preview_count):
+                attempts = max(preview_count, preview_count * 4)
+                for i in range(attempts):
+                    if len(windows) >= preview_count:
+                        break
                     box = boxes_for_sampling[int(i % boxes_for_sampling.shape[0])]
                     w, _info = sample_bbox_safe_breast_biased_square_window(
                         image_width=width,
@@ -3015,6 +3018,8 @@ def _prepare_sample(
                         options=random_options,
                         rng=rng,
                     )
+                    if bool(random_options.get("bbox_safe_skip_unsafe_fallbacks", True)) and not bool(_info.get("accepted", True)):
+                        continue
                     windows.append(w)
             else:
                 for _ in range(preview_count):
@@ -3026,6 +3031,8 @@ def _prepare_sample(
                         options=random_options,
                         rng=rng,
                     )
+                    if bool(random_options.get("bbox_safe_skip_unsafe_fallbacks", True)) and boxes_for_sampling.shape[0] > 0 and not bool(_info.get("accepted", True)):
+                        continue
                     windows.append(w)
         else:
             for _ in range(preview_count):

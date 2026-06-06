@@ -32,11 +32,13 @@ except Exception:  # pragma: no cover
 
 from .crops import (
     crop_image_and_boxes_to_window,
+    exported_boxes_satisfy_bbox_safe_margin,
     sample_bbox_safe_breast_biased_square_window,
     sample_breast_biased_clean_square_window,
     sample_box_centered_square_window,
     sample_random_square_window,
     sliding_square_windows,
+    validate_bbox_safe_window,
     window_has_positive_mass,
 )
 from .dataset import VindrMammoDataset
@@ -505,6 +507,30 @@ def export_square_crop_datasets(
             options=common_crop_options,
         )
         boxes = crop_result.mass_boxes
+
+        if str(extra_info.get("crop_mode", "")).startswith("bbox_safe_random"):
+            skip_unsafe = bool(crop_cfg.get("bbox_safe_skip_unsafe_fallbacks", True))
+            margin_fraction = float(crop_cfg.get("bbox_safe_boundary_margin_fraction", 0.15))
+
+            if skip_unsafe and not bool(extra_info.get("accepted", True)):
+                return False
+
+            source_ok, _source_safe_info = validate_bbox_safe_window(
+                window,
+                target["mass"]["boxes"],
+                crop_size=crop_size,
+                margin_fraction=margin_fraction,
+                target_box=None,
+            )
+            exported_ok, _export_safe_info = exported_boxes_satisfy_bbox_safe_margin(
+                boxes,
+                crop_size=crop_size,
+                margin_fraction=margin_fraction,
+            )
+            if skip_unsafe and (not source_ok or not exported_ok):
+                return False
+            extra_info = {**extra_info, **_source_safe_info, **_export_safe_info}
+
         if str(extra_info.get("deterministic_selection_mode", "")).casefold() == "mass_only" and boxes.shape[0] == 0:
             return False
         if int(extra_info.get("deterministic_include_empty", 1)) == 0 and boxes.shape[0] == 0:
@@ -863,6 +889,7 @@ def _windows_for_export_split(
             "bbox_safe_left_bias_strength",
             "bbox_safe_projection_bias_strength",
             "bbox_safe_foreground_threshold",
+            "bbox_safe_skip_unsafe_fallbacks",
         ]:
             if key in crop_cfg:
                 safe_options[key] = crop_cfg.get(key)
@@ -878,6 +905,8 @@ def _windows_for_export_split(
                     options=safe_options,
                     rng=rng,
                 )
+                if bool(crop_cfg.get("bbox_safe_skip_unsafe_fallbacks", True)) and not bool(info.get("accepted", True)):
+                    continue
                 windows.append((window, {"crop_mode": "bbox_safe_random", "annotation_index": int(ann_index), **info}))
 
         num_positive = len(windows)
@@ -903,6 +932,8 @@ def _windows_for_export_split(
                 options=clean_options,
                 rng=rng,
             )
+            if bool(crop_cfg.get("bbox_safe_skip_unsafe_fallbacks", True)) and boxes.shape[0] > 0 and not bool(info.get("accepted", True)):
+                continue
             windows.append((window, {"crop_mode": "bbox_safe_random_clean", **info}))
         return windows
 
@@ -1987,6 +2018,11 @@ def _sample_stats_row(
                 "bbox_safe_boxes_inside_margin": crop_info.get("bbox_safe_boxes_inside_margin", ""),
                 "bbox_safe_foreground_fraction": crop_info.get("bbox_safe_foreground_fraction", ""),
                 "bbox_safe_score": crop_info.get("bbox_safe_score", ""),
+                "bbox_safe_margin_ok": crop_info.get("bbox_safe_margin_ok", ""),
+                "bbox_safe_export_margin_ok": crop_info.get("bbox_safe_export_margin_ok", ""),
+                "bbox_safe_exported_boxes": crop_info.get("bbox_safe_exported_boxes", ""),
+                "bbox_safe_exported_boxes_inside_margin": crop_info.get("bbox_safe_exported_boxes_inside_margin", ""),
+                "bbox_safe_failure_reason": crop_info.get("bbox_safe_failure_reason", ""),
             }
         )
     return row

@@ -138,6 +138,10 @@ square_crops:
   bbox_safe_left_bias_strength: 0.25
   bbox_safe_projection_bias_strength: 0.25
   bbox_safe_foreground_threshold: null
+
+  # Hard safety gate. If true, bbox_safe_random crops that cannot satisfy the
+  # boundary rule are skipped instead of exported as fallback crops.
+  bbox_safe_skip_unsafe_fallbacks: true
   seed: 123
 
   # Validation/test deterministic crop options.
