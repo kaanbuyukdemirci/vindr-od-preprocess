@@ -2364,10 +2364,27 @@ def _export_dataset_from_gui_panel(
 
         st.markdown("**Export mass/empty balance per split**")
         st.caption(
-            "Use this when you want 50% mass crops and 50% empty crops. For random and bbox-safe random, the target ratio "
-            "controls how many empty random crops are added. For deterministic sliding, it controls which empty windows are sampled."
+            "Use this when you want 50% mass crops and 50% empty crops. For random and bbox-safe random, the exporter now "
+            "uses an online approximate balance by default: it saves mass crops immediately, keeps running counts, and saves "
+            "empty crops when the current split needs more empty crops. Empty crops can come from any source image, including "
+            "images with no mass. For deterministic sliding, positive-ratio selection still uses the exact planning-based sampler."
         )
         selection_payload = _deterministic_selection_controls(crop_cfg, split_crop_modes)
+        with st.expander("Random/bbox-safe balance behavior", expanded=False):
+            online_default = bool(crop_cfg.get("online_positive_ratio_selection_for_random", True))
+            shuffle_default = bool(crop_cfg.get("online_balance_shuffle_source_records", True))
+            st.write({
+                "online_positive_ratio_selection_for_random": online_default,
+                "online_balance_shuffle_source_records": shuffle_default,
+                "global_positive_ratio_selection_for_random": bool(crop_cfg.get("global_positive_ratio_selection_for_random", False)),
+                "global_negative_candidate_crops_per_image_when_balancing": int(crop_cfg.get("global_negative_candidate_crops_per_image_when_balancing", 1) or 1),
+            })
+            st.caption(
+                "Online mode avoids the long Planning step and starts writing crops immediately. It is approximate, not exact. "
+                "If the target is 0.50 and the split currently has 10 saved mass crops and 6 saved empty crops, the next clean "
+                "candidate is saved. If it already has 10 mass and 10 empty, clean candidates are skipped until more mass crops appear. "
+                "Shuffling source images is enabled so mass and no-mass images are mixed during this one-pass export."
+            )
 
         st.markdown("**Simple export profiler**")
         runtime_cfg = dict(cfg.get("runtime", {}) or {})
@@ -2507,7 +2524,14 @@ def _build_gui_export_config(
     square["random_crops_per_annotation"] = int(square.get("random_crops_per_annotation", 1) or 1)
     square["bbox_safe_crops_per_annotation"] = int(square.get("bbox_safe_crops_per_annotation", square.get("random_crops_per_annotation", 1)) or 1)
     square["balance_train_positive_fraction_globally"] = bool(square.get("balance_train_positive_fraction_globally", True))
-    square["global_positive_ratio_selection_for_random"] = bool(square.get("global_positive_ratio_selection_for_random", True))
+    # Default for random/bbox-safe export is now online approximate balancing, not exact
+    # planning-first global selection. This starts saving images immediately.
+    square["online_positive_ratio_selection_for_random"] = bool(square.get("online_positive_ratio_selection_for_random", True))
+    square["online_balance_shuffle_source_records"] = bool(square.get("online_balance_shuffle_source_records", True))
+    if square["online_positive_ratio_selection_for_random"]:
+        square["global_positive_ratio_selection_for_random"] = False
+    else:
+        square["global_positive_ratio_selection_for_random"] = bool(square.get("global_positive_ratio_selection_for_random", False))
     square["global_negative_candidate_crops_per_image_when_balancing"] = int(square.get("global_negative_candidate_crops_per_image_when_balancing", 1) or 1)
     square["random_crops_per_negative_image_when_balancing"] = int(square.get("random_crops_per_negative_image_when_balancing", 1) or 1)
     square["bbox_safe_random_crops_per_negative_image_when_balancing"] = int(square.get("bbox_safe_random_crops_per_negative_image_when_balancing", 1) or 1)

@@ -1,6 +1,6 @@
 paths:
   data_root: /mnt/t9/vindr
-  output_root: /mnt/t9/preprocessed-vindr-v55
+  output_root: /mnt/t9/preprocessed-vindr-v56
 runtime:
   show_progress: true
   simple_profiler_enabled: true
@@ -158,7 +158,9 @@ square_crops:
   contralateral_alignment_cache_items: 64
   bbox_safe_crops_per_annotation: 1
   bbox_safe_random_crops_per_negative_image_when_balancing: 1
-  global_positive_ratio_selection_for_random: true
+  global_positive_ratio_selection_for_random: false
+  online_positive_ratio_selection_for_random: true
+  online_balance_shuffle_source_records: true
   global_negative_candidate_crops_per_image_when_balancing: 1
 crop_annotation_policy:
   allow_partial_annotations: true
@@ -168,7 +170,7 @@ crop_annotation_policy:
 dataset:
   validate_paths: false
 visualizations:
-  output_dir: /mnt/t9/preprocessed-vindr-v55/visualizations
+  output_dir: /mnt/t9/preprocessed-vindr-v56/visualizations
   include_square_crops: true
   include_baseline_uncropped: true
   write_html_report: true

@@ -595,7 +595,7 @@ visualizations/23_coco_box_width_height_scatter.png
 These are meant to help interpret AP_small, AP_medium, and AP_large behavior in COCO-style evaluation.
 
 
-## v55 random/bbox-safe global balance note
+## v56 random/bbox-safe global balance note
 
 For random and bbox-safe random exports, the default is now one positive crop per annotation and global selection of negative crops to match the requested target positive ratio. With `positive_fraction: 0.50`, the exporter keeps all positive crop candidates and randomly selects enough clean crops from the global clean-candidate pool, including images with no mass, to make the saved crop set approximately 50% mass-positive and 50% empty.
 

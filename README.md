@@ -1442,7 +1442,7 @@ The default contralateral alignment method is now `nipple_y`, with `mask_centroi
 The exporter also includes a lightweight start/stop profiler. It records coarse timing buckets such as preprocessing, crop planning, contralateral source crop generation, image saving, and metadata writing. In the GUI export panel, enable **Show simple timing breakdown during export** to see the live table. The table is updated every `runtime.simple_profiler_emit_every` progress updates to avoid slowing down the export.
 
 
-## v55 random/bbox-safe global balance note
+## v56 random/bbox-safe global balance note
 
 For random and bbox-safe random exports, the default is now one positive crop per annotation and global selection of negative crops to match the requested target positive ratio. With `positive_fraction: 0.50`, the exporter keeps all positive crop candidates and randomly selects enough clean crops from the global clean-candidate pool, including images with no mass, to make the saved crop set approximately 50% mass-positive and 50% empty.
 
@@ -1460,7 +1460,7 @@ square_crops:
 The contralateral source path was also made faster: the exporter now estimates and caches a vertical shift, then crops the opposite image from an adjusted window instead of shifting the full mammogram tensor before every crop.
 
 
-## v55 global random balance and faster contralateral crop
+## v56 global random balance and faster contralateral crop
 
 Defaults changed for random and bbox-safe random exports:
 

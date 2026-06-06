@@ -710,6 +710,83 @@ def export_square_crop_datasets(
         split_mode = str(crop_cfg.get(f"{split_name}_crop_mode", "random" if split_name == "train" else "deterministic")).casefold().strip()
         selection_mode = _deterministic_selection_mode(crop_cfg, split_name) if split_mode == "deterministic" else ""
 
+        if split_mode in {"random", "bbox_safe_random"} and _online_positive_ratio_selection_enabled(crop_cfg, split_name, split_mode):
+            # Single-pass approximate balancing. This avoids the slow planning pass used by
+            # exact global selection and starts writing crops immediately. Empty candidates
+            # may come from any source image, including no-mass images.
+            target_ratio = _target_positive_fraction(crop_cfg, split_name, bbox_safe=(split_mode == "bbox_safe_random"))
+            online_records = list(records)
+            if bool(crop_cfg.get(f"{split_name}_online_balance_shuffle_source_records", crop_cfg.get("online_balance_shuffle_source_records", True))):
+                order = rng.permutation(len(online_records)) if online_records else []
+                online_records = [online_records[int(i)] for i in order]
+
+            positive_saved = 0
+            negative_saved = 0
+            attempted_crops = 0
+            saved_crops = 0
+            iterator = _progress(online_records, show_progress, f"Export square crops {split_name} online balance", unit="img")
+            for record in iterator:
+                image, target = get_preprocessed(record)
+                height, width = int(image.shape[-2]), int(image.shape[-1])
+                windows = _profiled_call(
+                    profiler,
+                    "plan crop windows",
+                    lambda: _windows_for_export_split(
+                        split_name=split_name,
+                        image_width=width,
+                        image_height=height,
+                        image_tensor=image,
+                        mass_boxes=target["mass"]["boxes"],
+                        crop_options=common_crop_options,
+                        crop_cfg=crop_cfg,
+                        rng=rng,
+                    ),
+                )
+                for window, extra_info in windows:
+                    is_positive_window = int(extra_info.get("is_positive_window", 0)) == 1
+                    if not is_positive_window and not _online_should_save_negative(positive_saved, negative_saved, target_ratio):
+                        continue
+
+                    attempted_crops += 1
+                    proposed_positive = positive_saved + (1 if is_positive_window else 0)
+                    proposed_negative = negative_saved + (0 if is_positive_window else 1)
+                    enriched_info = _online_balance_extra_info(
+                        extra_info,
+                        split_name=split_name,
+                        target_ratio=target_ratio,
+                        positive_count=proposed_positive,
+                        negative_count=proposed_negative,
+                    )
+                    saved_ok = save_window(
+                        record=record,
+                        split_name=split_name,
+                        crop_number=attempted_crops - 1,
+                        window=window,
+                        extra_info=enriched_info,
+                    )
+                    if saved_ok:
+                        saved_crops += 1
+                        if is_positive_window:
+                            positive_saved += 1
+                        else:
+                            negative_saved += 1
+
+                processed_records_for_progress += 1
+                maybe_emit_profiler_progress({
+                    "event": "image_progress",
+                    "stage": "export_square_crops",
+                    "split": f"{split_name} online saving",
+                    "processed": int(processed_records_for_progress),
+                    "total": int(total_records_for_progress),
+                    "unit": "source images",
+                    "saved_crops": int(saved_crops),
+                    "saved_positive_crops": int(positive_saved),
+                    "saved_negative_crops": int(negative_saved),
+                    "running_positive_ratio": float(positive_saved / max(1, positive_saved + negative_saved)),
+                    "target_positive_ratio": float(target_ratio),
+                })
+            continue
+
         if split_mode in {"random", "bbox_safe_random"} and _global_positive_ratio_selection_enabled(crop_cfg, split_name, split_mode):
             candidates: list[tuple[dict[str, Any], tuple[int, int, int, int], dict[str, Any]]] = []
             iterator = _progress(records, show_progress, f"Plan square crops {split_name}", unit="img")
@@ -950,6 +1027,68 @@ def _global_positive_ratio_selection_enabled(crop_cfg: dict[str, Any], split_nam
     # Legacy behavior: this flag used to suppress negatives from no-mass images.
     # It now means random/bbox-safe crops are globally selected to the target ratio.
     return bool(crop_cfg.get("balance_train_positive_fraction_globally", True)) and split_mode in {"random", "bbox_safe_random"}
+
+
+def _online_positive_ratio_selection_enabled(crop_cfg: dict[str, Any], split_name: str, split_mode: str) -> bool:
+    """Use a single-pass approximate target ratio for random crop modes.
+
+    Unlike global positive-ratio selection, this does not collect all candidates first.
+    It writes positive crops immediately and accepts empty candidates only when the
+    running saved counts need more empty crops. This is intentionally approximate,
+    but it avoids the long planning stage and lets PNGs appear during export.
+    """
+    if split_mode not in {"random", "bbox_safe_random"}:
+        return False
+    split_key = f"{split_name}_online_positive_ratio_selection_for_random"
+    if split_key in crop_cfg and crop_cfg.get(split_key) is not None:
+        return bool(crop_cfg.get(split_key))
+    if "online_positive_ratio_selection_for_random" in crop_cfg:
+        return bool(crop_cfg.get("online_positive_ratio_selection_for_random"))
+    return False
+
+
+def _online_should_save_negative(positive_count: int, negative_count: int, target_ratio: float) -> bool:
+    """Return True when the running split ratio needs another empty crop."""
+    try:
+        target_ratio = min(max(float(target_ratio), 0.01), 1.0)
+    except Exception:
+        target_ratio = 0.50
+    if target_ratio >= 1.0:
+        return False
+    if positive_count <= 0:
+        return False
+    desired_negatives = int(round(float(positive_count) * (1.0 - target_ratio) / target_ratio))
+    return int(negative_count) < max(0, desired_negatives)
+
+
+def _online_balance_extra_info(
+    extra_info: dict[str, Any],
+    *,
+    split_name: str,
+    target_ratio: float,
+    positive_count: int,
+    negative_count: int,
+) -> dict[str, Any]:
+    total = int(positive_count) + int(negative_count)
+    achieved = float(positive_count / total) if total > 0 else 0.0
+    return {
+        **dict(extra_info),
+        "online_positive_ratio_selection": f"online_{split_name}_random_positive_ratio",
+        "online_target_positive_ratio": float(target_ratio),
+        "online_running_positive_windows": int(positive_count),
+        "online_running_negative_windows": int(negative_count),
+        "online_running_achieved_positive_ratio": float(achieved),
+        # Also fill the older summary/debug names so samples.csv stays easy to compare.
+        "global_positive_ratio_selection": "online_streaming_approximate",
+        "global_target_positive_ratio": float(target_ratio),
+        "global_achieved_positive_ratio": float(achieved),
+        "global_selected_positive_windows": int(positive_count),
+        "global_selected_negative_windows": int(negative_count),
+        "deterministic_target_positive_ratio": float(target_ratio),
+        "deterministic_achieved_positive_ratio": float(achieved),
+        "deterministic_selected_positive_windows": int(positive_count),
+        "deterministic_selected_negative_windows": int(negative_count),
+    }
 
 
 def _select_positive_ratio_candidates(
