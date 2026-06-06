@@ -306,6 +306,79 @@ def align_contralateral_image_to_reference(
     return shifted, info
 
 
+def estimate_contralateral_alignment_info(
+    reference_image: torch.Tensor | np.ndarray,
+    moving_image: torch.Tensor | np.ndarray,
+    *,
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Estimate contralateral vertical alignment without shifting the full image.
+
+    This is used by the exporter for speed. Shifting a full mammogram can require
+    copying millions of pixels even when the export only needs one 1024x1024 crop.
+    The exporter can instead estimate ``shift_y`` once, cache this small dict, and
+    crop the opposite image from an adjusted y-window.
+    """
+    opts = make_contralateral_alignment_options(options)
+    info: dict[str, Any] = {
+        "contralateral_alignment_enabled": bool(opts.get("enabled", True)),
+        "contralateral_alignment_method": str(opts.get("method", "nipple_y")),
+        "contralateral_alignment_selected_method": None,
+        "contralateral_alignment_shift_y": 0,
+        "contralateral_alignment_applied": False,
+        "contralateral_alignment_failure_reason": None,
+        "contralateral_alignment_fast_crop_mode": True,
+    }
+
+    if not bool(opts.get("enabled", True)):
+        info["contralateral_alignment_failure_reason"] = "alignment_disabled"
+        return info
+
+    method = _normalize_alignment_method(opts.get("method", "nipple_y"))
+    if method in {"none", "disabled", "off"}:
+        info["contralateral_alignment_failure_reason"] = "alignment_method_none"
+        return info
+
+    reference_arr = _as_float2d(reference_image)
+    moving_arr = _as_float2d(moving_image)
+    max_shift = int(round(float(opts.get("max_shift_fraction", 0.20)) * float(max(moving_arr.shape[0], 1))))
+    max_shift = max(0, max_shift)
+
+    if method in {"hybrid", "hybrid_profile", "hybrid_profile_y", "profile_hybrid", "profile_hybrid_y"}:
+        selected = estimate_hybrid_profile_alignment_shift(reference_arr, moving_arr, options=opts)
+    else:
+        selected = estimate_alignment_shift_y(reference_arr, moving_arr, method=method, options=opts)
+
+    info.update({
+        "contralateral_alignment_candidates": selected.get("candidates", {}),
+        "contralateral_alignment_selected_method": selected.get("selected_method"),
+        "contralateral_alignment_selection_reason": selected.get("selection_reason"),
+        "contralateral_alignment_warning": selected.get("warning"),
+        "contralateral_alignment_max_shift_px": int(max_shift),
+    })
+
+    if "nipple_y" in selected.get("candidates", {}):
+        nipple = selected["candidates"]["nipple_y"]
+        info["reference_nipple_tip"] = nipple.get("reference_nipple_tip")
+        info["moving_nipple_tip"] = nipple.get("moving_nipple_tip")
+    elif method == "nipple_y":
+        info["reference_nipple_tip"] = selected.get("reference_nipple_tip")
+        info["moving_nipple_tip"] = selected.get("moving_nipple_tip")
+
+    if selected.get("found") is not True:
+        info["contralateral_alignment_failure_reason"] = selected.get("failure_reason", "alignment_shift_not_found")
+        return info
+
+    shift_y = int(round(float(selected.get("shift_y", 0))))
+    if max_shift >= 0:
+        shift_y = int(np.clip(shift_y, -max_shift, max_shift))
+    info.update({
+        "contralateral_alignment_shift_y": int(shift_y),
+        "contralateral_alignment_applied": bool(shift_y != 0),
+    })
+    return info
+
+
 def _normalize_alignment_method(method: Any) -> str:
     m = str(method or "nipple_y").strip().casefold().replace("-", "_").replace(" ", "_")
     aliases = {

@@ -1390,7 +1390,7 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
             )
             random_seed = st.number_input("Random preview seed", min_value=0, max_value=999999, value=random_seed, step=1, key=_widget_key("crop_random_seed"))
 
-    bbox_safe_boundary_margin_fraction = float(crop_cfg.get("bbox_safe_boundary_margin_fraction", 0.15))
+    bbox_safe_boundary_margin_fraction = float(crop_cfg.get("bbox_safe_boundary_margin_fraction", 0.02))
     bbox_safe_random_shift_fraction = float(crop_cfg.get("bbox_safe_random_shift_fraction", crop_cfg.get("center_shift_fraction", 0.25)))
     bbox_safe_candidate_count = int(crop_cfg.get("bbox_safe_candidate_count", 120))
     bbox_safe_top_k = int(crop_cfg.get("bbox_safe_top_k", 8))
@@ -1407,8 +1407,8 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 step=0.01,
                 key=_widget_key("crop_bbox_safe_boundary_margin_fraction"),
                 help=(
-                    "Example: 0.15 means the outer 15% of the crop on every side is forbidden. "
-                    "For a 1024 crop, visible mass boxes must be fully inside x=154..870 and y=154..870. "
+                    "Example: 0.02 means the outer 2% of the crop on every side is forbidden. "
+                    "For a 1024 crop, visible mass boxes must be fully inside about x=20..1004 and y=20..1004. "
                     "If a mass box touches that forbidden band, bbox-safe mode rejects the crop."
                 ),
             )
@@ -2504,6 +2504,13 @@ def _build_gui_export_config(
     # Global fallback for older configs and non-GUI exports. GUI export writes split-specific
     # *_positive_fraction values above, so the export panel is the source of truth.
     square["positive_fraction"] = float(square.get("positive_fraction", 0.50))
+    square["random_crops_per_annotation"] = int(square.get("random_crops_per_annotation", 1) or 1)
+    square["bbox_safe_crops_per_annotation"] = int(square.get("bbox_safe_crops_per_annotation", square.get("random_crops_per_annotation", 1)) or 1)
+    square["balance_train_positive_fraction_globally"] = bool(square.get("balance_train_positive_fraction_globally", True))
+    square["global_positive_ratio_selection_for_random"] = bool(square.get("global_positive_ratio_selection_for_random", True))
+    square["global_negative_candidate_crops_per_image_when_balancing"] = int(square.get("global_negative_candidate_crops_per_image_when_balancing", 1) or 1)
+    square["random_crops_per_negative_image_when_balancing"] = int(square.get("random_crops_per_negative_image_when_balancing", 1) or 1)
+    square["bbox_safe_random_crops_per_negative_image_when_balancing"] = int(square.get("bbox_safe_random_crops_per_negative_image_when_balancing", 1) or 1)
     square["center_shift_fraction"] = float(crop_options.get("center_shift_fraction", square.get("center_shift_fraction", 0.25)))
     for key in [
         "bbox_safe_boundary_margin_fraction",

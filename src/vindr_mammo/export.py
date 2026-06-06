@@ -42,7 +42,7 @@ from .crops import (
     window_has_positive_mass,
 )
 from .dataset import VindrMammoDataset
-from .preprocessing import align_contralateral_image_to_reference
+from .preprocessing import align_contralateral_image_to_reference, estimate_contralateral_alignment_info
 
 CLASS_NAMES = ["mass"]
 COCO_CATEGORIES = [{"id": 1, "name": "mass", "supercategory": "lesion"}]
@@ -542,7 +542,7 @@ def export_square_crop_datasets(
     # each other.
     preprocessed_cache: OrderedDict[str, tuple[torch.Tensor, dict[str, Any]]] = OrderedDict()
     max_preprocessed_cache_items = int(crop_cfg.get("contralateral_preprocessed_cache_items", 16))
-    aligned_contralateral_cache: OrderedDict[tuple[Any, ...], tuple[torch.Tensor, dict[str, Any]]] = OrderedDict()
+    aligned_contralateral_cache: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
     max_aligned_contralateral_cache_items = int(crop_cfg.get("contralateral_alignment_cache_items", 2))
     contralateral_lookup = _build_contralateral_record_lookup(dataset.image_records)
     needs_contralateral = _config_uses_contralateral_source(config)
@@ -600,7 +600,7 @@ def export_square_crop_datasets(
 
         if str(extra_info.get("crop_mode", "")).startswith("bbox_safe_random"):
             skip_unsafe = bool(crop_cfg.get("bbox_safe_skip_unsafe_fallbacks", True))
-            margin_fraction = float(crop_cfg.get("bbox_safe_boundary_margin_fraction", 0.15))
+            margin_fraction = float(crop_cfg.get("bbox_safe_boundary_margin_fraction", 0.02))
 
             if skip_unsafe and not bool(extra_info.get("accepted", True)):
                 return False
@@ -709,6 +709,62 @@ def export_square_crop_datasets(
         records = split_records.get(split_name, [])
         split_mode = str(crop_cfg.get(f"{split_name}_crop_mode", "random" if split_name == "train" else "deterministic")).casefold().strip()
         selection_mode = _deterministic_selection_mode(crop_cfg, split_name) if split_mode == "deterministic" else ""
+
+        if split_mode in {"random", "bbox_safe_random"} and _global_positive_ratio_selection_enabled(crop_cfg, split_name, split_mode):
+            candidates: list[tuple[dict[str, Any], tuple[int, int, int, int], dict[str, Any]]] = []
+            iterator = _progress(records, show_progress, f"Plan square crops {split_name}", unit="img")
+            for record in iterator:
+                image, target = get_preprocessed(record)
+                height, width = int(image.shape[-2]), int(image.shape[-1])
+                windows = _profiled_call(
+                    profiler,
+                    "plan crop windows",
+                    lambda: _windows_for_export_split(
+                        split_name=split_name,
+                        image_width=width,
+                        image_height=height,
+                        image_tensor=image,
+                        mass_boxes=target["mass"]["boxes"],
+                        crop_options=common_crop_options,
+                        crop_cfg=crop_cfg,
+                        rng=rng,
+                    ),
+                )
+                candidates.extend((record, window, extra_info) for window, extra_info in windows)
+                processed_records_for_progress += 1
+                maybe_emit_profiler_progress({
+                    "event": "image_progress",
+                    "stage": "export_square_crops",
+                    "split": f"{split_name} planning",
+                    "processed": int(processed_records_for_progress),
+                    "total": int(total_records_for_progress),
+                    "unit": "source images",
+                })
+
+            target_ratio = _target_positive_fraction(crop_cfg, split_name, bbox_safe=(split_mode == "bbox_safe_random"))
+            selected = _select_positive_ratio_candidates(
+                candidates,
+                crop_cfg,
+                split_name,
+                rng,
+                target_ratio=target_ratio,
+                selection_label=f"global_{split_mode}_positive_ratio",
+            )
+            save_iter = _progress(selected, show_progress, f"Save square crops {split_name}", unit="crop")
+            total_selected = len(selected)
+            saved_count = 0
+            for crop_number, (record, window, extra_info) in enumerate(save_iter):
+                if save_window(record=record, split_name=split_name, crop_number=crop_number, window=window, extra_info=extra_info):
+                    saved_count += 1
+                maybe_emit_profiler_progress({
+                    "event": "image_progress",
+                    "stage": "export_square_crops",
+                    "split": f"{split_name} saving",
+                    "processed": int(crop_number + 1),
+                    "total": int(total_selected),
+                    "unit": "crops",
+                })
+            continue
 
         if split_mode == "deterministic" and selection_mode == "positive_ratio":
             candidates: list[tuple[dict[str, Any], tuple[int, int, int, int], dict[str, Any]]] = []
@@ -885,19 +941,45 @@ def _target_positive_fraction(crop_cfg: dict[str, Any], split_name: str, *, bbox
     return 0.50
 
 
+def _global_positive_ratio_selection_enabled(crop_cfg: dict[str, Any], split_name: str, split_mode: str) -> bool:
+    split_key = f"{split_name}_global_positive_ratio_selection_for_random"
+    if split_key in crop_cfg and crop_cfg.get(split_key) is not None:
+        return bool(crop_cfg.get(split_key))
+    if "global_positive_ratio_selection_for_random" in crop_cfg:
+        return bool(crop_cfg.get("global_positive_ratio_selection_for_random"))
+    # Legacy behavior: this flag used to suppress negatives from no-mass images.
+    # It now means random/bbox-safe crops are globally selected to the target ratio.
+    return bool(crop_cfg.get("balance_train_positive_fraction_globally", True)) and split_mode in {"random", "bbox_safe_random"}
+
+
 def _select_positive_ratio_candidates(
     candidates: list[tuple[dict[str, Any], tuple[int, int, int, int], dict[str, Any]]],
     crop_cfg: dict[str, Any],
     split_name: str,
     rng: np.random.Generator,
+    *,
+    target_ratio: float | None = None,
+    selection_label: str = "positive_ratio",
 ) -> list[tuple[dict[str, Any], tuple[int, int, int, int], dict[str, Any]]]:
-    target_ratio = _deterministic_target_positive_ratio(crop_cfg, split_name)
+    """Keep all positive crops and globally sample negative candidates.
+
+    This lets random/bbox-safe exports create one crop per annotation while still
+    drawing the empty half of a 50/50 dataset from any clean candidate, including
+    source images that contain no mass at all.
+    """
+    if target_ratio is None:
+        target_ratio = _deterministic_target_positive_ratio(crop_cfg, split_name)
+    try:
+        target_ratio = min(max(float(target_ratio), 0.01), 1.0)
+    except Exception:
+        target_ratio = 0.50
+
     positives = [c for c in candidates if int(c[2].get("is_positive_window", 0)) == 1]
     negatives = [c for c in candidates if int(c[2].get("is_positive_window", 0)) == 0]
     if not positives:
         return []
     if target_ratio >= 1.0 or not negatives:
-        selected = positives
+        selected_negatives = []
     else:
         wanted_negatives = int(round(len(positives) * (1.0 - target_ratio) / target_ratio))
         wanted_negatives = min(max(0, wanted_negatives), len(negatives))
@@ -906,16 +988,23 @@ def _select_positive_ratio_candidates(
             selected_negatives = [negatives[int(i)] for i in indices]
         else:
             selected_negatives = []
-        selected = positives + selected_negatives
+    selected = positives + selected_negatives
+
     # Keep deterministic/reproducible ordering by source image and window position.
     selected.sort(key=lambda c: (str(c[0].get("image_id", "")), int(c[1][1]), int(c[1][0]), int(c[1][3]), int(c[1][2])))
     selected_count = len(selected)
     positive_count = len(positives)
-    negative_count = max(0, selected_count - positive_count)
+    negative_count = len(selected_negatives)
     achieved_ratio = float(positive_count / selected_count) if selected_count else 0.0
     out = []
     for record, window, extra in selected:
         e = dict(extra)
+        e["global_positive_ratio_selection"] = selection_label
+        e["global_target_positive_ratio"] = float(target_ratio)
+        e["global_achieved_positive_ratio"] = float(achieved_ratio)
+        e["global_selected_positive_windows"] = int(positive_count)
+        e["global_selected_negative_windows"] = int(negative_count)
+        # Backward-compatible field names used by deterministic exports and old summaries.
         e["deterministic_target_positive_ratio"] = float(target_ratio)
         e["deterministic_achieved_positive_ratio"] = float(achieved_ratio)
         e["deterministic_selected_positive_windows"] = int(positive_count)
@@ -1026,6 +1115,7 @@ def _windows_for_export_split(
         windows: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
         crops_per_ann = int(crop_cfg.get("bbox_safe_crops_per_annotation", crop_cfg.get("random_crops_per_annotation", 5)))
         positive_fraction = _target_positive_fraction(crop_cfg, split_name, bbox_safe=True)
+        global_balance = _global_positive_ratio_selection_enabled(crop_cfg, split_name, split_mode)
 
         safe_options = dict(crop_options)
         for key in [
@@ -1055,15 +1145,22 @@ def _windows_for_export_split(
                 )
                 if bool(crop_cfg.get("bbox_safe_skip_unsafe_fallbacks", True)) and not bool(info.get("accepted", True)):
                     continue
-                windows.append((window, {"crop_mode": "bbox_safe_random", "annotation_index": int(ann_index), "target_positive_fraction": float(positive_fraction), **info}))
+                windows.append((window, {"crop_mode": "bbox_safe_random", "annotation_index": int(ann_index), "target_positive_fraction": float(positive_fraction), "is_positive_window": 1, **info}))
 
         num_positive = len(windows)
-        if num_positive > 0 and positive_fraction > 0:
+        if global_balance:
+            # Candidate negatives are generated from both finding and no-finding images.
+            # The final 50/50 ratio is enforced globally by _select_positive_ratio_candidates.
+            num_negative = int(crop_cfg.get(
+                "bbox_safe_random_crops_per_negative_image_when_balancing",
+                crop_cfg.get("global_negative_candidate_crops_per_image_when_balancing", crop_cfg.get("random_crops_per_negative_image_when_balancing", 1)),
+            ))
+        elif num_positive > 0 and positive_fraction > 0:
             num_negative = int(round(num_positive * max(0.0, 1.0 - positive_fraction) / positive_fraction))
         else:
             num_negative = int(crop_cfg.get("bbox_safe_random_crops_per_negative_image", crop_cfg.get("random_crops_per_negative_image", 1)))
 
-        if boxes.shape[0] == 0:
+        if boxes.shape[0] == 0 and not global_balance:
             if bool(crop_cfg.get("balance_train_positive_fraction_globally", True)):
                 num_negative = int(crop_cfg.get("random_crops_per_negative_image_when_balancing", 0))
             else:
@@ -1082,7 +1179,7 @@ def _windows_for_export_split(
             )
             if bool(crop_cfg.get("bbox_safe_skip_unsafe_fallbacks", True)) and boxes.shape[0] > 0 and not bool(info.get("accepted", True)):
                 continue
-            windows.append((window, {"crop_mode": "bbox_safe_random_clean", "target_positive_fraction": float(positive_fraction), **info}))
+            windows.append((window, {"crop_mode": "bbox_safe_random_clean", "target_positive_fraction": float(positive_fraction), "is_positive_window": 0, **info}))
         return windows
 
     # Random mode. Positive crops are centered around annotations.
@@ -1090,6 +1187,7 @@ def _windows_for_export_split(
     windows: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
     crops_per_ann = int(crop_cfg.get("random_crops_per_annotation", 5))
     positive_fraction = _target_positive_fraction(crop_cfg, split_name, bbox_safe=False)
+    global_balance = _global_positive_ratio_selection_enabled(crop_cfg, split_name, split_mode)
 
     for ann_index, box in enumerate(boxes):
         for _ in range(max(0, crops_per_ann)):
@@ -1101,21 +1199,24 @@ def _windows_for_export_split(
                 options=crop_options,
                 rng=rng,
             )
-            windows.append((window, {"crop_mode": "random", "annotation_index": int(ann_index), "target_positive_fraction": float(positive_fraction), **info}))
+            windows.append((window, {"crop_mode": "random", "annotation_index": int(ann_index), "target_positive_fraction": float(positive_fraction), "is_positive_window": 1, **info}))
 
     num_positive = len(windows)
-    if num_positive > 0 and positive_fraction > 0:
+    if global_balance:
+        # Generate negative candidates from all images, including no-mass images.
+        # The final target ratio is enforced globally after all candidates are planned.
+        num_negative = int(crop_cfg.get(
+            "global_negative_candidate_crops_per_image_when_balancing",
+            crop_cfg.get("random_crops_per_negative_image_when_balancing", 1),
+        ))
+    elif num_positive > 0 and positive_fraction > 0:
         num_negative = int(round(num_positive * max(0.0, 1.0 - positive_fraction) / positive_fraction))
     else:
         num_negative = int(crop_cfg.get("random_crops_per_negative_image", 1))
 
-    if boxes.shape[0] == 0:
-        # Important: if the user requests an overall train positive fraction such
-        # as 0.50, do not automatically add one negative crop from every normal
-        # image. Otherwise the global positive percentage can become much lower
-        # than requested because VinDr-Mammo has many images without mass boxes.
-        # Set balance_train_positive_fraction_globally=False to restore the old
-        # behavior and sample negatives from every no-mass image.
+    if boxes.shape[0] == 0 and not global_balance:
+        # Legacy behavior: optionally suppress no-mass-image negatives when using
+        # old per-image balancing.
         if bool(crop_cfg.get("balance_train_positive_fraction_globally", True)):
             num_negative = int(crop_cfg.get("random_crops_per_negative_image_when_balancing", 0))
         else:
@@ -1131,7 +1232,7 @@ def _windows_for_export_split(
             options=clean_options,
             rng=rng,
         )
-        windows.append((window, {"crop_mode": "random_clean", "target_positive_fraction": float(positive_fraction), **info}))
+        windows.append((window, {"crop_mode": "random_clean", "target_positive_fraction": float(positive_fraction), "is_positive_window": 0, **info}))
     return windows
 
 
@@ -1175,7 +1276,7 @@ def _contralateral_source_arrays_for_window(
     contralateral_lookup: dict[str, dict[str, Any]],
     get_preprocessed,
     config: dict[str, Any],
-    alignment_cache: OrderedDict[tuple[Any, ...], tuple[torch.Tensor, dict[str, Any]]] | None = None,
+    alignment_cache: OrderedDict[tuple[Any, ...], dict[str, Any]] | None = None,
     max_alignment_cache_items: int = 2,
     profiler: SimpleTimerProfiler | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
@@ -1195,20 +1296,20 @@ def _contralateral_source_arrays_for_window(
         int(align_options.get("boundary_smooth_rows", 0) or 0),
     )
     if alignment_cache is not None and cache_key in alignment_cache:
-        paired_image_aligned, cached_info = alignment_cache[cache_key]
+        cached_info = alignment_cache[cache_key]
         alignment_cache.move_to_end(cache_key)
         alignment_info = {**cached_info, "contralateral_alignment_cache_hit": True}
         if profiler is not None:
             profiler.record("contralateral alignment cache hit", 0.0)
     else:
         if profiler is not None:
-            profiler.start("contralateral alignment estimate and shift")
-        paired_image_aligned, alignment_info = align_contralateral_image_to_reference(reference_image, paired_image, options=align_options)
+            profiler.start("contralateral alignment estimate")
+        alignment_info = estimate_contralateral_alignment_info(reference_image, paired_image, options=align_options)
         if profiler is not None:
-            profiler.stop("contralateral alignment estimate and shift")
+            profiler.stop("contralateral alignment estimate")
         alignment_info = {**alignment_info, "contralateral_alignment_cache_hit": False}
         if alignment_cache is not None:
-            alignment_cache[cache_key] = (paired_image_aligned, dict(alignment_info))
+            alignment_cache[cache_key] = dict(alignment_info)
             alignment_cache.move_to_end(cache_key)
             while len(alignment_cache) > max(1, int(max_alignment_cache_items)):
                 alignment_cache.popitem(last=False)
@@ -1219,9 +1320,15 @@ def _contralateral_source_arrays_for_window(
         **alignment_info,
     }
     empty_boxes = torch.zeros((0, 4), dtype=torch.float32)
+    shift_y = int(round(float(alignment_info.get("contralateral_alignment_shift_y", 0) or 0)))
+    x0, y0, x1, y1 = [int(v) for v in window]
+    # Cropping the shifted image at y is equivalent to cropping the original
+    # image at y-shift_y. This avoids copying the full contralateral mammogram.
+    adjusted_window = (x0, y0 - shift_y, x1, y1 - shift_y)
+    alignment_info["contralateral_fast_adjusted_window_xyxy"] = adjusted_window
     if profiler is not None:
         profiler.start("crop aligned contralateral image")
-    paired_crop = crop_image_and_boxes_to_window(paired_image_aligned, boxes=empty_boxes, mass_boxes=empty_boxes, window_xyxy=window, options=crop_options)
+    paired_crop = crop_image_and_boxes_to_window(paired_image, boxes=empty_boxes, mass_boxes=empty_boxes, window_xyxy=adjusted_window, options=crop_options)
     if profiler is not None:
         profiler.stop("crop aligned contralateral image")
     return {"contralateral_same_view_crop": _tensor_to_float2d(paired_crop.image)}, alignment_info

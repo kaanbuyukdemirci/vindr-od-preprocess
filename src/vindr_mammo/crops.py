@@ -29,7 +29,7 @@ DEFAULT_CROP_OPTIONS: dict[str, Any] = {
     # visible in the crop must be fully inside the crop-safe inner region, not
     # near the crop boundary. A candidate pool is sampled randomly and then
     # biased toward windows containing more breast foreground.
-    "bbox_safe_boundary_margin_fraction": 0.15,
+    "bbox_safe_boundary_margin_fraction": 0.02,
     "bbox_safe_random_shift_fraction": 0.35,
     "bbox_safe_candidate_count": 120,
     "bbox_safe_top_k": 8,
@@ -453,7 +453,7 @@ def sample_bbox_safe_breast_biased_square_window(
     candidate_count = max(1, int(opts.get("bbox_safe_candidate_count", max_tries)))
     candidate_count = max(candidate_count, max_tries)
     top_k = max(1, int(opts.get("bbox_safe_top_k", 8)))
-    margin_fraction = float(opts.get("bbox_safe_boundary_margin_fraction", 0.15))
+    margin_fraction = float(opts.get("bbox_safe_boundary_margin_fraction", 0.02))
     margin_px = max(0.0, min(0.49, margin_fraction)) * float(n)
     shift = float(opts.get("bbox_safe_random_shift_fraction", opts.get("center_shift_fraction", 0.25))) * float(n)
 

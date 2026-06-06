@@ -405,7 +405,7 @@ square_crops:
   val_crop_mode: bbox_safe_random
   test_crop_mode: bbox_safe_random
 
-  bbox_safe_boundary_margin_fraction: 0.15
+  bbox_safe_boundary_margin_fraction: 0.02
   bbox_safe_random_shift_fraction: 0.35
   bbox_safe_candidate_count: 120
   bbox_safe_top_k: 8
@@ -414,8 +414,8 @@ square_crops:
   bbox_safe_projection_bias_strength: 0.25
 ```
 
-If `bbox_safe_boundary_margin_fraction` is `0.15`, then every visible annotation
-must be fully inside the central 70 percent of the crop. The outer 15 percent on
+If `bbox_safe_boundary_margin_fraction` is `0.02`, then every visible annotation
+must be fully inside the central 96 percent of the crop. The outer 2 percent on
 each side is treated as a forbidden boundary zone for annotations.
 
 
@@ -451,3 +451,21 @@ square_crops:
 ```
 
 With this enabled, if no crop can keep the visible annotations fully inside the safe inner region, the exporter skips that crop instead of writing a fallback. The exporter also performs a final validation on the actual crop-coordinate boxes before saving labels. This prevents annotations from touching or entering the forbidden boundary band.
+
+
+## v55 random/bbox-safe global balance note
+
+For random and bbox-safe random exports, the default is now one positive crop per annotation and global selection of negative crops to match the requested target positive ratio. With `positive_fraction: 0.50`, the exporter keeps all positive crop candidates and randomly selects enough clean crops from the global clean-candidate pool, including images with no mass, to make the saved crop set approximately 50% mass-positive and 50% empty.
+
+```yaml
+square_crops:
+  random_crops_per_annotation: 1
+  bbox_safe_crops_per_annotation: 1
+  positive_fraction: 0.50
+  global_positive_ratio_selection_for_random: true
+  global_negative_candidate_crops_per_image_when_balancing: 1
+  random_crops_per_negative_image_when_balancing: 1
+  bbox_safe_random_crops_per_negative_image_when_balancing: 1
+```
+
+The contralateral source path was also made faster: the exporter now estimates and caches a vertical shift, then crops the opposite image from an adjusted window instead of shifting the full mammogram tensor before every crop.

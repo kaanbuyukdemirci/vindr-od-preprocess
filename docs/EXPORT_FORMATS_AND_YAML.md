@@ -92,7 +92,7 @@ For the square-crop export:
 square_crops:
   crop_size: 1024
   stride: 512
-  random_crops_per_annotation: 5
+  random_crops_per_annotation: 1
   random_crops_per_negative_image: 1
   positive_fraction: 0.80
 ```
@@ -593,3 +593,21 @@ visualizations/23_coco_box_width_height_scatter.png
 ```
 
 These are meant to help interpret AP_small, AP_medium, and AP_large behavior in COCO-style evaluation.
+
+
+## v55 random/bbox-safe global balance note
+
+For random and bbox-safe random exports, the default is now one positive crop per annotation and global selection of negative crops to match the requested target positive ratio. With `positive_fraction: 0.50`, the exporter keeps all positive crop candidates and randomly selects enough clean crops from the global clean-candidate pool, including images with no mass, to make the saved crop set approximately 50% mass-positive and 50% empty.
+
+```yaml
+square_crops:
+  random_crops_per_annotation: 1
+  bbox_safe_crops_per_annotation: 1
+  positive_fraction: 0.50
+  global_positive_ratio_selection_for_random: true
+  global_negative_candidate_crops_per_image_when_balancing: 1
+  random_crops_per_negative_image_when_balancing: 1
+  bbox_safe_random_crops_per_negative_image_when_balancing: 1
+```
+
+The contralateral source path was also made faster: the exporter now estimates and caches a vertical shift, then crops the opposite image from an adjusted window instead of shifting the full mammogram tensor before every crop.

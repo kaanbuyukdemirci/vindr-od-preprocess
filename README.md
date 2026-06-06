@@ -963,7 +963,7 @@ The default crop settings are:
 square_crops:
   crop_size: 1024
   stride: 512
-  random_crops_per_annotation: 5
+  random_crops_per_annotation: 1
   positive_fraction: 0.80
 ```
 
@@ -1440,3 +1440,42 @@ For example, with `method: hybrid_profile_y`, the debug fields may show that `ro
 The default contralateral alignment method is now `nipple_y`, with `mask_centroid_y` as fallback. This is much faster than `hybrid_profile_y` for full dataset export. The profile methods are still available for inspection or smaller debug exports.
 
 The exporter also includes a lightweight start/stop profiler. It records coarse timing buckets such as preprocessing, crop planning, contralateral source crop generation, image saving, and metadata writing. In the GUI export panel, enable **Show simple timing breakdown during export** to see the live table. The table is updated every `runtime.simple_profiler_emit_every` progress updates to avoid slowing down the export.
+
+
+## v55 random/bbox-safe global balance note
+
+For random and bbox-safe random exports, the default is now one positive crop per annotation and global selection of negative crops to match the requested target positive ratio. With `positive_fraction: 0.50`, the exporter keeps all positive crop candidates and randomly selects enough clean crops from the global clean-candidate pool, including images with no mass, to make the saved crop set approximately 50% mass-positive and 50% empty.
+
+```yaml
+square_crops:
+  random_crops_per_annotation: 1
+  bbox_safe_crops_per_annotation: 1
+  positive_fraction: 0.50
+  global_positive_ratio_selection_for_random: true
+  global_negative_candidate_crops_per_image_when_balancing: 1
+  random_crops_per_negative_image_when_balancing: 1
+  bbox_safe_random_crops_per_negative_image_when_balancing: 1
+```
+
+The contralateral source path was also made faster: the exporter now estimates and caches a vertical shift, then crops the opposite image from an adjusted window instead of shifting the full mammogram tensor before every crop.
+
+
+## v55 global random balance and faster contralateral crop
+
+Defaults changed for random and bbox-safe random exports:
+
+```yaml
+square_crops:
+  random_crops_per_annotation: 1
+  bbox_safe_crops_per_annotation: 1
+  positive_fraction: 0.50
+  global_positive_ratio_selection_for_random: true
+  global_negative_candidate_crops_per_image_when_balancing: 1
+  random_crops_per_negative_image_when_balancing: 1
+  bbox_safe_random_crops_per_negative_image_when_balancing: 1
+  bbox_safe_boundary_margin_fraction: 0.02
+```
+
+This means the exporter keeps one mass-centered crop candidate per annotation, then globally samples clean crops to reach the requested target mass-positive crop ratio. Clean crops can come from no-mass images as well as clean windows from finding images.
+
+The contralateral source path is faster now. Instead of shifting the whole opposite mammogram tensor and then cropping it, the exporter estimates and caches a vertical shift, then takes the same crop from an adjusted y-window. This preserves the same aligned crop behavior while avoiding a large full-image copy for every pair.
