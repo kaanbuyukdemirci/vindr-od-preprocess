@@ -1391,3 +1391,46 @@ image_export:
 ```
 
 `method: projection_y` is included as an explicit placeholder. It currently leaves the opposite image unchanged and records `projection_intensity_alignment_placeholder_not_implemented` in the debug metadata.
+
+## v53 notes: profile-based contralateral source alignment
+
+This version upgrades `source: contralateral_same_view_crop` alignment from a single nipple-y rule to multiple implemented vertical alignment methods.
+
+The new default is:
+
+```yaml
+image_export:
+  contralateral_source_alignment:
+    enabled: true
+    method: hybrid_profile_y
+    fallback_method: nipple_y
+    projection_smooth_rows: 51
+    boundary_smooth_rows: 31
+    max_shift_fraction: 0.20
+    min_profile_overlap_fraction: 0.60
+    min_profile_score: 0.05
+    profile_score_margin: 0.03
+    max_profile_nipple_disagreement_fraction: 0.05
+```
+
+Available methods:
+
+- `hybrid_profile_y`: default. Computes row-projection, boundary-profile, nipple-y, and centroid-y candidate shifts. It usually chooses `row_projection_y`, because that uses the full vertical foreground distribution. If the profile match is weak, it falls back to `nipple_y` or `mask_centroid_y`.
+- `row_projection_y`: builds a 1D profile where each row value is the number of breast-foreground pixels in that row. It then searches for the vertical shift with the best normalized correlation.
+- `boundary_profile_y`: builds a 1D profile from the outer breast boundary row by row, then aligns that shape profile.
+- `nipple_y`: previous v52 method. It estimates the nipple/tip row from the foreground boundary and aligns those rows.
+- `mask_centroid_y`: aligns the vertical centroid of the breast foreground mask.
+- `intensity_projection_y`: row-sum intensity profile matching. This is now implemented, but it is not the default because intensity differences across vendors/windowing can make it less stable than foreground-mask profiles.
+
+The exporter and GUI write debug metadata such as:
+
+```text
+contralateral_alignment_method
+contralateral_alignment_selected_method
+contralateral_alignment_selection_reason
+contralateral_alignment_shift_y
+contralateral_alignment_candidates
+contralateral_alignment_warning
+```
+
+For example, with `method: hybrid_profile_y`, the debug fields may show that `row_projection_y` was selected, the shift was `-58` pixels, and nipple-y estimated `-65` pixels. If the profile and nipple estimates disagree too much, the profile shift is still used but a warning is recorded.

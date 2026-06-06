@@ -1,6 +1,6 @@
 paths:
   data_root: /mnt/t9/vindr
-  output_root: /mnt/t9/preprocessed-vindr-v52
+  output_root: /mnt/t9/preprocessed-vindr-v53
 runtime:
   show_progress: true
 image:
@@ -39,13 +39,21 @@ image_export:
     gradient_ksize: 3
   contralateral_source_alignment:
     enabled: true
-    method: nipple_y
+    method: hybrid_profile_y
+    fallback_method: nipple_y
     threshold: null
     tip_side: auto
     tip_tolerance_fraction: 0.006
     tip_tolerance_px: null
     smooth_rows: 31
+    projection_smooth_rows: 51
+    boundary_smooth_rows: 31
     max_shift_fraction: 0.2
+    min_profile_overlap_fraction: 0.6
+    min_profile_score: 0.05
+    profile_score_margin: 0.03
+    max_profile_nipple_disagreement_fraction: 0.05
+    max_profile_nipple_disagreement_px: null
     pad_value: 0.0
   custom_channel_pipeline:
     R:
@@ -152,7 +160,7 @@ crop_annotation_policy:
 dataset:
   validate_paths: false
 visualizations:
-  output_dir: /mnt/t9/preprocessed-vindr-v52/visualizations
+  output_dir: /mnt/t9/preprocessed-vindr-v53/visualizations
   include_square_crops: true
   include_baseline_uncropped: true
   write_html_report: true

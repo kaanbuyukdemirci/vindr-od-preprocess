@@ -1532,36 +1532,63 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     with st.sidebar.expander("Opposite-breast source alignment", expanded=False):
         st.caption(
             "Used only when an RGB channel source is 'opposite breast, same view, same xyxy crop'. "
-            "The paired full preprocessed image is shifted vertically first, then the same crop window is extracted."
+            "The paired full preprocessed image is shifted vertically first, then the same crop window is extracted. "
+            "The default hybrid method compares the vertical breast foreground distribution and keeps nipple-y as a fallback."
         )
         align_enabled = st.checkbox(
-            "Enable nipple-y alignment for opposite-breast source",
+            "Enable opposite-breast vertical alignment",
             value=bool(align_cfg.get("enabled", True)),
             key=_widget_key("contralateral_align_enabled"),
             help=(
-                "Example: if the right breast nipple is 40 pixels lower than the left breast nipple after mirroring, "
-                "the opposite source is shifted up/down so the nipple y locations match before the same xyxy crop is taken."
+                "Example: if the opposite breast appears 50 pixels lower, the full opposite image is shifted up/down before "
+                "the same xyxy crop is taken. This affects only channels using source=contralateral_same_view_crop."
             ),
         )
         method_options = {
-            "nipple_y": "nipple-y from foreground tip (implemented)",
-            "projection_y": "intensity projection matching (placeholder)",
+            "hybrid_profile_y": "hybrid profile-y, best default",
+            "row_projection_y": "foreground row distribution",
+            "boundary_profile_y": "outer boundary profile",
+            "nipple_y": "nipple-y foreground tip",
+            "mask_centroid_y": "foreground centroid-y",
+            "intensity_projection_y": "intensity row projection",
             "none": "none",
         }
-        default_method = str(align_cfg.get("method", "nipple_y") or "nipple_y").strip().casefold()
+        default_method = str(align_cfg.get("method", "hybrid_profile_y") or "hybrid_profile_y").strip().casefold()
+        if default_method in {"projection_y", "projection", "intensity_projection", "projection_intensity"}:
+            default_method = "intensity_projection_y"
         if default_method not in method_options:
-            default_method = "nipple_y"
+            default_method = "hybrid_profile_y"
         method_label = st.selectbox(
             "Alignment method",
             options=list(method_options.values()),
             index=list(method_options.keys()).index(default_method),
             key=_widget_key("contralateral_align_method"),
             help=(
-                "nipple-y uses the breast foreground mask and the furthest foreground tip as a nipple estimate. "
-                "projection matching is listed as a placeholder for a future, more expensive intensity-profile method."
+                "Best default: hybrid profile-y. It estimates several shifts and usually chooses the foreground row-distribution "
+                "match. If that match is weak, it falls back to nipple-y or centroid-y. "
+                "Example: row_projection_y compares how much breast foreground exists at each image row."
             ),
         )
         align_method = {v: k for k, v in method_options.items()}[method_label]
+        fallback_options = {
+            "nipple_y": "nipple-y fallback",
+            "mask_centroid_y": "centroid-y fallback",
+            "row_projection_y": "row-distribution fallback",
+            "none": "none",
+        }
+        default_fallback = str(align_cfg.get("fallback_method", "nipple_y") or "nipple_y").strip().casefold()
+        if default_fallback not in fallback_options:
+            default_fallback = "nipple_y"
+        fallback_label = st.selectbox(
+            "Fallback method for hybrid",
+            options=list(fallback_options.values()),
+            index=list(fallback_options.keys()).index(default_fallback),
+            key=_widget_key("contralateral_align_fallback_method"),
+            help=(
+                "Used only when the hybrid profile match is too weak. Example: nipple-y fallback uses the estimated nipple row."
+            ),
+        )
+        fallback_method = {v: k for k, v in fallback_options.items()}[fallback_label]
         max_shift_fraction = st.slider(
             "Maximum vertical shift fraction",
             min_value=0.0,
@@ -1571,6 +1598,62 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
             key=_widget_key("contralateral_align_max_shift_fraction"),
             help="Example: 0.20 on a 3000-pixel-high image allows at most 600 pixels of vertical shifting.",
         )
+        min_profile_overlap_fraction = st.slider(
+            "Minimum profile overlap fraction",
+            min_value=0.10,
+            max_value=0.95,
+            value=float(align_cfg.get("min_profile_overlap_fraction", 0.60)),
+            step=0.05,
+            key=_widget_key("contralateral_align_min_profile_overlap_fraction"),
+            help=(
+                "For profile matching, this is the minimum shared vertical breast-profile support required for a tested shift. "
+                "Example: 0.60 means a shift is ignored if too little of the two profiles overlaps."
+            ),
+        )
+        min_profile_score = st.slider(
+            "Minimum profile match score",
+            min_value=-1.0,
+            max_value=1.0,
+            value=float(align_cfg.get("min_profile_score", 0.05)),
+            step=0.01,
+            key=_widget_key("contralateral_align_min_profile_score"),
+            help=(
+                "Normalized correlation threshold for accepting a profile match. 1 is perfect, 0 is weak/no linear match. "
+                "Example: if the best score is below 0.05, hybrid uses the fallback method."
+            ),
+        )
+        profile_score_margin = st.slider(
+            "Row-vs-boundary score margin",
+            min_value=0.0,
+            max_value=0.25,
+            value=float(align_cfg.get("profile_score_margin", 0.03)),
+            step=0.01,
+            key=_widget_key("contralateral_align_profile_score_margin"),
+            help=(
+                "Hybrid usually prefers row-distribution alignment. Boundary-profile alignment must beat it by this margin to be selected. "
+                "Example: 0.03 prevents tiny score differences from switching methods."
+            ),
+        )
+        projection_smooth_rows = int(st.number_input(
+            "Row-distribution smoothing rows",
+            min_value=1,
+            max_value=301,
+            value=int(align_cfg.get("projection_smooth_rows", 51) or 51),
+            step=2,
+            key=_widget_key("contralateral_align_projection_smooth_rows"),
+            help=(
+                "Smooths the vertical foreground row-count profile before matching. Example: 51 rows reduces small mask noise."
+            ),
+        ))
+        boundary_smooth_rows = int(st.number_input(
+            "Boundary profile smoothing rows",
+            min_value=1,
+            max_value=201,
+            value=int(align_cfg.get("boundary_smooth_rows", align_cfg.get("smooth_rows", 31)) or 31),
+            step=2,
+            key=_widget_key("contralateral_align_boundary_smooth_rows"),
+            help="Smooths the outer breast boundary profile before matching or nipple-tip estimation. Example: 31 rows.",
+        ))
         tip_tolerance_fraction = st.slider(
             "Nipple-tip row tolerance fraction",
             min_value=0.001,
@@ -1583,24 +1666,35 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
                 "Example: 0.006 on a 3000-pixel-wide image means rows within about 18 pixels of the tip x can vote."
             ),
         )
-        smooth_rows = int(st.number_input(
-            "Boundary profile smoothing rows",
-            min_value=1,
-            max_value=201,
-            value=int(align_cfg.get("smooth_rows", 31) or 31),
-            step=2,
-            key=_widget_key("contralateral_align_smooth_rows"),
-            help="Odd row-window used to smooth the foreground boundary before selecting the nipple-tip row. Example: 31 rows.",
-        ))
+        max_profile_nipple_disagreement_fraction = st.slider(
+            "Profile/nipple disagreement warning fraction",
+            min_value=0.0,
+            max_value=0.25,
+            value=float(align_cfg.get("max_profile_nipple_disagreement_fraction", 0.05)),
+            step=0.01,
+            key=_widget_key("contralateral_align_disagreement_fraction"),
+            help=(
+                "Hybrid still uses the profile shift, but records a warning if it disagrees strongly with nipple-y. "
+                "Example: 0.05 on a 3000-pixel image warns when they differ by more than 150 pixels."
+            ),
+        )
         contralateral_source_alignment = {
             "enabled": bool(align_enabled),
             "method": str(align_method),
+            "fallback_method": str(fallback_method),
             "threshold": align_cfg.get("threshold", None),
             "tip_side": str(align_cfg.get("tip_side", "auto") or "auto"),
             "tip_tolerance_fraction": float(tip_tolerance_fraction),
             "tip_tolerance_px": align_cfg.get("tip_tolerance_px", None),
-            "smooth_rows": int(smooth_rows),
+            "smooth_rows": int(boundary_smooth_rows),
+            "projection_smooth_rows": int(projection_smooth_rows),
+            "boundary_smooth_rows": int(boundary_smooth_rows),
             "max_shift_fraction": float(max_shift_fraction),
+            "min_profile_overlap_fraction": float(min_profile_overlap_fraction),
+            "min_profile_score": float(min_profile_score),
+            "profile_score_margin": float(profile_score_margin),
+            "max_profile_nipple_disagreement_fraction": float(max_profile_nipple_disagreement_fraction),
+            "max_profile_nipple_disagreement_px": align_cfg.get("max_profile_nipple_disagreement_px", None),
             "pad_value": float(align_cfg.get("pad_value", 0.0)),
         }
 
