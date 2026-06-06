@@ -42,6 +42,7 @@ from .crops import (
     window_has_positive_mass,
 )
 from .dataset import VindrMammoDataset
+from .preprocessing import align_contralateral_image_to_reference
 
 CLASS_NAMES = ["mass"]
 COCO_CATEGORIES = [{"id": 1, "name": "mass", "supercategory": "lesion"}]
@@ -540,13 +541,17 @@ def export_square_crop_datasets(
         rel_img_path = Path("images") / split_name / filename
         source_arrays = None
         if needs_contralateral:
-            source_arrays = _contralateral_source_arrays_for_window(
+            source_arrays, alignment_info = _contralateral_source_arrays_for_window(
                 record=record,
+                reference_image=image,
                 window=window,
                 crop_options=common_crop_options,
                 contralateral_lookup=contralateral_lookup,
                 get_preprocessed=get_preprocessed,
+                config=config,
             )
+            if alignment_info:
+                extra_info = {**extra_info, **alignment_info}
         save_info = _save_export_images(crop_result.image, crop_root, rel_img_path, config, source_arrays=source_arrays)
 
         labels_path = crop_root / "labels" / split_name / f"{Path(filename).stem}.txt"
@@ -1047,24 +1052,38 @@ def _build_contralateral_record_lookup(records: list[dict[str, Any]]) -> dict[st
 def _contralateral_source_arrays_for_window(
     *,
     record: dict[str, Any],
+    reference_image: torch.Tensor,
     window: tuple[int, int, int, int],
     crop_options: dict[str, Any],
     contralateral_lookup: dict[str, dict[str, Any]],
     get_preprocessed,
-) -> dict[str, np.ndarray]:
+    config: dict[str, Any],
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     paired_record = contralateral_lookup.get(str(record.get("image_id", "")))
     if paired_record is None:
-        return {}
+        return {}, {"contralateral_alignment_requested": True, "contralateral_alignment_found_pair": False}
     paired_image, _paired_target = get_preprocessed(paired_record)
+    align_options = dict((config.get("image_export", {}) or {}).get("contralateral_source_alignment", {}) or {})
+    paired_image_aligned, alignment_info = align_contralateral_image_to_reference(
+        reference_image,
+        paired_image,
+        options=align_options,
+    )
+    alignment_info = {
+        "contralateral_alignment_requested": True,
+        "contralateral_alignment_found_pair": True,
+        "contralateral_image_id": str(paired_record.get("image_id", "")),
+        **alignment_info,
+    }
     empty_boxes = torch.zeros((0, 4), dtype=torch.float32)
     paired_crop = crop_image_and_boxes_to_window(
-        paired_image,
+        paired_image_aligned,
         boxes=empty_boxes,
         mass_boxes=empty_boxes,
         window_xyxy=window,
         options=crop_options,
     )
-    return {"contralateral_same_view_crop": _tensor_to_float2d(paired_crop.image)}
+    return {"contralateral_same_view_crop": _tensor_to_float2d(paired_crop.image)}, alignment_info
 
 
 def export_baseline_dataset(

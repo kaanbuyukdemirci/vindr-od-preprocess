@@ -38,6 +38,7 @@ from .crops import (
 )
 from .dataset import VindrMammoDataset
 from .export import export_from_config, load_export_config, make_train_val_test_split
+from .preprocessing import align_contralateral_image_to_reference
 from .visualize import create_visualizations_from_export
 
 
@@ -748,6 +749,7 @@ def _manifest_diff_rows(prev: dict[str, Any], cur: dict[str, Any], pair_index: i
         ("R_pipeline", ["config_snapshot", "image_export", "custom_channel_pipeline", "R"]),
         ("G_pipeline", ["config_snapshot", "image_export", "custom_channel_pipeline", "G"]),
         ("B_pipeline", ["config_snapshot", "image_export", "custom_channel_pipeline", "B"]),
+        ("contralateral_source_alignment", ["config_snapshot", "image_export", "contralateral_source_alignment"]),
         ("square_crops_config", ["config_snapshot", "square_crops"]),
         ("crop_annotation_policy", ["config_snapshot", "crop_annotation_policy"]),
     ]
@@ -864,6 +866,7 @@ def _current_preprocessing_yaml_payload(
             "center_shift_fraction": crop_options.get("center_shift_fraction"),
             "allow_partial_annotations": crop_options.get("allow_partial_annotations"),
             "min_box_visibility": crop_options.get("min_box_visibility"),
+            "contralateral_source_alignment": dict(crop_controls.get("contralateral_source_alignment", {}) or {}),
         },
         "display_debug_settings": {
             "visible_rgb_channels": list(display_controls.get("visible_channels", ["R", "G", "B"]) or []),
@@ -873,7 +876,7 @@ def _current_preprocessing_yaml_payload(
             "description": (
                 "Each channel has a source crop plus an ordered operation list. "
                 "source=current_crop uses the selected crop. "
-                "source=contralateral_same_view_crop uses the same xyxy window from the opposite breast with the same view."
+                "source=contralateral_same_view_crop uses the same xyxy window from the opposite breast with the same view. If enabled, the opposite full image is vertically nipple-aligned before taking that same xyxy crop."
             ),
             "R": _pipeline_channel_payload(pipeline, "R"),
             "G": _pipeline_channel_payload(pipeline, "G"),
@@ -899,6 +902,7 @@ def _current_preprocessing_yaml_payload(
             },
             "image_export": {
                 "rgb_scheme": "custom_channel_pipeline",
+                "contralateral_source_alignment": dict(crop_controls.get("contralateral_source_alignment", {}) or {}),
                 "custom_channel_pipeline": {
                     "R": _pipeline_channel_payload(pipeline, "R"),
                     "G": _pipeline_channel_payload(pipeline, "G"),
@@ -1523,6 +1527,83 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
             help="Shows which crop pixels counted as breast foreground.",
         )
 
+    image_export_cfg = cfg.get("image_export", {}) or {}
+    align_cfg = dict(image_export_cfg.get("contralateral_source_alignment", {}) or {})
+    with st.sidebar.expander("Opposite-breast source alignment", expanded=False):
+        st.caption(
+            "Used only when an RGB channel source is 'opposite breast, same view, same xyxy crop'. "
+            "The paired full preprocessed image is shifted vertically first, then the same crop window is extracted."
+        )
+        align_enabled = st.checkbox(
+            "Enable nipple-y alignment for opposite-breast source",
+            value=bool(align_cfg.get("enabled", True)),
+            key=_widget_key("contralateral_align_enabled"),
+            help=(
+                "Example: if the right breast nipple is 40 pixels lower than the left breast nipple after mirroring, "
+                "the opposite source is shifted up/down so the nipple y locations match before the same xyxy crop is taken."
+            ),
+        )
+        method_options = {
+            "nipple_y": "nipple-y from foreground tip (implemented)",
+            "projection_y": "intensity projection matching (placeholder)",
+            "none": "none",
+        }
+        default_method = str(align_cfg.get("method", "nipple_y") or "nipple_y").strip().casefold()
+        if default_method not in method_options:
+            default_method = "nipple_y"
+        method_label = st.selectbox(
+            "Alignment method",
+            options=list(method_options.values()),
+            index=list(method_options.keys()).index(default_method),
+            key=_widget_key("contralateral_align_method"),
+            help=(
+                "nipple-y uses the breast foreground mask and the furthest foreground tip as a nipple estimate. "
+                "projection matching is listed as a placeholder for a future, more expensive intensity-profile method."
+            ),
+        )
+        align_method = {v: k for k, v in method_options.items()}[method_label]
+        max_shift_fraction = st.slider(
+            "Maximum vertical shift fraction",
+            min_value=0.0,
+            max_value=0.50,
+            value=float(align_cfg.get("max_shift_fraction", 0.20)),
+            step=0.01,
+            key=_widget_key("contralateral_align_max_shift_fraction"),
+            help="Example: 0.20 on a 3000-pixel-high image allows at most 600 pixels of vertical shifting.",
+        )
+        tip_tolerance_fraction = st.slider(
+            "Nipple-tip row tolerance fraction",
+            min_value=0.001,
+            max_value=0.050,
+            value=float(align_cfg.get("tip_tolerance_fraction", 0.006)),
+            step=0.001,
+            key=_widget_key("contralateral_align_tip_tolerance_fraction"),
+            help=(
+                "Rows whose foreground boundary is very close to the furthest x tip are averaged. "
+                "Example: 0.006 on a 3000-pixel-wide image means rows within about 18 pixels of the tip x can vote."
+            ),
+        )
+        smooth_rows = int(st.number_input(
+            "Boundary profile smoothing rows",
+            min_value=1,
+            max_value=201,
+            value=int(align_cfg.get("smooth_rows", 31) or 31),
+            step=2,
+            key=_widget_key("contralateral_align_smooth_rows"),
+            help="Odd row-window used to smooth the foreground boundary before selecting the nipple-tip row. Example: 31 rows.",
+        ))
+        contralateral_source_alignment = {
+            "enabled": bool(align_enabled),
+            "method": str(align_method),
+            "threshold": align_cfg.get("threshold", None),
+            "tip_side": str(align_cfg.get("tip_side", "auto") or "auto"),
+            "tip_tolerance_fraction": float(tip_tolerance_fraction),
+            "tip_tolerance_px": align_cfg.get("tip_tolerance_px", None),
+            "smooth_rows": int(smooth_rows),
+            "max_shift_fraction": float(max_shift_fraction),
+            "pad_value": float(align_cfg.get("pad_value", 0.0)),
+        }
+
     crop_options = {
         "enabled": True,
         "mode": "bbox_safe_random" if crop_mode == "bbox-safe breast-biased random" else ("random" if crop_mode == "stochastic random" else "deterministic"),
@@ -1565,6 +1646,7 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         "bbox_safe_left_bias_strength": float(bbox_safe_left_bias_strength),
         "bbox_safe_projection_bias_strength": float(bbox_safe_projection_bias_strength),
         "crop_options": crop_options,
+        "contralateral_source_alignment": contralateral_source_alignment,
     }
 
 
@@ -2319,6 +2401,7 @@ def _build_gui_export_config(
     }
     out["image_export"] = dict(out.get("image_export", {}) or {})
     out["image_export"]["rgb_scheme"] = "custom_channel_pipeline"
+    out["image_export"]["contralateral_source_alignment"] = dict(crop_controls.get("contralateral_source_alignment", {}) or {})
     out["image_export"]["custom_channel_pipeline"] = {
         "R": _pipeline_channel_payload(pipeline, "R"),
         "G": _pipeline_channel_payload(pipeline, "G"),
@@ -3226,10 +3309,16 @@ def _prepare_sample(
         if contralateral_index is not None:
             paired = _read_preprocessed_cached(dataset, _dataset_cache_key(dataset), int(contralateral_index))
             paired_image = paired["image"]
-            image_tensor = torch.from_numpy(np.ascontiguousarray(paired_image)).unsqueeze(0)
+            reference_tensor = torch.from_numpy(np.ascontiguousarray(image)).unsqueeze(0)
+            moving_tensor = torch.from_numpy(np.ascontiguousarray(paired_image)).unsqueeze(0)
+            aligned_tensor, alignment_info = align_contralateral_image_to_reference(
+                reference_tensor,
+                moving_tensor,
+                options=dict(crop_controls.get("contralateral_source_alignment", {}) or {}),
+            )
             empty_boxes = torch.zeros((0, 4), dtype=torch.float32)
             paired_crop_result = crop_image_and_boxes_to_window(
-                image_tensor,
+                aligned_tensor,
                 boxes=empty_boxes,
                 mass_boxes=empty_boxes,
                 window_xyxy=selected["window"],
@@ -3242,6 +3331,7 @@ def _prepare_sample(
                 "image_id": paired_summary.get("image_id"),
                 "laterality": paired_summary.get("laterality"),
                 "view_position": paired_summary.get("view_position"),
+                "alignment": alignment_info,
             })
         else:
             # Keep the display/export robust. The metadata makes the fallback explicit.
@@ -3353,6 +3443,8 @@ def _show_sample(
         stat_df = _stats_table(full, crop, processed_rgb)
         st.dataframe(stat_df, use_container_width=True)
         meta_payload = _compact_metadata(result["target_summary"], processing_meta)
+        if result.get("contralateral_info"):
+            meta_payload["contralateral_source"] = result.get("contralateral_info")
         if bool(result.get("showing_failed_crop", False)):
             meta_payload["failed_crop_preview"] = {
                 "reason": str(selected.get("failure_reason", "unknown")),

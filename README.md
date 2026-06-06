@@ -1367,3 +1367,27 @@ square_crops:
 ```
 
 With this enabled, if no crop can keep the visible annotations fully inside the safe inner region, the exporter skips that crop instead of writing a fallback. The exporter also performs a final validation on the actual crop-coordinate boxes before saving labels. This prevents annotations from touching or entering the forbidden boundary band.
+
+## v52 notes: contralateral source nipple-y alignment
+
+This version adds vertical alignment for the custom RGB source `contralateral_same_view_crop`, shown in the GUI as `opposite breast, same view, same xyxy crop`.
+
+When enabled, the exporter and GUI estimate the nipple y location from the breast foreground boundary in the current image and the opposite-breast image. The opposite full preprocessed image is shifted up or down so the two estimated nipple y locations match. After that shift, the same `xyxy` crop window is extracted from the opposite breast.
+
+The default alignment config is:
+
+```yaml
+image_export:
+  contralateral_source_alignment:
+    enabled: true
+    method: nipple_y
+    threshold: null
+    tip_side: auto
+    tip_tolerance_fraction: 0.006
+    tip_tolerance_px: null
+    smooth_rows: 31
+    max_shift_fraction: 0.20
+    pad_value: 0.0
+```
+
+`method: projection_y` is included as an explicit placeholder. It currently leaves the opposite image unchanged and records `projection_intensity_alignment_placeholder_not_implemented` in the debug metadata.

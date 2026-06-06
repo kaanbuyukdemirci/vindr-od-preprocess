@@ -1,140 +1,132 @@
-# VinDr-Mammo export configuration
-# Edit this file, then run main.py from the VSCode Run button.
-
 paths:
-  # Folder containing metadata.csv, breast-level_annotations.csv,
-  # finding_annotations.csv, and images/<study_id>/<image_id>.dicom
-  data_root: "/mnt/t9/vindr"
-
-  # All exported images, labels, COCO JSON files, stats, and metadata are saved here.
-  output_root: "/mnt/t9/preprocessed-vindr-v51"
-
+  data_root: /mnt/t9/vindr
+  output_root: /mnt/t9/preprocessed-vindr-v52
 runtime:
   show_progress: true
-
 image:
-  # "none" keeps the post-modality-LUT DICOM numeric values until export-time
-  # windowing. This is better when you also save preserved 16-bit PNGs.
-  # You can use "minmax" or "percentile" for quicker visual/debug exports.
-  normalize: "none"
-  percentile_range: [0.5, 99.5]
+  normalize: none
+  percentile_range:
+  - 0.5
+  - 99.5
   use_voi_lut: false
-
 preprocess:
-  # These are applied before both baseline and square-crop exports.
   invert_to_black_background: true
-  crop_breast: true
+  crop_breast: false
   mirror_right_to_left: true
   crop_padding: 20
   crop_threshold: null
-
+  min_component_area_fraction: 0.001
 image_export:
-  # Training images saved under images/<split> are always RGB PNGs.
-  # Recommended current experiment: "intensity_equalized_gradient".
-  # Other options: "multi_window", "grayscale_rgb", "equalized_rgb", "bitpack16".
-  # bitpack16 is available for experiments but is not recommended for YOLO/MMDetection.
-  rgb_scheme: "intensity_equalized_gradient"
-
-  # For multi_window, each RGB channel is made from a different percentile window
-  # computed over foreground/breast pixels after preprocessing and square cropping.
-  # R: wide/global contrast, G: narrower tissue contrast, B: narrow lesion/local contrast.
+  rgb_scheme: custom_channel_pipeline
   multi_window_percentiles:
-    - [0.5, 99.5]
-    - [1.0, 99.0]
-    - [2.0, 98.0]
-
-  # Used by grayscale_rgb, equalized_rgb, and as a fallback for
-  # intensity_equalized_gradient.
-  single_window: [1.0, 99.0]
-
-  # Used when rgb_scheme = "intensity_equalized_gradient".
-  # R = normal intensity window, G = histogram-equalized version of R,
-  # B = Sobel gradient magnitude. This is a useful CNN representation,
-  # while preserved_16bit remains the true depth-preserving image.
+  - - 0.5
+    - 99.5
+  - - 1.0
+    - 99.0
+  - - 2.0
+    - 98.0
+  single_window:
+  - 1.0
+  - 99.0
   intensity_equalized_gradient:
-    intensity_window: [1.0, 99.0]
-    gradient_source: "normal"     # "normal" or "equalized"
-    gradient_window: [1.0, 99.0]
+    intensity_window:
+    - 1.0
+    - 99.0
+    gradient_source: normal
+    gradient_window:
+    - 1.0
+    - 99.0
     gradient_ksize: 3
-
+  contralateral_source_alignment:
+    enabled: true
+    method: nipple_y
+    threshold: null
+    tip_side: auto
+    tip_tolerance_fraction: 0.006
+    tip_tolerance_px: null
+    smooth_rows: 31
+    max_shift_fraction: 0.2
+    pad_value: 0.0
+  custom_channel_pipeline:
+    R:
+      source: current_crop
+      steps:
+      - op: percentile_normalize
+        params:
+          percentiles:
+          - 0.0
+          - 100.0
+      - op: hist_equalize
+        params: {}
+    G:
+      source: current_crop
+      steps:
+      - op: percentile_normalize
+        params:
+          percentiles:
+          - 0.0
+          - 100.0
+      - op: hist_equalize
+        params: {}
+      - op: clahe
+        params:
+          clip_limit: 8.0
+          tile_grid_size: 8
+    B:
+      source: contralateral_same_view_crop
+      steps:
+      - op: percentile_normalize
+        params:
+          percentiles:
+          - 0.0
+          - 100.0
+      - op: hist_equalize
+        params: {}
 histogram_equalization:
-  # Simple histogram equalization on the 8-bit training RGB image channels.
-  # For rgb_scheme="intensity_equalized_gradient", the second channel is always
-  # equalized by the scheme, so this global post-equalization is skipped.
   enabled: true
-  # Options: "all_channels", "third_channel", "none".
-  apply_to: "third_channel"
-
+  apply_to: third_channel
 preserved_16bit:
-  # Saves a separate 16-bit grayscale PNG for each exported sample under
-  # preserved_16bit/<split>. Use this for data integrity/debugging, not YOLO input.
   save: true
-  percentile_range: [0.1, 99.9]
+  percentile_range:
+  - 0.1
+  - 99.9
   use_foreground_mask: true
-
 metadata:
-  # Copies the full source CSVs and saves per-exported-sample metadata JSONL/CSV.
   save_full_source_csvs: true
   include_dicom_meta: true
-
 splits:
-  # VinDr-Mammo already has official training/test. This keeps official test as test,
-  # then splits official training studies into train and val.
   val_fraction_from_training: 0.15
   seed: 123
-
 export:
-  # true deletes G:/preprocessed-vindr before exporting. Keep false unless you are sure.
   clean_output_root: false
   save_square_crops: true
   save_baseline_uncropped: false
   save_empty_label_files: true
-
 square_crops:
-  # Final n x n object-detection crops. This is applied after the preprocessing above.
   crop_size: 1024
   stride: 512
-
-  # Crop proposal mode per split. Options:
-  #   deterministic: normal sliding-window grid
-  #   random: stochastic mass-centered crops
-  #   bbox_safe_random: stochastic crops around annotations, rejecting crops where
-  #     visible boxes are near crop boundaries and preferring breast-rich windows
-  train_crop_mode: "random"
-  val_crop_mode: "deterministic"
-  test_crop_mode: "deterministic"
-
-  # Training split uses random crops. Validation and test use deterministic sliding crops.
-  # random_crops_per_annotation=5 means each mass annotation creates five positive
-  # training crop attempts centered near that mass, with random shifts.
+  train_crop_mode: bbox_safe_random
+  val_crop_mode: bbox_safe_random
+  test_crop_mode: bbox_safe_random
   random_crops_per_annotation: 5
-
-  # Export class-balance defaults. 0.50 means approximately 50% mass-positive crops
-  # and 50% empty/non-mass crops. The GUI export panel is now the single place to
-  # change this per split. These YAML fields are the command-line/default fallback.
   balance_train_positive_fraction_globally: true
   random_crops_per_negative_image_when_balancing: 0
   random_crops_per_negative_image: 1
-  positive_fraction: 0.50
-  train_positive_fraction: 0.50
-  val_positive_fraction: 0.50
-  test_positive_fraction: 0.50
-  train_bbox_safe_positive_fraction: 0.50
-  val_bbox_safe_positive_fraction: 0.50
-  test_bbox_safe_positive_fraction: 0.50
-  train_deterministic_selection_mode: "positive_ratio"
-  val_deterministic_selection_mode: "positive_ratio"
-  test_deterministic_selection_mode: "positive_ratio"
-  train_deterministic_target_positive_ratio: 0.50
-  val_deterministic_target_positive_ratio: 0.50
-  test_deterministic_target_positive_ratio: 0.50
+  positive_fraction: 0.5
+  train_positive_fraction: 0.5
+  val_positive_fraction: 0.5
+  test_positive_fraction: 0.5
+  train_bbox_safe_positive_fraction: 0.5
+  val_bbox_safe_positive_fraction: 0.5
+  test_bbox_safe_positive_fraction: 0.5
+  train_deterministic_selection_mode: positive_ratio
+  val_deterministic_selection_mode: positive_ratio
+  test_deterministic_selection_mode: positive_ratio
+  train_deterministic_target_positive_ratio: 0.5
+  val_deterministic_target_positive_ratio: 0.5
+  test_deterministic_target_positive_ratio: 0.5
   center_shift_fraction: 0.25
   max_random_tries: 80
-
-  # BBox-safe breast-biased random crop options. Used when any split has
-  # *_crop_mode: "bbox_safe_random". boundary_margin_fraction=0.15 means visible
-  # annotations must be fully inside the central 70% of the crop, not in the
-  # outer 15% boundary margin.
   bbox_safe_boundary_margin_fraction: 0.15
   bbox_safe_random_shift_fraction: 0.35
   bbox_safe_candidate_count: 120
@@ -143,39 +135,25 @@ square_crops:
   bbox_safe_left_bias_strength: 0.25
   bbox_safe_projection_bias_strength: 0.25
   bbox_safe_foreground_threshold: null
-
-  # Hard safety gate. If true, bbox_safe_random crops that cannot satisfy the
-  # boundary rule are skipped instead of exported as fallback crops.
   bbox_safe_skip_unsafe_fallbacks: true
   seed: 123
-
-  # Validation/test deterministic crop options.
   deterministic_include_empty: true
   deterministic_max_windows_per_image: null
-
-  # If a breast-cropped image is smaller than 1024 in either direction, pad it.
   pad_if_needed: true
   pad_value: 0.0
-
+  deterministic_require_foreground: false
+  deterministic_min_foreground_fraction: 0.05
+  deterministic_foreground_threshold: null
 crop_annotation_policy:
-  # false means a mass annotation is kept only when the complete box is inside the crop.
-  # true means cut boxes are clipped and kept when the visible fraction is high enough.
-  allow_partial_annotations: false
-  min_box_visibility: 0.30
-  reject_partial_windows: true
+  allow_partial_annotations: true
+  min_box_visibility: 0.3
+  reject_partial_windows: false
   negative_max_box_visibility: 0.0
-
 dataset:
   validate_paths: false
-
-
 visualizations:
-  # Fast plots from the already exported CSV/JSON files. This does not read DICOMs
-  # and does not regenerate crops. Run visualize_export.py from the VSCode Run button.
-  output_dir: "/mnt/t9/preprocessed-vindr-v51/visualizations"
+  output_dir: /mnt/t9/preprocessed-vindr-v52/visualizations
   include_square_crops: true
   include_baseline_uncropped: true
   write_html_report: true
-
-  # Optional debug limit for huge samples.csv files. Keep null for exact plots.
   max_rows_per_samples_csv: null
