@@ -1545,28 +1545,28 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
             ),
         )
         method_options = {
-            "hybrid_profile_y": "hybrid profile-y, best default",
-            "row_projection_y": "foreground row distribution",
+            "nipple_y": "nipple-y foreground tip, fast default",
+            "row_projection_y": "foreground row distribution, balanced",
+            "hybrid_profile_y": "hybrid profile-y, slower debug",
             "boundary_profile_y": "outer boundary profile",
-            "nipple_y": "nipple-y foreground tip",
             "mask_centroid_y": "foreground centroid-y",
             "intensity_projection_y": "intensity row projection",
             "none": "none",
         }
-        default_method = str(align_cfg.get("method", "hybrid_profile_y") or "hybrid_profile_y").strip().casefold()
+        default_method = str(align_cfg.get("method", "nipple_y") or "nipple_y").strip().casefold()
         if default_method in {"projection_y", "projection", "intensity_projection", "projection_intensity"}:
             default_method = "intensity_projection_y"
         if default_method not in method_options:
-            default_method = "hybrid_profile_y"
+            default_method = "nipple_y"
         method_label = st.selectbox(
             "Alignment method",
             options=list(method_options.values()),
             index=list(method_options.keys()).index(default_method),
             key=_widget_key("contralateral_align_method"),
             help=(
-                "Best default: hybrid profile-y. It estimates several shifts and usually chooses the foreground row-distribution "
-                "match. If that match is weak, it falls back to nipple-y or centroid-y. "
-                "Example: row_projection_y compares how much breast foreground exists at each image row."
+                "Fast default: nipple-y. It estimates one foreground-tip row and shifts the opposite breast to match it. "
+                "Use row_projection_y for a slower but more global foreground-distribution match. "
+                "Use hybrid_profile_y only for debugging samples because it runs several methods."
             ),
         )
         align_method = {v: k for k, v in method_options.items()}[method_label]
@@ -1576,16 +1576,16 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
             "row_projection_y": "row-distribution fallback",
             "none": "none",
         }
-        default_fallback = str(align_cfg.get("fallback_method", "nipple_y") or "nipple_y").strip().casefold()
+        default_fallback = str(align_cfg.get("fallback_method", "mask_centroid_y") or "mask_centroid_y").strip().casefold()
         if default_fallback not in fallback_options:
-            default_fallback = "nipple_y"
+            default_fallback = "mask_centroid_y"
         fallback_label = st.selectbox(
             "Fallback method for hybrid",
             options=list(fallback_options.values()),
             index=list(fallback_options.keys()).index(default_fallback),
             key=_widget_key("contralateral_align_fallback_method"),
             help=(
-                "Used only when the hybrid profile match is too weak. Example: nipple-y fallback uses the estimated nipple row."
+                "Used when the selected method cannot estimate a shift. Example: centroid-y fallback aligns the vertical center of the breast mask."
             ),
         )
         fallback_method = {v: k for k, v in fallback_options.items()}[fallback_label]
@@ -1593,10 +1593,10 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
             "Maximum vertical shift fraction",
             min_value=0.0,
             max_value=0.50,
-            value=float(align_cfg.get("max_shift_fraction", 0.20)),
+            value=float(align_cfg.get("max_shift_fraction", 0.10)),
             step=0.01,
             key=_widget_key("contralateral_align_max_shift_fraction"),
-            help="Example: 0.20 on a 3000-pixel-high image allows at most 600 pixels of vertical shifting.",
+            help="Example: 0.10 on a 3000-pixel-high image allows at most 300 pixels of vertical shifting. Smaller is faster for profile methods.",
         )
         min_profile_overlap_fraction = st.slider(
             "Minimum profile overlap fraction",
@@ -1638,7 +1638,7 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
             "Row-distribution smoothing rows",
             min_value=1,
             max_value=301,
-            value=int(align_cfg.get("projection_smooth_rows", 51) or 51),
+            value=int(align_cfg.get("projection_smooth_rows", 31) or 31),
             step=2,
             key=_widget_key("contralateral_align_projection_smooth_rows"),
             help=(
@@ -1649,7 +1649,7 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
             "Boundary profile smoothing rows",
             min_value=1,
             max_value=201,
-            value=int(align_cfg.get("boundary_smooth_rows", align_cfg.get("smooth_rows", 31)) or 31),
+            value=int(align_cfg.get("boundary_smooth_rows", align_cfg.get("smooth_rows", 21)) or 21),
             step=2,
             key=_widget_key("contralateral_align_boundary_smooth_rows"),
             help="Smooths the outer breast boundary profile before matching or nipple-tip estimation. Example: 31 rows.",
@@ -2368,6 +2368,28 @@ def _export_dataset_from_gui_panel(
             "controls how many empty random crops are added. For deterministic sliding, it controls which empty windows are sampled."
         )
         selection_payload = _deterministic_selection_controls(crop_cfg, split_crop_modes)
+
+        st.markdown("**Simple export profiler**")
+        runtime_cfg = dict(cfg.get("runtime", {}) or {})
+        simple_profiler_enabled = st.checkbox(
+            "Show simple timing breakdown during export",
+            value=bool(runtime_cfg.get("simple_profiler_enabled", True)),
+            key=_widget_key("gui_export_simple_profiler_enabled"),
+            help=(
+                "Adds very small start/stop timers around coarse export blocks. "
+                "Example rows: preprocessing, crop planning, contralateral source crop, image saving, metadata writing."
+            ),
+        )
+        simple_profiler_emit_every = int(st.number_input(
+            "Profiler GUI update frequency",
+            min_value=1,
+            max_value=200,
+            value=int(runtime_cfg.get("simple_profiler_emit_every", 10)),
+            step=1,
+            key=_widget_key("gui_export_simple_profiler_emit_every"),
+            help="Updates the timing table every N progress updates. Example: 10 gives lower GUI overhead than updating every crop.",
+        ))
+
         confirm = st.checkbox("I checked the output path and want to start export", value=False, key=_widget_key("gui_export_confirm"))
 
         with st.expander("Effective loaded/export settings preview", expanded=False):
@@ -2385,6 +2407,8 @@ def _export_dataset_from_gui_panel(
                     save_baseline=save_baseline,
                     crop_controls=crop_controls,
                     pipeline=pipeline,
+                    simple_profiler_enabled=simple_profiler_enabled,
+                    simple_profiler_emit_every=simple_profiler_emit_every,
                 )
             st.code(yaml.safe_dump(_make_yaml_safe(preview_cfg), sort_keys=False, allow_unicode=True, width=120), language="yaml")
 
@@ -2409,6 +2433,8 @@ def _export_dataset_from_gui_panel(
                     save_baseline=save_baseline,
                     crop_controls=crop_controls,
                     pipeline=pipeline,
+                    simple_profiler_enabled=simple_profiler_enabled,
+                    simple_profiler_emit_every=simple_profiler_emit_every,
                 )
             _run_export_with_streamlit_progress(export_cfg)
 
@@ -2444,6 +2470,8 @@ def _build_gui_export_config(
     save_baseline: bool,
     crop_controls: dict[str, Any],
     pipeline: dict[str, Any],
+    simple_profiler_enabled: bool = True,
+    simple_profiler_emit_every: int = 10,
 ) -> dict[str, Any]:
     out = copy.deepcopy(cfg)
     out.setdefault("paths", {})["output_root"] = str(output_root)
@@ -2451,6 +2479,8 @@ def _build_gui_export_config(
     out.setdefault("export", {})["save_square_crops"] = bool(save_square)
     out.setdefault("export", {})["save_baseline_uncropped"] = bool(save_baseline)
     out.setdefault("export", {})["save_empty_label_files"] = bool(out.get("export", {}).get("save_empty_label_files", True))
+    out.setdefault("runtime", {})["simple_profiler_enabled"] = bool(simple_profiler_enabled)
+    out.setdefault("runtime", {})["simple_profiler_emit_every"] = int(simple_profiler_emit_every)
 
     out["vendor_filter"] = {
         "enabled": bool(selected_vendors),
@@ -2531,8 +2561,11 @@ def _run_export_with_streamlit_progress(export_cfg: dict[str, Any]) -> None:
     progress_bar = st.progress(0.0, text="Export not started yet")
     status_box = st.empty()
     time_box = st.empty()
+    profiler_box = st.empty()
     log_box = st.empty()
     log_lines: list[str] = []
+    live_stage_timings: dict[str, dict[str, Any]] = {}
+    latest_profiler_snapshot: dict[str, Any] = {}
     export_started_at = time.monotonic()
     current_stage_started_at = export_started_at
 
@@ -2565,14 +2598,49 @@ def _run_export_with_streamlit_progress(export_cfg: dict[str, Any]) -> None:
             "Estimated remaining: calculating"
         )
 
+    def _render_live_profiler() -> None:
+        rows: list[dict[str, Any]] = []
+        for stage_name, item in live_stage_timings.items():
+            elapsed = float(item.get("elapsed_seconds", 0.0) or 0.0)
+            rows.append({
+                "block": f"stage: {stage_name.replace('_', ' ')}",
+                "total": _format_duration(elapsed),
+                "seconds": round(elapsed, 3),
+                "count": 1,
+                "avg": _format_duration(elapsed),
+                "max": _format_duration(elapsed),
+                "%": "",
+            })
+        for item in list((latest_profiler_snapshot or {}).get("items", []) or [])[:12]:
+            rows.append({
+                "block": str(item.get("name", "")),
+                "total": _format_duration(float(item.get("total_seconds", 0.0) or 0.0)),
+                "seconds": round(float(item.get("total_seconds", 0.0) or 0.0), 3),
+                "count": int(item.get("count", 0) or 0),
+                "avg": _format_duration(float(item.get("avg_seconds", 0.0) or 0.0)),
+                "max": _format_duration(float(item.get("max_seconds", 0.0) or 0.0)),
+                "%": f"{float(item.get('percent_of_profiled_time', 0.0) or 0.0):.1f}",
+            })
+        if rows:
+            with profiler_box.expander("Timing breakdown, simple profiler", expanded=True):
+                st.dataframe(rows, hide_index=True, use_container_width=True)
+                st.caption("Coarse start/stop timers. Use this to find big bottlenecks without the overhead of a full profiler.")
+
     def update_progress(event: dict[str, Any]) -> None:
-        nonlocal current_stage_started_at
+        nonlocal current_stage_started_at, latest_profiler_snapshot
         stage = str(event.get("stage", ""))
         try:
             stage_idx = active_stages.index(stage)
         except ValueError:
             stage_idx = 0
         event_name = str(event.get("event", ""))
+        if isinstance(event.get("simple_profiler"), dict):
+            latest_profiler_snapshot = dict(event.get("simple_profiler") or {})
+        if event_name in {"stage_finish", "stage_failed"}:
+            live_stage_timings[stage] = {
+                "elapsed_seconds": float(event.get("elapsed_seconds", 0.0) or 0.0),
+                "status": event_name.replace("stage_", ""),
+            }
         frac_inside_stage: float | None = None
         if event_name == "stage_start":
             current_stage_started_at = time.monotonic()
@@ -2605,6 +2673,7 @@ def _run_export_with_streamlit_progress(export_cfg: dict[str, Any]) -> None:
         timer_text = _time_text(stage_fraction=frac_inside_stage, event_name=event_name)
         progress_bar.progress(overall_clamped, text=f"{text} | {timer_text}")
         time_box.info(timer_text)
+        _render_live_profiler()
         if event_name in {"stage_start", "stage_finish", "stage_failed"}:
             log_lines.append(text)
             log_box.code("\n".join(log_lines[-12:]), language="text")
@@ -2614,6 +2683,10 @@ def _run_export_with_streamlit_progress(export_cfg: dict[str, Any]) -> None:
         result = export_from_config(export_cfg, progress_callback=update_progress)
         progress_bar.progress(1.0, text="Export complete")
         status_box.success(f"Export complete: {result.output_root}")
+        square_summary = (getattr(result, "summary", {}) or {}).get("square_crops", {}) or {}
+        if isinstance(square_summary.get("simple_profiler"), dict):
+            latest_profiler_snapshot = dict(square_summary.get("simple_profiler") or {})
+            _render_live_profiler()
         _render_export_result_summary(result)
     except Exception as exc:
         status_box.error(f"Export failed: {exc}")

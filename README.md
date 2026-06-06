@@ -1434,3 +1434,9 @@ contralateral_alignment_warning
 ```
 
 For example, with `method: hybrid_profile_y`, the debug fields may show that `row_projection_y` was selected, the shift was `-58` pixels, and nipple-y estimated `-65` pixels. If the profile and nipple estimates disagree too much, the profile shift is still used but a warning is recorded.
+
+## v54 speed defaults and simple profiler
+
+The default contralateral alignment method is now `nipple_y`, with `mask_centroid_y` as fallback. This is much faster than `hybrid_profile_y` for full dataset export. The profile methods are still available for inspection or smaller debug exports.
+
+The exporter also includes a lightweight start/stop profiler. It records coarse timing buckets such as preprocessing, crop planning, contralateral source crop generation, image saving, and metadata writing. In the GUI export panel, enable **Show simple timing breakdown during export** to see the live table. The table is updated every `runtime.simple_profiler_emit_every` progress updates to avoid slowing down the export.

@@ -184,18 +184,18 @@ def _mirror_boxes(boxes: torch.Tensor, width: int) -> torch.Tensor:
 
 DEFAULT_CONTRALATERAL_ALIGNMENT_OPTIONS: dict[str, Any] = {
     "enabled": True,
-    # Best default for the asymmetry channel. It first tries robust 1D profile
-    # matching, then falls back to the interpretable nipple-y estimate.
-    "method": "hybrid_profile_y",
-    "fallback_method": "nipple_y",
+    # Fast default for full dataset export. Use row_projection_y or
+    # hybrid_profile_y for slower debugging/quality checks.
+    "method": "nipple_y",
+    "fallback_method": "mask_centroid_y",
     "threshold": None,
     "tip_side": "auto",
     "tip_tolerance_fraction": 0.006,
     "tip_tolerance_px": None,
     "smooth_rows": 31,
-    "projection_smooth_rows": 51,
-    "boundary_smooth_rows": 31,
-    "max_shift_fraction": 0.20,
+    "projection_smooth_rows": 31,
+    "boundary_smooth_rows": 21,
+    "max_shift_fraction": 0.10,
     "min_profile_overlap_fraction": 0.60,
     "min_profile_score": 0.05,
     "profile_score_margin": 0.03,
@@ -228,10 +228,13 @@ def align_contralateral_image_to_reference(
 
     Available methods:
 
+    ``nipple_y``
+        Fast default for full export. Aligns the estimated nipple/tip row from
+        the foreground boundary.
     ``hybrid_profile_y``
-        Default. Computes row-projection, boundary-profile, nipple-y, and
-        centroid-y candidate shifts. It chooses the strongest profile match and
-        falls back to nipple-y/centroid-y if the profile score is weak.
+        Slower debugging/quality option. Computes row-projection, boundary-profile,
+        nipple-y, and centroid-y candidate shifts. It chooses the strongest
+        profile match and falls back if the profile score is weak.
     ``row_projection_y``
         Aligns the full foreground distribution along image rows.
     ``boundary_profile_y``
@@ -248,7 +251,7 @@ def align_contralateral_image_to_reference(
     moving_tensor = _as_1hw_tensor(moving_image)
     info: dict[str, Any] = {
         "contralateral_alignment_enabled": bool(opts.get("enabled", True)),
-        "contralateral_alignment_method": str(opts.get("method", "hybrid_profile_y")),
+        "contralateral_alignment_method": str(opts.get("method", "nipple_y")),
         "contralateral_alignment_selected_method": None,
         "contralateral_alignment_shift_y": 0,
         "contralateral_alignment_applied": False,
@@ -259,7 +262,7 @@ def align_contralateral_image_to_reference(
         info["contralateral_alignment_failure_reason"] = "alignment_disabled"
         return moving_tensor, info
 
-    method = _normalize_alignment_method(opts.get("method", "hybrid_profile_y"))
+    method = _normalize_alignment_method(opts.get("method", "nipple_y"))
     if method in {"none", "disabled", "off"}:
         info["contralateral_alignment_failure_reason"] = "alignment_method_none"
         return moving_tensor, info
@@ -304,7 +307,7 @@ def align_contralateral_image_to_reference(
 
 
 def _normalize_alignment_method(method: Any) -> str:
-    m = str(method or "hybrid_profile_y").strip().casefold().replace("-", "_").replace(" ", "_")
+    m = str(method or "nipple_y").strip().casefold().replace("-", "_").replace(" ", "_")
     aliases = {
         "nipple": "nipple_y",
         "foreground_tip": "nipple_y",

@@ -55,6 +55,71 @@ class ExportResult:
     summary: dict[str, Any]
 
 
+class SimpleTimerProfiler:
+    """Tiny start/stop timer used during export.
+
+    It stores only aggregated totals and counts. The overhead is one
+    perf_counter call at start and one at stop for each measured block.
+    """
+
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = bool(enabled)
+        self._open: dict[str, float] = {}
+        self._stats: dict[str, dict[str, float]] = {}
+
+    def start(self, name: str) -> None:
+        if self.enabled:
+            self._open[str(name)] = time.perf_counter()
+
+    def stop(self, name: str) -> float:
+        if not self.enabled:
+            return 0.0
+        key = str(name)
+        started = self._open.pop(key, None)
+        if started is None:
+            return 0.0
+        elapsed = max(0.0, time.perf_counter() - started)
+        item = self._stats.setdefault(key, {"total_seconds": 0.0, "count": 0.0, "max_seconds": 0.0})
+        item["total_seconds"] += float(elapsed)
+        item["count"] += 1.0
+        item["max_seconds"] = max(float(item.get("max_seconds", 0.0)), float(elapsed))
+        return elapsed
+
+    def record(self, name: str, elapsed: float) -> None:
+        if not self.enabled:
+            return
+        key = str(name)
+        elapsed = max(0.0, float(elapsed))
+        item = self._stats.setdefault(key, {"total_seconds": 0.0, "count": 0.0, "max_seconds": 0.0})
+        item["total_seconds"] += elapsed
+        item["count"] += 1.0
+        item["max_seconds"] = max(float(item.get("max_seconds", 0.0)), elapsed)
+
+    def snapshot(self) -> dict[str, Any]:
+        total = sum(float(v.get("total_seconds", 0.0)) for v in self._stats.values())
+        items = []
+        for name, item in sorted(self._stats.items(), key=lambda kv: float(kv[1].get("total_seconds", 0.0)), reverse=True):
+            count = int(item.get("count", 0.0))
+            total_seconds = float(item.get("total_seconds", 0.0))
+            items.append({
+                "name": name,
+                "total_seconds": total_seconds,
+                "count": count,
+                "avg_seconds": float(total_seconds / count) if count else 0.0,
+                "max_seconds": float(item.get("max_seconds", 0.0)),
+                "percent_of_profiled_time": float(100.0 * total_seconds / total) if total > 0 else 0.0,
+            })
+        return {"enabled": self.enabled, "total_profiled_seconds": float(total), "items": items}
+
+
+def _profiled_call(profiler: SimpleTimerProfiler, name: str, func):
+    profiler.start(name)
+    try:
+        return func()
+    finally:
+        profiler.stop(name)
+
+
 def load_export_config(path: str | Path) -> dict[str, Any]:
     """Load the YAML configuration used by ``main.py``.
 
@@ -460,7 +525,11 @@ def export_square_crop_datasets(
 
     rng = np.random.default_rng(int(crop_cfg.get("seed", 123)))
     save_empty_labels = bool(config.get("export", {}).get("save_empty_label_files", True))
-    show_progress = bool(config.get("runtime", {}).get("show_progress", True))
+    runtime_cfg = dict(config.get("runtime", {}) or {})
+    show_progress = bool(runtime_cfg.get("show_progress", True))
+    profiler = SimpleTimerProfiler(enabled=bool(runtime_cfg.get("simple_profiler_enabled", True)))
+    profiler_emit_every = max(1, int(runtime_cfg.get("simple_profiler_emit_every", 10)))
+    profiler_event_counter = 0
 
     coco_by_split = {split: _empty_coco() for split in ["train", "val", "test"]}
     stats_rows: list[dict[str, Any]] = []
@@ -472,18 +541,34 @@ def export_square_crop_datasets(
     # cache still avoids immediate rereads when paired views are processed near
     # each other.
     preprocessed_cache: OrderedDict[str, tuple[torch.Tensor, dict[str, Any]]] = OrderedDict()
-    max_preprocessed_cache_items = int(crop_cfg.get("contralateral_preprocessed_cache_items", 8))
+    max_preprocessed_cache_items = int(crop_cfg.get("contralateral_preprocessed_cache_items", 16))
+    aligned_contralateral_cache: OrderedDict[tuple[Any, ...], tuple[torch.Tensor, dict[str, Any]]] = OrderedDict()
+    max_aligned_contralateral_cache_items = int(crop_cfg.get("contralateral_alignment_cache_items", 2))
     contralateral_lookup = _build_contralateral_record_lookup(dataset.image_records)
     needs_contralateral = _config_uses_contralateral_source(config)
     total_records_for_progress = sum(len(split_records.get(split, [])) for split in ["train", "val", "test"])
     processed_records_for_progress = 0
 
+    def profiler_snapshot_event() -> dict[str, Any]:
+        return {"simple_profiler": profiler.snapshot()} if profiler.enabled else {}
+
+    def maybe_emit_profiler_progress(base_event: dict[str, Any], *, force: bool = False) -> None:
+        nonlocal profiler_event_counter
+        if progress_callback is None:
+            return
+        profiler_event_counter += 1
+        if force or profiler_event_counter % profiler_emit_every == 0:
+            progress_callback({**base_event, **profiler_snapshot_event()})
+        else:
+            progress_callback(base_event)
+
     def get_preprocessed(record_: dict[str, Any]) -> tuple[torch.Tensor, dict[str, Any]]:
         key = str(record_.get("image_id", ""))
         if key in preprocessed_cache:
             preprocessed_cache.move_to_end(key)
+            profiler.record("preprocess cache hit", 0.0)
             return preprocessed_cache[key]
-        value = dataset._read_preprocessed_record_no_square(record_)
+        value = _profiled_call(profiler, "read and fixed-preprocess source image", lambda: dataset._read_preprocessed_record_no_square(record_))
         preprocessed_cache[key] = value
         preprocessed_cache.move_to_end(key)
         while len(preprocessed_cache) > max(1, max_preprocessed_cache_items):
@@ -500,12 +585,16 @@ def export_square_crop_datasets(
     ) -> bool:
         nonlocal image_id_counter, ann_id_counter
         image, target = get_preprocessed(record)
-        crop_result = crop_image_and_boxes_to_window(
-            image,
-            boxes=target["boxes"],
-            mass_boxes=target["mass"]["boxes"],
-            window_xyxy=window,
-            options=common_crop_options,
+        crop_result = _profiled_call(
+            profiler,
+            "crop current image and boxes",
+            lambda: crop_image_and_boxes_to_window(
+                image,
+                boxes=target["boxes"],
+                mass_boxes=target["mass"]["boxes"],
+                window_xyxy=window,
+                options=common_crop_options,
+            ),
         )
         boxes = crop_result.mass_boxes
 
@@ -516,6 +605,7 @@ def export_square_crop_datasets(
             if skip_unsafe and not bool(extra_info.get("accepted", True)):
                 return False
 
+            profiler.start("bbox-safe final validation")
             source_ok, _source_safe_info = validate_bbox_safe_window(
                 window,
                 target["mass"]["boxes"],
@@ -528,6 +618,7 @@ def export_square_crop_datasets(
                 crop_size=crop_size,
                 margin_fraction=margin_fraction,
             )
+            profiler.stop("bbox-safe final validation")
             if skip_unsafe and (not source_ok or not exported_ok):
                 return False
             extra_info = {**extra_info, **_source_safe_info, **_export_safe_info}
@@ -541,20 +632,32 @@ def export_square_crop_datasets(
         rel_img_path = Path("images") / split_name / filename
         source_arrays = None
         if needs_contralateral:
-            source_arrays, alignment_info = _contralateral_source_arrays_for_window(
-                record=record,
-                reference_image=image,
-                window=window,
-                crop_options=common_crop_options,
-                contralateral_lookup=contralateral_lookup,
-                get_preprocessed=get_preprocessed,
-                config=config,
+            source_arrays, alignment_info = _profiled_call(
+                profiler,
+                "contralateral source crop",
+                lambda: _contralateral_source_arrays_for_window(
+                    record=record,
+                    reference_image=image,
+                    window=window,
+                    crop_options=common_crop_options,
+                    contralateral_lookup=contralateral_lookup,
+                    get_preprocessed=get_preprocessed,
+                    config=config,
+                    alignment_cache=aligned_contralateral_cache,
+                    max_alignment_cache_items=max_aligned_contralateral_cache_items,
+                    profiler=profiler,
+                ),
             )
             if alignment_info:
                 extra_info = {**extra_info, **alignment_info}
-        save_info = _save_export_images(crop_result.image, crop_root, rel_img_path, config, source_arrays=source_arrays)
+        save_info = _profiled_call(
+            profiler,
+            "save RGB and preserved PNG",
+            lambda: _save_export_images(crop_result.image, crop_root, rel_img_path, config, source_arrays=source_arrays),
+        )
 
         labels_path = crop_root / "labels" / split_name / f"{Path(filename).stem}.txt"
+        profiler.start("write labels and metadata rows")
         _write_yolo_label_file(labels_path, boxes, width=crop_size, height=crop_size, save_empty=save_empty_labels)
 
         crop_info = {"window_xyxy": window, **extra_info, **crop_result.info}
@@ -599,6 +702,7 @@ def export_square_crop_datasets(
             )
         )
         image_id_counter += 1
+        profiler.stop("write labels and metadata rows")
         return True
 
     for split_name in ["train", "val", "test"]:
@@ -612,27 +716,30 @@ def export_square_crop_datasets(
             for record in iterator:
                 image, target = get_preprocessed(record)
                 height, width = int(image.shape[-2]), int(image.shape[-1])
-                windows = _windows_for_export_split(
-                    split_name=split_name,
-                    image_width=width,
-                    image_height=height,
-                    image_tensor=image,
-                    mass_boxes=target["mass"]["boxes"],
-                    crop_options=common_crop_options,
-                    crop_cfg=crop_cfg,
-                    rng=rng,
+                windows = _profiled_call(
+                    profiler,
+                    "plan crop windows",
+                    lambda: _windows_for_export_split(
+                        split_name=split_name,
+                        image_width=width,
+                        image_height=height,
+                        image_tensor=image,
+                        mass_boxes=target["mass"]["boxes"],
+                        crop_options=common_crop_options,
+                        crop_cfg=crop_cfg,
+                        rng=rng,
+                    ),
                 )
                 candidates.extend((record, window, extra_info) for window, extra_info in windows)
                 processed_records_for_progress += 1
-                if progress_callback is not None:
-                    progress_callback({
-                        "event": "image_progress",
-                        "stage": "export_square_crops",
-                        "split": f"{split_name} planning",
-                        "processed": int(processed_records_for_progress),
-                        "total": int(total_records_for_progress),
-                        "unit": "source images",
-                    })
+                maybe_emit_profiler_progress({
+                    "event": "image_progress",
+                    "stage": "export_square_crops",
+                    "split": f"{split_name} planning",
+                    "processed": int(processed_records_for_progress),
+                    "total": int(total_records_for_progress),
+                    "unit": "source images",
+                })
 
             selected = _select_positive_ratio_candidates(candidates, crop_cfg, split_name, rng)
             save_iter = _progress(selected, show_progress, f"Save square crops {split_name}", unit="crop")
@@ -641,46 +748,56 @@ def export_square_crop_datasets(
             for crop_number, (record, window, extra_info) in enumerate(save_iter):
                 if save_window(record=record, split_name=split_name, crop_number=crop_number, window=window, extra_info=extra_info):
                     saved_count += 1
-                if progress_callback is not None:
-                    progress_callback({
-                        "event": "image_progress",
-                        "stage": "export_square_crops",
-                        "split": f"{split_name} saving",
-                        "processed": int(crop_number + 1),
-                        "total": int(total_selected),
-                        "unit": "crops",
-                    })
+                maybe_emit_profiler_progress({
+                    "event": "image_progress",
+                    "stage": "export_square_crops",
+                    "split": f"{split_name} saving",
+                    "processed": int(crop_number + 1),
+                    "total": int(total_selected),
+                    "unit": "crops",
+                })
             continue
 
         iterator = _progress(records, show_progress, f"Export square crops {split_name}", unit="img")
         for record in iterator:
             image, target = get_preprocessed(record)
             height, width = int(image.shape[-2]), int(image.shape[-1])
-            windows = _windows_for_export_split(
-                split_name=split_name,
-                image_width=width,
-                image_height=height,
-                image_tensor=image,
-                mass_boxes=target["mass"]["boxes"],
-                crop_options=common_crop_options,
-                crop_cfg=crop_cfg,
-                rng=rng,
+            windows = _profiled_call(
+                profiler,
+                "plan crop windows",
+                lambda: _windows_for_export_split(
+                    split_name=split_name,
+                    image_width=width,
+                    image_height=height,
+                    image_tensor=image,
+                    mass_boxes=target["mass"]["boxes"],
+                    crop_options=common_crop_options,
+                    crop_cfg=crop_cfg,
+                    rng=rng,
+                ),
             )
             for crop_number, (window, extra_info) in enumerate(windows):
                 save_window(record=record, split_name=split_name, crop_number=crop_number, window=window, extra_info=extra_info)
             processed_records_for_progress += 1
-            if progress_callback is not None:
-                progress_callback({
-                    "event": "image_progress",
-                    "stage": "export_square_crops",
-                    "split": split_name,
-                    "processed": int(processed_records_for_progress),
-                    "total": int(total_records_for_progress),
-                    "unit": "source images",
-                })
+            maybe_emit_profiler_progress({
+                "event": "image_progress",
+                "stage": "export_square_crops",
+                "split": split_name,
+                "processed": int(processed_records_for_progress),
+                "total": int(total_records_for_progress),
+                "unit": "source images",
+            })
 
-    created = _write_shared_export_files(crop_root, coco_by_split, stats_rows, metadata_rows, dataset_kind="square_crops")
-    return _summary_from_stats(stats_rows), created
+    created = _profiled_call(
+        profiler,
+        "write COCO CSV and summary files",
+        lambda: _write_shared_export_files(crop_root, coco_by_split, stats_rows, metadata_rows, dataset_kind="square_crops"),
+    )
+    summary = _summary_from_stats(stats_rows)
+    summary["simple_profiler"] = profiler.snapshot()
+    if progress_callback is not None:
+        progress_callback({"event": "profiler_update", "stage": "export_square_crops", **profiler_snapshot_event()})
+    return summary, created
 
 
 def _split_crop_cfg(crop_cfg: dict[str, Any], split_name: str, key: str, default: Any) -> Any:
@@ -1058,31 +1175,55 @@ def _contralateral_source_arrays_for_window(
     contralateral_lookup: dict[str, dict[str, Any]],
     get_preprocessed,
     config: dict[str, Any],
+    alignment_cache: OrderedDict[tuple[Any, ...], tuple[torch.Tensor, dict[str, Any]]] | None = None,
+    max_alignment_cache_items: int = 2,
+    profiler: SimpleTimerProfiler | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     paired_record = contralateral_lookup.get(str(record.get("image_id", "")))
     if paired_record is None:
         return {}, {"contralateral_alignment_requested": True, "contralateral_alignment_found_pair": False}
     paired_image, _paired_target = get_preprocessed(paired_record)
     align_options = dict((config.get("image_export", {}) or {}).get("contralateral_source_alignment", {}) or {})
-    paired_image_aligned, alignment_info = align_contralateral_image_to_reference(
-        reference_image,
-        paired_image,
-        options=align_options,
+    ref_id = str(record.get("image_id", ""))
+    pair_id = str(paired_record.get("image_id", ""))
+    cache_key = (
+        ref_id, pair_id, str(align_options.get("method", "")), str(align_options.get("fallback_method", "")),
+        float(align_options.get("max_shift_fraction", 0.0) or 0.0),
+        float(align_options.get("tip_tolerance_fraction", 0.0) or 0.0),
+        int(align_options.get("smooth_rows", 0) or 0),
+        int(align_options.get("projection_smooth_rows", 0) or 0),
+        int(align_options.get("boundary_smooth_rows", 0) or 0),
     )
+    if alignment_cache is not None and cache_key in alignment_cache:
+        paired_image_aligned, cached_info = alignment_cache[cache_key]
+        alignment_cache.move_to_end(cache_key)
+        alignment_info = {**cached_info, "contralateral_alignment_cache_hit": True}
+        if profiler is not None:
+            profiler.record("contralateral alignment cache hit", 0.0)
+    else:
+        if profiler is not None:
+            profiler.start("contralateral alignment estimate and shift")
+        paired_image_aligned, alignment_info = align_contralateral_image_to_reference(reference_image, paired_image, options=align_options)
+        if profiler is not None:
+            profiler.stop("contralateral alignment estimate and shift")
+        alignment_info = {**alignment_info, "contralateral_alignment_cache_hit": False}
+        if alignment_cache is not None:
+            alignment_cache[cache_key] = (paired_image_aligned, dict(alignment_info))
+            alignment_cache.move_to_end(cache_key)
+            while len(alignment_cache) > max(1, int(max_alignment_cache_items)):
+                alignment_cache.popitem(last=False)
     alignment_info = {
         "contralateral_alignment_requested": True,
         "contralateral_alignment_found_pair": True,
-        "contralateral_image_id": str(paired_record.get("image_id", "")),
+        "contralateral_image_id": pair_id,
         **alignment_info,
     }
     empty_boxes = torch.zeros((0, 4), dtype=torch.float32)
-    paired_crop = crop_image_and_boxes_to_window(
-        paired_image_aligned,
-        boxes=empty_boxes,
-        mass_boxes=empty_boxes,
-        window_xyxy=window,
-        options=crop_options,
-    )
+    if profiler is not None:
+        profiler.start("crop aligned contralateral image")
+    paired_crop = crop_image_and_boxes_to_window(paired_image_aligned, boxes=empty_boxes, mass_boxes=empty_boxes, window_xyxy=window, options=crop_options)
+    if profiler is not None:
+        profiler.stop("crop aligned contralateral image")
     return {"contralateral_same_view_crop": _tensor_to_float2d(paired_crop.image)}, alignment_info
 
 
@@ -1097,6 +1238,7 @@ def export_baseline_dataset(
     base_root.mkdir(parents=True, exist_ok=True)
     save_empty_labels = bool(config.get("export", {}).get("save_empty_label_files", True))
     show_progress = bool(config.get("runtime", {}).get("show_progress", True))
+    crop_cfg = dict(config.get("square_crops", {}) or {})
 
     coco_by_split = {split: _empty_coco() for split in ["train", "val", "test"]}
     stats_rows: list[dict[str, Any]] = []
