@@ -52,18 +52,13 @@ def main() -> None:
     st.set_page_config(page_title="VinDr-Mammo preprocessing inspector", layout="wide")
     st.title("VinDr-Mammo preprocessing inspector")
     st.caption(
-        "Inspect raw/preprocessed mammography crops, mass boxes, vendor differences, "
-        "and candidate RGB preprocessing pipelines before exporting another dataset."
+        "Inspect raw/preprocessed mammography crops, saved exports, mass boxes, "
+        "vendor differences, and candidate RGB preprocessing pipelines."
     )
 
     config_path = _get_config_path_from_query_or_cli()
     cfg = _load_config_ui(config_path)
     cfg = _apply_loaded_manifest_settings_if_any(cfg)
-    cfg = _global_preprocess_controls(cfg)
-
-    dataset = _load_dataset_from_config(cfg)
-    split_records, split_df = _load_split_records(dataset, cfg)
-    enriched = _build_enriched_record_table(dataset, split_df)
 
     mode = st.sidebar.radio(
         "Mode",
@@ -71,10 +66,26 @@ def main() -> None:
             "Single image",
             "Vendor / image comparison",
             "Dataset visualizations",
+            "Saved dataset viewer",
             "Manifest comparison / load settings",
         ],
         index=0,
+        help=(
+            "Saved dataset viewer opens an already exported square_crops dataset. "
+            "It does not need to load the original DICOM files."
+        ),
     )
+
+    if mode == "Saved dataset viewer":
+        _render_saved_dataset_viewer_mode(cfg)
+        return
+
+    cfg = _global_preprocess_controls(cfg)
+
+    dataset = _load_dataset_from_config(cfg)
+    split_records, split_df = _load_split_records(dataset, cfg)
+    enriched = _build_enriched_record_table(dataset, split_df)
+
     crop_controls = _crop_controls(cfg)
     show_annotations = st.sidebar.checkbox("Show mass annotations", value=True)
     display_window = st.sidebar.slider(
@@ -111,6 +122,443 @@ def main() -> None:
     else:
         _render_manifest_comparison_mode(cfg)
 
+
+
+# -----------------------------------------------------------------------------
+# Saved exported dataset viewer mode
+# -----------------------------------------------------------------------------
+
+
+@st.cache_data(show_spinner="Loading saved dataset index...")
+def _load_saved_dataset_viewer_index(dataset_root_text: str, refresh_token: int = 0) -> dict[str, Any]:
+    """Load exported square_crops metadata without touching the original DICOMs."""
+    del refresh_token
+    root = Path(dataset_root_text).expanduser()
+    crop_root = root if root.name == "square_crops" else root / "square_crops"
+    if not crop_root.exists():
+        return {
+            "ok": False,
+            "error": f"Could not find square_crops at: {crop_root}",
+            "root": str(root),
+            "crop_root": str(crop_root),
+            "rows": [],
+            "settings": {},
+            "summary": {},
+        }
+
+    crop_log_path = crop_root / "debug_logs" / "crop_log.csv"
+    samples_path = crop_root / "stats" / "samples.csv"
+    rows_df = pd.DataFrame()
+    used_table = ""
+    if crop_log_path.exists():
+        rows_df = pd.read_csv(crop_log_path)
+        used_table = str(crop_log_path)
+    elif samples_path.exists():
+        rows_df = pd.read_csv(samples_path)
+        used_table = str(samples_path)
+    else:
+        return {
+            "ok": False,
+            "error": f"Could not find crop_log.csv or samples.csv under: {crop_root}",
+            "root": str(root),
+            "crop_root": str(crop_root),
+            "rows": [],
+            "settings": {},
+            "summary": {},
+        }
+
+    if "split" not in rows_df.columns and "export_split" in rows_df.columns:
+        rows_df["split"] = rows_df["export_split"]
+    if "file_name" not in rows_df.columns and "filename" in rows_df.columns:
+        rows_df["file_name"] = rows_df["filename"]
+    if "has_mass" not in rows_df.columns:
+        if "num_mass_boxes" in rows_df.columns:
+            rows_df["has_mass"] = pd.to_numeric(rows_df["num_mass_boxes"], errors="coerce").fillna(0).astype(int) > 0
+        elif "is_positive_window" in rows_df.columns:
+            rows_df["has_mass"] = pd.to_numeric(rows_df["is_positive_window"], errors="coerce").fillna(0).astype(int) > 0
+        else:
+            rows_df["has_mass"] = False
+    if "is_positive_window" not in rows_df.columns:
+        rows_df["is_positive_window"] = rows_df["has_mass"].astype(int)
+    if "source_index" not in rows_df.columns:
+        rows_df["source_index"] = -1
+    if "source_image_id" not in rows_df.columns:
+        rows_df["source_image_id"] = ""
+    if "crop_window_xyxy" not in rows_df.columns:
+        rows_df["crop_window_xyxy"] = ""
+
+    rows_df = rows_df.copy()
+    rows_df["split"] = rows_df["split"].fillna("").astype(str)
+    rows_df["file_name"] = rows_df["file_name"].fillna("").astype(str)
+    rows_df["image_path"] = rows_df.apply(
+        lambda r: str(crop_root / "images" / str(r.get("split", "")) / str(r.get("file_name", ""))),
+        axis=1,
+    )
+    rows_df["label_path"] = rows_df.apply(
+        lambda r: str(crop_root / "labels" / str(r.get("split", "")) / f"{Path(str(r.get('file_name', ''))).stem}.txt"),
+        axis=1,
+    )
+    rows_df["image_exists"] = rows_df["image_path"].map(lambda x: Path(str(x)).exists())
+    rows_df["label_exists"] = rows_df["label_path"].map(lambda x: Path(str(x)).exists())
+    rows_df["positive"] = pd.to_numeric(rows_df["is_positive_window"], errors="coerce").fillna(0).astype(int) > 0
+    rows_df["viewer_row"] = np.arange(len(rows_df), dtype=int)
+
+    settings_paths = [
+        crop_root.parent / "metadata" / "export_config_resolved.yaml",
+        crop_root.parent / "metadata" / "source_csv" / "export_config_resolved.yaml",
+        crop_root / "metadata" / "export_config_resolved.yaml",
+    ]
+    settings: dict[str, Any] = {}
+    settings_path = ""
+    for path in settings_paths:
+        if path.exists():
+            settings_path = str(path)
+            try:
+                settings = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            except Exception as exc:
+                settings = {"settings_load_error": str(exc)}
+            break
+
+    summary_paths = [
+        crop_root / "debug_logs" / "debug_summary.json",
+        crop_root.parent / "manifest.json",
+    ]
+    summary: dict[str, Any] = {}
+    summary_path = ""
+    for path in summary_paths:
+        if path.exists():
+            summary_path = str(path)
+            try:
+                summary = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                summary = {"summary_load_error": str(exc)}
+            break
+
+    source_log_path = crop_root / "debug_logs" / "source_image_log.csv"
+    source_count = 0
+    no_saved_count = None
+    crops_per_source_hist = []
+    if source_log_path.exists():
+        try:
+            source_df = pd.read_csv(source_log_path)
+            source_count = int(len(source_df))
+            if "source_image_has_no_saved_crops" in source_df.columns:
+                no_saved_count = int(pd.to_numeric(source_df["source_image_has_no_saved_crops"], errors="coerce").fillna(0).sum())
+            if "saved_crops" in source_df.columns and "split" in source_df.columns:
+                hist_df = (
+                    source_df.groupby(["split", "saved_crops"], dropna=False)
+                    .size()
+                    .reset_index(name="n_source_images")
+                    .rename(columns={"saved_crops": "n_crops"})
+                    .sort_values(["split", "n_crops"])
+                )
+                crops_per_source_hist = hist_df.to_dict(orient="records")
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "error": "",
+        "root": str(root),
+        "crop_root": str(crop_root),
+        "used_table": used_table,
+        "rows": rows_df.to_dict(orient="records"),
+        "settings": settings,
+        "settings_path": settings_path,
+        "summary": summary,
+        "summary_path": summary_path,
+        "source_count": source_count,
+        "source_images_with_no_saved_crops": no_saved_count,
+        "crops_per_source_histogram": crops_per_source_hist,
+    }
+
+
+def _render_saved_dataset_viewer_mode(cfg: dict[str, Any]) -> None:
+    """Inspect already saved square crops with annotation overlays."""
+    st.subheader("Saved dataset viewer")
+    st.caption(
+        "Open an exported square_crops dataset, inspect saved images and labels, and play crops one after another. "
+        "This reads PNG, YOLO label, CSV, and YAML files only. It does not load the original DICOMs."
+    )
+
+    default_root = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/preprocessed-vindr-v19")))
+    controls = st.columns([3.0, 1.0])
+    dataset_root_text = controls[0].text_input(
+        "Exported dataset root or square_crops folder",
+        value=str(default_root),
+        help=(
+            "Use the export root, for example /mnt/t9/preprocessed-vindr-v19, or point directly to "
+            "/mnt/t9/preprocessed-vindr-v19/square_crops."
+        ),
+        key="saved_viewer_dataset_root",
+    )
+    if "saved_viewer_refresh_token" not in st.session_state:
+        st.session_state["saved_viewer_refresh_token"] = 0
+    if controls[1].button("Reload saved data", use_container_width=True):
+        st.session_state["saved_viewer_refresh_token"] += 1
+        st.session_state["saved_viewer_index"] = 0
+        st.rerun()
+
+    loaded = _load_saved_dataset_viewer_index(dataset_root_text, int(st.session_state.get("saved_viewer_refresh_token", 0)))
+    if not loaded.get("ok"):
+        st.error(str(loaded.get("error", "Unknown saved-dataset loading error")))
+        return
+
+    rows = pd.DataFrame(loaded.get("rows", []))
+    if rows.empty:
+        st.warning("The saved dataset table is empty.")
+        return
+
+    stat_cols = st.columns(5)
+    stat_cols[0].metric("Crops", f"{len(rows):,}")
+    stat_cols[1].metric("Positive", f"{int(rows['positive'].sum()):,}")
+    stat_cols[2].metric("Empty", f"{int((~rows['positive']).sum()):,}")
+    stat_cols[3].metric("Images found", f"{int(rows['image_exists'].sum()):,}")
+    no_saved = loaded.get("source_images_with_no_saved_crops")
+    stat_cols[4].metric("Source images with no crops", "n/a" if no_saved is None else f"{int(no_saved):,}")
+
+    with st.expander("Loaded dataset settings and debug files", expanded=False):
+        st.write(f"Crop root: `{loaded.get('crop_root')}`")
+        st.write(f"Crop table: `{loaded.get('used_table')}`")
+        if loaded.get("settings_path"):
+            st.write(f"Settings: `{loaded.get('settings_path')}`")
+            st.json(loaded.get("settings") or {})
+        else:
+            st.info("No resolved settings YAML found under metadata/.")
+        if loaded.get("summary_path"):
+            st.write(f"Debug summary: `{loaded.get('summary_path')}`")
+            st.json(loaded.get("summary") or {})
+        hist = pd.DataFrame(loaded.get("crops_per_source_histogram", []))
+        if not hist.empty:
+            st.write("Crops per source image histogram")
+            st.dataframe(hist, hide_index=True, use_container_width=True)
+
+    filter_cols = st.columns([1.1, 1.2, 1.2, 1.3, 1.0])
+    split_values = [s for s in ["train", "val", "test"] if s in set(rows["split"].astype(str))]
+    split_choice = filter_cols[0].selectbox("Split", ["all"] + split_values, key="saved_viewer_split")
+    pos_choice = filter_cols[1].selectbox("Crop type", ["all", "positive only", "empty only"], key="saved_viewer_positive_filter")
+    source_search = filter_cols[2].text_input(
+        "Image id/index contains",
+        value="",
+        key="saved_viewer_source_search",
+        help="Optional filter. Matches source_image_id, source_index, or file_name.",
+    )
+    only_existing = filter_cols[3].checkbox("Only existing image files", value=True, key="saved_viewer_only_existing")
+    show_boxes = filter_cols[4].checkbox("Draw annotations", value=True, key="saved_viewer_show_boxes")
+
+    view_df = rows.copy()
+    if split_choice != "all":
+        view_df = view_df[view_df["split"].astype(str) == split_choice]
+    if pos_choice == "positive only":
+        view_df = view_df[view_df["positive"]]
+    elif pos_choice == "empty only":
+        view_df = view_df[~view_df["positive"]]
+    if source_search.strip():
+        needle = source_search.strip().casefold()
+        hay = (
+            view_df.get("source_image_id", "").astype(str)
+            + " " + view_df.get("source_index", "").astype(str)
+            + " " + view_df.get("file_name", "").astype(str)
+        ).str.casefold()
+        view_df = view_df[hay.str.contains(needle, regex=False, na=False)]
+    if only_existing:
+        view_df = view_df[view_df["image_exists"].astype(bool)]
+    view_df = view_df.reset_index(drop=True)
+
+    if view_df.empty:
+        st.warning("No saved crops match the current filters.")
+        return
+
+    if "saved_viewer_index" not in st.session_state:
+        st.session_state["saved_viewer_index"] = 0
+    idx = int(st.session_state.get("saved_viewer_index", 0))
+    if idx >= len(view_df):
+        idx = 0
+    if idx < 0:
+        idx = len(view_df) - 1
+    st.session_state["saved_viewer_index"] = idx
+
+    mode_cols = st.columns([1.0, 1.0, 1.0, 2.0])
+    viewer_mode = mode_cols[0].radio("Viewer mode", ["manual", "automatic"], horizontal=True, key="saved_viewer_mode")
+    period = float(mode_cols[1].number_input("Period, seconds", min_value=0.1, max_value=10.0, value=0.75, step=0.1, key="saved_viewer_period"))
+    if mode_cols[2].button("Reset to first", use_container_width=True):
+        st.session_state["saved_viewer_index"] = 0
+        st.rerun()
+    mode_cols[3].caption(f"Showing {idx + 1:,} of {len(view_df):,} crops after filtering.")
+
+    if viewer_mode == "manual":
+        nav_cols = st.columns([1.0, 1.0, 4.0])
+        if nav_cols[0].button("Previous", use_container_width=True):
+            st.session_state["saved_viewer_index"] = (idx - 1) % len(view_df)
+            st.rerun()
+        if nav_cols[1].button("Next", use_container_width=True):
+            st.session_state["saved_viewer_index"] = (idx + 1) % len(view_df)
+            st.rerun()
+        selected_number = nav_cols[2].slider(
+            "Crop number",
+            min_value=1,
+            max_value=int(len(view_df)),
+            value=int(idx + 1),
+            step=1,
+            key="saved_viewer_slider",
+        )
+        if int(selected_number - 1) != idx:
+            st.session_state["saved_viewer_index"] = int(selected_number - 1)
+            st.rerun()
+    else:
+        auto_cols = st.columns([1.0, 3.0])
+        playing = auto_cols[0].checkbox("Play", value=False, key="saved_viewer_play")
+        auto_cols[1].caption("Automatic mode advances by one crop per rerun. Stop by unchecking Play.")
+
+    row = view_df.iloc[int(st.session_state["saved_viewer_index"])]
+    image_path = Path(str(row.get("image_path", "")))
+    label_path = Path(str(row.get("label_path", "")))
+    image = _load_saved_viewer_image(image_path)
+    if image is None:
+        st.error(f"Could not read image: {image_path}")
+        return
+    boxes = _load_yolo_boxes_for_saved_image(label_path, width=int(image.shape[1]), height=int(image.shape[0]))
+    display_image = _prepare_saved_viewer_display_image(image, boxes if show_boxes else np.zeros((0, 4)), row, int(st.session_state["saved_viewer_index"]), len(view_df))
+
+    main_cols = st.columns([2.4, 1.0])
+    with main_cols[0]:
+        st.image(display_image, caption=_saved_viewer_caption(row, int(st.session_state["saved_viewer_index"]), len(view_df)), use_container_width=True)
+    with main_cols[1]:
+        st.write("Selected crop metadata")
+        metadata_fields = [
+            "split",
+            "viewer_row",
+            "source_index",
+            "source_image_id",
+            "source_study_id",
+            "file_name",
+            "has_mass",
+            "is_positive_window",
+            "num_mass_boxes",
+            "crop_mode",
+            "crop_window_xyxy",
+            "negative_foreground_fraction",
+            "bbox_safe_foreground_fraction",
+            "bbox_safe_margin_ok",
+            "contralateral_image_id",
+            "contralateral_alignment_method",
+            "contralateral_alignment_shift_y",
+            "image_path",
+            "label_path",
+        ]
+        shown = {k: _streamlit_json_safe(row.get(k)) for k in metadata_fields if k in row.index}
+        st.json(shown)
+        if label_path.exists():
+            st.write(f"YOLO label file: `{label_path}`")
+            st.code(label_path.read_text(encoding="utf-8"), language="text")
+        else:
+            st.info("No label file found for this crop. Empty crops may have an empty or missing label file depending on export settings.")
+
+    if viewer_mode == "automatic" and bool(st.session_state.get("saved_viewer_play", False)):
+        time.sleep(float(period))
+        st.session_state["saved_viewer_index"] = (int(st.session_state.get("saved_viewer_index", 0)) + 1) % len(view_df)
+        st.rerun()
+
+
+def _load_saved_viewer_image(path: Path) -> np.ndarray | None:
+    """Read a saved PNG/JPEG crop as an RGB uint8 array."""
+    if not path.exists():
+        return None
+    arr = None
+    if cv2 is not None:
+        raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if raw is not None:
+            if raw.ndim == 2:
+                arr = _gray_to_rgb(_scale_saved_viewer_to_uint8(raw))
+            elif raw.ndim == 3 and raw.shape[2] >= 3:
+                raw = raw[:, :, :3]
+                arr = cv2.cvtColor(_scale_saved_viewer_to_uint8(raw), cv2.COLOR_BGR2RGB)
+    if arr is None:
+        try:
+            arr = plt.imread(str(path))
+            arr = _scale_saved_viewer_to_uint8(arr)
+            if arr.ndim == 2:
+                arr = _gray_to_rgb(arr)
+            elif arr.ndim == 3 and arr.shape[2] == 4:
+                arr = arr[:, :, :3]
+        except Exception:
+            return None
+    return np.asarray(arr, dtype=np.uint8)
+
+
+def _scale_saved_viewer_to_uint8(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr)
+    if arr.dtype == np.uint8:
+        return arr
+    if np.issubdtype(arr.dtype, np.floating):
+        finite = arr[np.isfinite(arr)]
+        if finite.size and finite.max() <= 1.5:
+            return np.clip(arr, 0.0, 1.0).astype(np.float32).__mul__(255.0).round().astype(np.uint8)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return np.zeros(arr.shape, dtype=np.uint8)
+    lo, hi = float(np.percentile(finite, 1.0)), float(np.percentile(finite, 99.0))
+    if hi <= lo:
+        hi = float(finite.max())
+        lo = float(finite.min())
+    if hi <= lo:
+        return np.zeros(arr.shape, dtype=np.uint8)
+    return np.clip((arr.astype(np.float32) - lo) / (hi - lo), 0.0, 1.0).__mul__(255.0).round().astype(np.uint8)
+
+
+def _load_yolo_boxes_for_saved_image(label_path: Path, *, width: int, height: int) -> np.ndarray:
+    boxes: list[list[float]] = []
+    if not label_path.exists():
+        return np.zeros((0, 4), dtype=np.float32)
+    try:
+        for line in label_path.read_text(encoding="utf-8").splitlines():
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+            _, xc, yc, bw, bh = parts[:5]
+            xc_f = float(xc) * float(width)
+            yc_f = float(yc) * float(height)
+            bw_f = float(bw) * float(width)
+            bh_f = float(bh) * float(height)
+            x0 = xc_f - bw_f / 2.0
+            y0 = yc_f - bh_f / 2.0
+            x1 = xc_f + bw_f / 2.0
+            y1 = yc_f + bh_f / 2.0
+            boxes.append([x0, y0, x1, y1])
+    except Exception:
+        return np.zeros((0, 4), dtype=np.float32)
+    return np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+
+
+def _prepare_saved_viewer_display_image(
+    image: np.ndarray,
+    boxes: np.ndarray,
+    row: pd.Series,
+    idx: int,
+    total: int,
+) -> np.ndarray:
+    out = image.copy()
+    if boxes is not None and len(np.asarray(boxes).reshape(-1, 4)):
+        out = _draw_boxes(out, boxes, color=(255, 60, 60))
+    text_lines = [
+        f"{idx + 1}/{total} | split={row.get('split', '')} | source_index={row.get('source_index', '')}",
+        f"positive={int(bool(row.get('positive', False)))} | image_id={row.get('source_image_id', '')}",
+    ]
+    if cv2 is not None:
+        y = 28
+        for text in text_lines:
+            cv2.putText(out, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(out, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+            y += 32
+    return out
+
+
+def _saved_viewer_caption(row: pd.Series, idx: int, total: int) -> str:
+    return (
+        f"{idx + 1}/{total} | split={row.get('split', '')} | "
+        f"source_index={row.get('source_index', '')} | source_image_id={row.get('source_image_id', '')} | "
+        f"positive={int(bool(row.get('positive', False)))} | file={row.get('file_name', '')}"
+    )
 
 
 # -----------------------------------------------------------------------------

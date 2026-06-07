@@ -1479,3 +1479,22 @@ square_crops:
 This means the exporter keeps one mass-centered crop candidate per annotation, then globally samples clean crops to reach the requested target mass-positive crop ratio. Clean crops can come from no-mass images as well as clean windows from finding images.
 
 The contralateral source path is faster now. Instead of shifting the whole opposite mammogram tensor and then cropping it, the exporter estimates and caches a vertical shift, then takes the same crop from an adjusted y-window. This preserves the same aligned crop behavior while avoiding a large full-image copy for every pair.
+
+## Saved dataset viewer
+
+The Streamlit GUI includes a **Saved dataset viewer** mode for checking exported `square_crops` without reloading the original DICOM files. It reads the exported PNG crops, YOLO labels, `stats/samples.csv`, `debug_logs/crop_log.csv`, and `metadata/export_config_resolved.yaml`.
+
+Features:
+
+- Manual scan with Previous, Next, and crop-number slider.
+- Automatic playback with a user-selected period in seconds.
+- Annotation boxes drawn from saved YOLO label files.
+- Source image index, image id, split, positivity, crop window, and file name shown on screen and in the side metadata panel.
+
+Run the GUI as usual:
+
+```bash
+vindr-mammo-gui --config config/export_config.yaml
+```
+
+Then choose `Saved dataset viewer` from the Mode selector.
