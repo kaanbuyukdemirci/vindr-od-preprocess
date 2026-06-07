@@ -1,6 +1,6 @@
 paths:
   data_root: /mnt/t9/vindr
-  output_root: /mnt/t9/preprocessed-vindr-v56
+  output_root: /mnt/t9/preprocessed-vindr-v19
 runtime:
   show_progress: true
   simple_profiler_enabled: true
@@ -119,22 +119,22 @@ square_crops:
   val_crop_mode: bbox_safe_random
   test_crop_mode: bbox_safe_random
   random_crops_per_annotation: 1
-  balance_train_positive_fraction_globally: true
+  balance_train_positive_fraction_globally: false
   random_crops_per_negative_image_when_balancing: 1
   random_crops_per_negative_image: 1
   positive_fraction: 0.5
   train_positive_fraction: 0.5
-  val_positive_fraction: 0.5
-  test_positive_fraction: 0.5
+  val_positive_fraction: 1.0
+  test_positive_fraction: 1.0
   train_bbox_safe_positive_fraction: 0.5
-  val_bbox_safe_positive_fraction: 0.5
-  test_bbox_safe_positive_fraction: 0.5
+  val_bbox_safe_positive_fraction: 1.0
+  test_bbox_safe_positive_fraction: 1.0
   train_deterministic_selection_mode: positive_ratio
   val_deterministic_selection_mode: positive_ratio
   test_deterministic_selection_mode: positive_ratio
   train_deterministic_target_positive_ratio: 0.5
-  val_deterministic_target_positive_ratio: 0.5
-  test_deterministic_target_positive_ratio: 0.5
+  val_deterministic_target_positive_ratio: 1.0
+  test_deterministic_target_positive_ratio: 1.0
   center_shift_fraction: 0.25
   max_random_tries: 80
   bbox_safe_boundary_margin_fraction: 0.02
@@ -151,8 +151,8 @@ square_crops:
   deterministic_max_windows_per_image: null
   pad_if_needed: true
   pad_value: 0.0
-  deterministic_require_foreground: false
-  deterministic_min_foreground_fraction: 0.05
+  deterministic_require_foreground: true
+  deterministic_min_foreground_fraction: 0.35
   deterministic_foreground_threshold: null
   contralateral_preprocessed_cache_items: 32
   contralateral_alignment_cache_items: 64
@@ -162,6 +162,15 @@ square_crops:
   online_positive_ratio_selection_for_random: true
   online_balance_shuffle_source_records: true
   global_negative_candidate_crops_per_image_when_balancing: 1
+  negative_require_foreground: true
+  negative_min_foreground_fraction: 0.35
+  require_foreground_for_empty_crops: true
+  min_foreground_fraction: 0.35
+  bbox_safe_foreground_threshold_fraction: 0.02
+  bbox_safe_foreground_keep_largest_component: true
+  bbox_safe_foreground_min_component_area_fraction: 0.001
+  bbox_safe_min_foreground_fraction: 0.35
+  deduplicate_windows_per_source: true
 crop_annotation_policy:
   allow_partial_annotations: true
   min_box_visibility: 0.3
@@ -170,7 +179,7 @@ crop_annotation_policy:
 dataset:
   validate_paths: false
 visualizations:
-  output_dir: /mnt/t9/preprocessed-vindr-v56/visualizations
+  output_dir: /mnt/t9/preprocessed-vindr-v19/visualizations
   include_square_crops: true
   include_baseline_uncropped: true
   write_html_report: true

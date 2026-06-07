@@ -549,6 +549,87 @@ def export_square_crop_datasets(
     total_records_for_progress = sum(len(split_records.get(split, [])) for split in ["train", "val", "test"])
     processed_records_for_progress = 0
 
+    source_index_lookup: dict[tuple[str, str], int] = {}
+    source_debug: dict[tuple[str, str], dict[str, Any]] = {}
+    saved_window_keys: set[tuple[str, str, int, int, int, int]] = set()
+    for _split_name, _records in split_records.items():
+        for _idx, _record in enumerate(_records):
+            _image_id = str(_record.get("image_id", ""))
+            source_index_lookup[(_split_name, _image_id)] = int(_idx)
+            source_debug[(_split_name, _image_id)] = {
+                "split": _split_name,
+                "source_index": int(_idx),
+                "source_image_id": _image_id,
+                "source_study_id": str(_record.get("study_id", "")),
+                "laterality": _record.get("laterality", ""),
+                "view_position": _record.get("view_position", ""),
+                "official_split": _record.get("split", ""),
+                "processed_source_image": 0,
+                "n_source_mass_boxes": 0,
+                "has_source_mass": 0,
+                "candidate_windows": 0,
+                "attempted_save_windows": 0,
+                "saved_crops": 0,
+                "saved_positive_crops": 0,
+                "saved_negative_crops": 0,
+                "exported_mass_box_instances": 0,
+                "skipped_windows": 0,
+                "skip_foreground_too_low": 0,
+                "skip_bbox_safe_failed": 0,
+                "skip_duplicate_window": 0,
+                "skip_empty_disallowed": 0,
+                "_included_annotation_indices": set(),
+            }
+
+    def source_row_for(split_name_: str, record_: dict[str, Any]) -> dict[str, Any]:
+        image_id_ = str(record_.get("image_id", ""))
+        key_ = (split_name_, image_id_)
+        if key_ not in source_debug:
+            source_debug[key_] = {
+                "split": split_name_,
+                "source_index": int(source_index_lookup.get(key_, -1)),
+                "source_image_id": image_id_,
+                "source_study_id": str(record_.get("study_id", "")),
+                "laterality": record_.get("laterality", ""),
+                "view_position": record_.get("view_position", ""),
+                "official_split": record_.get("split", ""),
+                "processed_source_image": 0,
+                "n_source_mass_boxes": 0,
+                "has_source_mass": 0,
+                "candidate_windows": 0,
+                "attempted_save_windows": 0,
+                "saved_crops": 0,
+                "saved_positive_crops": 0,
+                "saved_negative_crops": 0,
+                "exported_mass_box_instances": 0,
+                "skipped_windows": 0,
+                "skip_foreground_too_low": 0,
+                "skip_bbox_safe_failed": 0,
+                "skip_duplicate_window": 0,
+                "skip_empty_disallowed": 0,
+                "_included_annotation_indices": set(),
+            }
+        return source_debug[key_]
+
+    def note_source_target(split_name_: str, record_: dict[str, Any], target_: dict[str, Any]) -> dict[str, Any]:
+        row_ = source_row_for(split_name_, record_)
+        boxes_ = target_.get("mass", {}).get("boxes", torch.zeros((0, 4)))
+        try:
+            n_mass_ = int(boxes_.detach().cpu().reshape(-1, 4).shape[0])
+        except Exception:
+            n_mass_ = 0
+        row_["processed_source_image"] = 1
+        row_["n_source_mass_boxes"] = max(int(row_.get("n_source_mass_boxes", 0)), n_mass_)
+        row_["has_source_mass"] = int(row_["n_source_mass_boxes"] > 0)
+        return row_
+
+    def mark_source_skip(split_name_: str, record_: dict[str, Any], reason: str) -> None:
+        row_ = source_row_for(split_name_, record_)
+        row_["skipped_windows"] = int(row_.get("skipped_windows", 0)) + 1
+        key_name = f"skip_{reason}"
+        if key_name in row_:
+            row_[key_name] = int(row_.get(key_name, 0)) + 1
+
     def profiler_snapshot_event() -> dict[str, Any]:
         return {"simple_profiler": profiler.snapshot()} if profiler.enabled else {}
 
@@ -585,6 +666,8 @@ def export_square_crop_datasets(
     ) -> bool:
         nonlocal image_id_counter, ann_id_counter
         image, target = get_preprocessed(record)
+        source_row = note_source_target(split_name, record, target)
+        source_row["attempted_save_windows"] = int(source_row.get("attempted_save_windows", 0)) + 1
         crop_result = _profiled_call(
             profiler,
             "crop current image and boxes",
@@ -603,6 +686,7 @@ def export_square_crop_datasets(
             margin_fraction = float(crop_cfg.get("bbox_safe_boundary_margin_fraction", 0.02))
 
             if skip_unsafe and not bool(extra_info.get("accepted", True)):
+                mark_source_skip(split_name, record, "bbox_safe_failed")
                 return False
 
             profiler.start("bbox-safe final validation")
@@ -620,13 +704,40 @@ def export_square_crop_datasets(
             )
             profiler.stop("bbox-safe final validation")
             if skip_unsafe and (not source_ok or not exported_ok):
+                mark_source_skip(split_name, record, "bbox_safe_failed")
                 return False
             extra_info = {**extra_info, **_source_safe_info, **_export_safe_info}
 
         if str(extra_info.get("deterministic_selection_mode", "")).casefold() == "mass_only" and boxes.shape[0] == 0:
+            mark_source_skip(split_name, record, "empty_disallowed")
             return False
         if int(extra_info.get("deterministic_include_empty", 1)) == 0 and boxes.shape[0] == 0:
+            mark_source_skip(split_name, record, "empty_disallowed")
             return False
+
+        deduplicate = bool(crop_cfg.get("deduplicate_windows_per_source", True))
+        if deduplicate:
+            window_key = (split_name, str(record.get("image_id", "")), int(window[0]), int(window[1]), int(window[2]), int(window[3]))
+            if window_key in saved_window_keys:
+                mark_source_skip(split_name, record, "duplicate_window")
+                return False
+
+        # Optional hard foreground filter for empty crops. This prevents low-level
+        # background noise from creating apparently valid empty/background crops.
+        if boxes.shape[0] == 0 and bool(_split_crop_cfg(crop_cfg, split_name, "negative_require_foreground", crop_cfg.get("require_foreground_for_empty_crops", True))):
+            min_empty_fg = float(_split_crop_cfg(crop_cfg, split_name, "negative_min_foreground_fraction", crop_cfg.get("min_foreground_fraction", 0.35)))
+            fg_threshold = _split_crop_cfg(crop_cfg, split_name, "foreground_threshold", crop_cfg.get("deterministic_foreground_threshold", None))
+            fg_fraction = _foreground_fraction_in_window(
+                _tensor_to_float2d(image),
+                window,
+                crop_size=crop_size,
+                threshold=fg_threshold,
+                pad_value=float(crop_cfg.get("pad_value", 0.0)),
+            )
+            extra_info = {**extra_info, "negative_foreground_filter_enabled": 1, "negative_min_foreground_fraction": float(min_empty_fg), "negative_foreground_fraction": float(fg_fraction)}
+            if fg_fraction < min_empty_fg:
+                mark_source_skip(split_name, record, "foreground_too_low")
+                return False
 
         filename = _make_crop_filename(record, split_name, crop_number, window)
         rel_img_path = Path("images") / split_name / filename
@@ -660,7 +771,13 @@ def export_square_crop_datasets(
         profiler.start("write labels and metadata rows")
         _write_yolo_label_file(labels_path, boxes, width=crop_size, height=crop_size, save_empty=save_empty_labels)
 
-        crop_info = {"window_xyxy": window, **extra_info, **crop_result.info}
+        crop_info = {
+            "window_xyxy": window,
+            "source_index": int(source_row.get("source_index", -1)),
+            "source_saved_crops_so_far": int(source_row.get("saved_crops", 0)),
+            **extra_info,
+            **crop_result.info,
+        }
         image_meta = _coco_image_record(
             image_id_counter,
             filename,
@@ -701,6 +818,20 @@ def export_square_crop_datasets(
                 crop_info=crop_info,
             )
         )
+        source_row["saved_crops"] = int(source_row.get("saved_crops", 0)) + 1
+        if boxes.shape[0] > 0:
+            source_row["saved_positive_crops"] = int(source_row.get("saved_positive_crops", 0)) + 1
+        else:
+            source_row["saved_negative_crops"] = int(source_row.get("saved_negative_crops", 0)) + 1
+        source_row["exported_mass_box_instances"] = int(source_row.get("exported_mass_box_instances", 0)) + int(boxes.shape[0])
+        ann_index = extra_info.get("annotation_index", None)
+        if ann_index is not None and boxes.shape[0] > 0:
+            try:
+                source_row.setdefault("_included_annotation_indices", set()).add(int(ann_index))
+            except Exception:
+                pass
+        if deduplicate:
+            saved_window_keys.add((split_name, str(record.get("image_id", "")), int(window[0]), int(window[1]), int(window[2]), int(window[3])))
         image_id_counter += 1
         profiler.stop("write labels and metadata rows")
         return True
@@ -727,6 +858,8 @@ def export_square_crop_datasets(
             iterator = _progress(online_records, show_progress, f"Export square crops {split_name} online balance", unit="img")
             for record in iterator:
                 image, target = get_preprocessed(record)
+                source_row_for(split_name, record)["processed_source_image"] = 1
+                note_source_target(split_name, record, target)
                 height, width = int(image.shape[-2]), int(image.shape[-1])
                 windows = _profiled_call(
                     profiler,
@@ -742,6 +875,7 @@ def export_square_crop_datasets(
                         rng=rng,
                     ),
                 )
+                source_row_for(split_name, record)["candidate_windows"] = int(source_row_for(split_name, record).get("candidate_windows", 0)) + len(windows)
                 for window, extra_info in windows:
                     is_positive_window = int(extra_info.get("is_positive_window", 0)) == 1
                     if not is_positive_window and not _online_should_save_negative(positive_saved, negative_saved, target_ratio):
@@ -792,6 +926,8 @@ def export_square_crop_datasets(
             iterator = _progress(records, show_progress, f"Plan square crops {split_name}", unit="img")
             for record in iterator:
                 image, target = get_preprocessed(record)
+                source_row_for(split_name, record)["processed_source_image"] = 1
+                note_source_target(split_name, record, target)
                 height, width = int(image.shape[-2]), int(image.shape[-1])
                 windows = _profiled_call(
                     profiler,
@@ -807,6 +943,7 @@ def export_square_crop_datasets(
                         rng=rng,
                     ),
                 )
+                source_row_for(split_name, record)["candidate_windows"] = int(source_row_for(split_name, record).get("candidate_windows", 0)) + len(windows)
                 candidates.extend((record, window, extra_info) for window, extra_info in windows)
                 processed_records_for_progress += 1
                 maybe_emit_profiler_progress({
@@ -848,6 +985,8 @@ def export_square_crop_datasets(
             iterator = _progress(records, show_progress, f"Plan square crops {split_name}", unit="img")
             for record in iterator:
                 image, target = get_preprocessed(record)
+                source_row_for(split_name, record)["processed_source_image"] = 1
+                note_source_target(split_name, record, target)
                 height, width = int(image.shape[-2]), int(image.shape[-1])
                 windows = _profiled_call(
                     profiler,
@@ -863,6 +1002,7 @@ def export_square_crop_datasets(
                         rng=rng,
                     ),
                 )
+                source_row_for(split_name, record)["candidate_windows"] = int(source_row_for(split_name, record).get("candidate_windows", 0)) + len(windows)
                 candidates.extend((record, window, extra_info) for window, extra_info in windows)
                 processed_records_for_progress += 1
                 maybe_emit_profiler_progress({
@@ -894,6 +1034,8 @@ def export_square_crop_datasets(
         iterator = _progress(records, show_progress, f"Export square crops {split_name}", unit="img")
         for record in iterator:
             image, target = get_preprocessed(record)
+            source_row_for(split_name, record)["processed_source_image"] = 1
+            note_source_target(split_name, record, target)
             height, width = int(image.shape[-2]), int(image.shape[-1])
             windows = _profiled_call(
                 profiler,
@@ -909,6 +1051,7 @@ def export_square_crop_datasets(
                     rng=rng,
                 ),
             )
+            source_row_for(split_name, record)["candidate_windows"] = int(source_row_for(split_name, record).get("candidate_windows", 0)) + len(windows)
             for crop_number, (window, extra_info) in enumerate(windows):
                 save_window(record=record, split_name=split_name, crop_number=crop_number, window=window, extra_info=extra_info)
             processed_records_for_progress += 1
@@ -926,7 +1069,15 @@ def export_square_crop_datasets(
         "write COCO CSV and summary files",
         lambda: _write_shared_export_files(crop_root, coco_by_split, stats_rows, metadata_rows, dataset_kind="square_crops"),
     )
+    created.extend(_write_square_crop_debug_logs(crop_root, stats_rows, source_debug))
     summary = _summary_from_stats(stats_rows)
+    summary["debug_logs"] = {
+        "folder": _path_as_posix(crop_root / "debug_logs"),
+        "crop_log_csv": _path_as_posix(crop_root / "debug_logs" / "crop_log.csv"),
+        "source_image_log_csv": _path_as_posix(crop_root / "debug_logs" / "source_image_log.csv"),
+        "crops_per_source_histogram_csv": _path_as_posix(crop_root / "debug_logs" / "crops_per_source_histogram.csv"),
+        "split_mass_coverage_csv": _path_as_posix(crop_root / "debug_logs" / "split_mass_coverage.csv"),
+    }
     summary["simple_profiler"] = profiler.snapshot()
     if progress_callback is not None:
         progress_callback({"event": "profiler_update", "stage": "export_square_crops", **profiler_snapshot_event()})
@@ -1501,6 +1652,87 @@ def export_baseline_dataset(
     needs_contralateral = _config_uses_contralateral_source(config)
     total_records_for_progress = sum(len(split_records.get(split, [])) for split in ["train", "val", "test"])
     processed_records_for_progress = 0
+
+    source_index_lookup: dict[tuple[str, str], int] = {}
+    source_debug: dict[tuple[str, str], dict[str, Any]] = {}
+    saved_window_keys: set[tuple[str, str, int, int, int, int]] = set()
+    for _split_name, _records in split_records.items():
+        for _idx, _record in enumerate(_records):
+            _image_id = str(_record.get("image_id", ""))
+            source_index_lookup[(_split_name, _image_id)] = int(_idx)
+            source_debug[(_split_name, _image_id)] = {
+                "split": _split_name,
+                "source_index": int(_idx),
+                "source_image_id": _image_id,
+                "source_study_id": str(_record.get("study_id", "")),
+                "laterality": _record.get("laterality", ""),
+                "view_position": _record.get("view_position", ""),
+                "official_split": _record.get("split", ""),
+                "processed_source_image": 0,
+                "n_source_mass_boxes": 0,
+                "has_source_mass": 0,
+                "candidate_windows": 0,
+                "attempted_save_windows": 0,
+                "saved_crops": 0,
+                "saved_positive_crops": 0,
+                "saved_negative_crops": 0,
+                "exported_mass_box_instances": 0,
+                "skipped_windows": 0,
+                "skip_foreground_too_low": 0,
+                "skip_bbox_safe_failed": 0,
+                "skip_duplicate_window": 0,
+                "skip_empty_disallowed": 0,
+                "_included_annotation_indices": set(),
+            }
+
+    def source_row_for(split_name_: str, record_: dict[str, Any]) -> dict[str, Any]:
+        image_id_ = str(record_.get("image_id", ""))
+        key_ = (split_name_, image_id_)
+        if key_ not in source_debug:
+            source_debug[key_] = {
+                "split": split_name_,
+                "source_index": int(source_index_lookup.get(key_, -1)),
+                "source_image_id": image_id_,
+                "source_study_id": str(record_.get("study_id", "")),
+                "laterality": record_.get("laterality", ""),
+                "view_position": record_.get("view_position", ""),
+                "official_split": record_.get("split", ""),
+                "processed_source_image": 0,
+                "n_source_mass_boxes": 0,
+                "has_source_mass": 0,
+                "candidate_windows": 0,
+                "attempted_save_windows": 0,
+                "saved_crops": 0,
+                "saved_positive_crops": 0,
+                "saved_negative_crops": 0,
+                "exported_mass_box_instances": 0,
+                "skipped_windows": 0,
+                "skip_foreground_too_low": 0,
+                "skip_bbox_safe_failed": 0,
+                "skip_duplicate_window": 0,
+                "skip_empty_disallowed": 0,
+                "_included_annotation_indices": set(),
+            }
+        return source_debug[key_]
+
+    def note_source_target(split_name_: str, record_: dict[str, Any], target_: dict[str, Any]) -> dict[str, Any]:
+        row_ = source_row_for(split_name_, record_)
+        boxes_ = target_.get("mass", {}).get("boxes", torch.zeros((0, 4)))
+        try:
+            n_mass_ = int(boxes_.detach().cpu().reshape(-1, 4).shape[0])
+        except Exception:
+            n_mass_ = 0
+        row_["processed_source_image"] = 1
+        row_["n_source_mass_boxes"] = max(int(row_.get("n_source_mass_boxes", 0)), n_mass_)
+        row_["has_source_mass"] = int(row_["n_source_mass_boxes"] > 0)
+        return row_
+
+    def mark_source_skip(split_name_: str, record_: dict[str, Any], reason: str) -> None:
+        row_ = source_row_for(split_name_, record_)
+        row_["skipped_windows"] = int(row_.get("skipped_windows", 0)) + 1
+        key_name = f"skip_{reason}"
+        if key_name in row_:
+            row_[key_name] = int(row_.get(key_name, 0)) + 1
 
     def get_preprocessed(record_: dict[str, Any]) -> tuple[torch.Tensor, dict[str, Any]]:
         key = str(record_.get("image_id", ""))
@@ -2101,17 +2333,44 @@ def _foreground_fraction_in_window(
 
 
 def _foreground_mask(arr: np.ndarray, threshold: float | None = None) -> np.ndarray:
+    """Robust breast foreground mask for statistics and foreground filtering.
+
+    Tiny nonzero background noise used to pass the old low threshold. The new
+    default threshold is a small fraction of the image range, and connected
+    component cleanup removes isolated noisy speckles.
+    """
+    arr = np.asarray(arr, dtype=np.float32)
     finite = np.isfinite(arr)
     if not finite.any():
-        return np.ones_like(arr, dtype=bool)
+        return np.zeros_like(arr, dtype=bool)
     vals = arr[finite]
     if threshold is None:
-        lo, hi = np.percentile(vals, [1.0, 99.0])
-        threshold = max(float(lo + 0.03 * (hi - lo)), float(lo) + 1e-6)
+        lo, hi = np.percentile(vals, [1.0, 99.5])
+        threshold = max(float(lo + 0.02 * (hi - lo)), float(lo) + 1e-6)
     mask = finite & (arr > float(threshold))
-    if mask.sum() < max(10, int(0.001 * arr.size)):
-        mask = finite
+    mask = _cleanup_foreground_mask(mask, min_area_fraction=0.001, keep_largest=True)
     return mask
+
+
+def _cleanup_foreground_mask(mask: np.ndarray, *, min_area_fraction: float = 0.001, keep_largest: bool = True) -> np.ndarray:
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any():
+        return mask
+    if cv2 is None:
+        return mask
+    num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    if num_labels <= 1:
+        return mask
+    areas = stats[1:, cv2.CC_STAT_AREA].astype(np.int64)
+    if areas.size == 0:
+        return np.zeros_like(mask, dtype=bool)
+    min_area = max(1, int(round(float(mask.size) * float(min_area_fraction))))
+    largest_label = int(np.argmax(areas)) + 1
+    keep_labels = {largest_label} if keep_largest else set()
+    for label_idx, area in enumerate(areas, start=1):
+        if int(area) >= min_area:
+            keep_labels.add(int(label_idx))
+    return np.isin(labels, list(keep_labels)).astype(bool, copy=False)
 
 
 def _safe_percentile(arr: np.ndarray, percentiles: Iterable[float], mask: np.ndarray | None = None) -> tuple[float, float]:
@@ -2163,6 +2422,147 @@ def _equalize_uint8(img: np.ndarray, mask: np.ndarray | None = None) -> np.ndarr
 # -----------------------------------------------------------------------------
 # Annotation and metadata writers
 # -----------------------------------------------------------------------------
+
+
+def _write_square_crop_debug_logs(
+    crop_root: Path,
+    stats_rows: list[dict[str, Any]],
+    source_debug: dict[tuple[str, str], dict[str, Any]],
+) -> list[Path]:
+    """Write human-readable debug logs for crop provenance and coverage."""
+    created: list[Path] = []
+    debug_dir = crop_root / "debug_logs"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    crop_log_cols = [
+        "split",
+        "source_index",
+        "source_image_id",
+        "source_study_id",
+        "file_name",
+        "has_mass",
+        "num_mass_boxes",
+        "is_positive_window",
+        "crop_mode",
+        "crop_window_xyxy",
+        "negative_foreground_fraction",
+        "bbox_safe_foreground_fraction",
+        "bbox_safe_margin_ok",
+        "contralateral_image_id",
+        "contralateral_alignment_method",
+        "contralateral_alignment_shift_y",
+    ]
+    crop_df = pd.DataFrame(stats_rows)
+    for col in crop_log_cols:
+        if col not in crop_df.columns:
+            crop_df[col] = ""
+    crop_log_path = debug_dir / "crop_log.csv"
+    crop_df[crop_log_cols].to_csv(crop_log_path, index=False)
+    created.append(crop_log_path)
+
+    source_rows: list[dict[str, Any]] = []
+    for row in source_debug.values():
+        out = {k: v for k, v in row.items() if not k.startswith("_")}
+        included = row.get("_included_annotation_indices", set())
+        try:
+            included_count = len(included)
+            included_list = ",".join(str(int(v)) for v in sorted(included))
+        except Exception:
+            included_count = 0
+            included_list = ""
+        out["included_target_annotation_count"] = int(included_count)
+        out["included_target_annotation_indices"] = included_list
+        out["source_image_has_no_saved_crops"] = int(int(out.get("saved_crops", 0)) == 0)
+        source_rows.append(out)
+    source_df = pd.DataFrame(source_rows)
+    if not source_df.empty:
+        source_df = source_df.sort_values(["split", "source_index", "source_image_id"])
+    source_log_path = debug_dir / "source_image_log.csv"
+    source_df.to_csv(source_log_path, index=False)
+    created.append(source_log_path)
+
+    hist_path = debug_dir / "crops_per_source_histogram.csv"
+    if source_df.empty:
+        pd.DataFrame(columns=["split", "n_crops", "n_source_images"]).to_csv(hist_path, index=False)
+    else:
+        hist_df = (
+            source_df.groupby(["split", "saved_crops"], dropna=False)
+            .size()
+            .reset_index(name="n_source_images")
+            .rename(columns={"saved_crops": "n_crops"})
+            .sort_values(["split", "n_crops"])
+        )
+        hist_df.to_csv(hist_path, index=False)
+    created.append(hist_path)
+
+    coverage_rows: list[dict[str, Any]] = []
+    for split_name in ["train", "val", "test"]:
+        if source_df.empty:
+            sdf = pd.DataFrame()
+        else:
+            sdf = source_df[source_df["split"] == split_name].copy()
+        if crop_df.empty:
+            cdf = pd.DataFrame()
+        else:
+            cdf = crop_df[crop_df["split"] == split_name].copy()
+        total_source_masses = int(pd.to_numeric(sdf.get("n_source_mass_boxes", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not sdf.empty else 0
+        included_target = int(pd.to_numeric(sdf.get("included_target_annotation_count", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not sdf.empty else 0
+        exported_mass_instances = int(pd.to_numeric(sdf.get("exported_mass_box_instances", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not sdf.empty else 0
+        saved_crops = int(pd.to_numeric(sdf.get("saved_crops", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not sdf.empty else 0
+        positive_crops = int(pd.to_numeric(sdf.get("saved_positive_crops", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not sdf.empty else 0
+        negative_crops = int(pd.to_numeric(sdf.get("saved_negative_crops", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not sdf.empty else 0
+        coverage_rows.append({
+            "split": split_name,
+            "source_images": int(len(sdf)),
+            "source_images_with_mass": int(pd.to_numeric(sdf.get("has_source_mass", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not sdf.empty else 0,
+            "source_images_with_no_saved_crops": int(pd.to_numeric(sdf.get("source_image_has_no_saved_crops", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not sdf.empty else 0,
+            "source_mass_annotations": int(total_source_masses),
+            "included_target_mass_annotations": int(included_target),
+            "included_target_mass_annotation_fraction": float(included_target / total_source_masses) if total_source_masses > 0 else 0.0,
+            "exported_mass_box_instances": int(exported_mass_instances),
+            "saved_crops": int(saved_crops),
+            "positive_crops": int(positive_crops),
+            "negative_crops": int(negative_crops),
+            "achieved_positive_crop_ratio": float(positive_crops / max(1, saved_crops)),
+            "saved_crop_rows_in_crop_log": int(len(cdf)),
+        })
+    coverage_df = pd.DataFrame(coverage_rows)
+    coverage_path = debug_dir / "split_mass_coverage.csv"
+    coverage_df.to_csv(coverage_path, index=False)
+    created.append(coverage_path)
+
+    summary = {
+        "debug_folder": _path_as_posix(debug_dir),
+        "source_images_total": int(len(source_df)),
+        "saved_crops_total": int(len(crop_df)),
+        "source_images_with_no_saved_crops_total": int(source_df["source_image_has_no_saved_crops"].sum()) if not source_df.empty and "source_image_has_no_saved_crops" in source_df else 0,
+        "coverage_by_split": coverage_rows,
+    }
+    summary_json_path = debug_dir / "debug_summary.json"
+    with open(summary_json_path, "w", encoding="utf-8") as f:
+        json.dump(_json_safe(summary), f, indent=2, ensure_ascii=False)
+    created.append(summary_json_path)
+
+    summary_txt_path = crop_root.parent / "square_crop_debug_summary.txt"
+    lines = [
+        "Square crop debug summary",
+        "=========================",
+        f"Debug folder: {_path_as_posix(debug_dir)}",
+        f"Saved crops total: {summary['saved_crops_total']}",
+        f"Source images with no saved crops: {summary['source_images_with_no_saved_crops_total']}",
+        "",
+        "Per split:",
+    ]
+    for row in coverage_rows:
+        lines.append(
+            f"- {row['split']}: saved={row['saved_crops']}, positive={row['positive_crops']}, "
+            f"negative={row['negative_crops']}, source_masses={row['source_mass_annotations']}, "
+            f"included_target_masses={row['included_target_mass_annotations']}, "
+            f"no_data_images={row['source_images_with_no_saved_crops']}"
+        )
+    summary_txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    created.append(summary_txt_path)
+    return created
 
 
 def _write_shared_export_files(
@@ -2436,6 +2836,7 @@ def _sample_stats_row(
         row.update(
             {
                 "crop_window_xyxy": "" if window is None else str(tuple(int(v) for v in window)),
+                "source_index": crop_info.get("source_index", ""),
                 "crop_mode": crop_info.get("crop_mode"),
                 "deterministic_selection_mode": crop_info.get("deterministic_selection_mode", ""),
                 "source_image_has_finding": crop_info.get("source_image_has_finding", ""),
@@ -2445,6 +2846,9 @@ def _sample_stats_row(
                 "foreground_filter_enabled": crop_info.get("foreground_filter_enabled", ""),
                 "foreground_fraction": crop_info.get("foreground_fraction", ""),
                 "min_foreground_fraction": crop_info.get("min_foreground_fraction", ""),
+                "negative_foreground_filter_enabled": crop_info.get("negative_foreground_filter_enabled", ""),
+                "negative_foreground_fraction": crop_info.get("negative_foreground_fraction", ""),
+                "negative_min_foreground_fraction": crop_info.get("negative_min_foreground_fraction", ""),
                 "bbox_safe_boundary_margin_fraction": crop_info.get("bbox_safe_boundary_margin_fraction", ""),
                 "bbox_safe_boundary_margin_px": crop_info.get("bbox_safe_boundary_margin_px", ""),
                 "bbox_safe_visible_boxes": crop_info.get("bbox_safe_visible_boxes", ""),

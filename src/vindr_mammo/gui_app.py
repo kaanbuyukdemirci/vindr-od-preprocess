@@ -3959,14 +3959,31 @@ def _foreground_mask_for_crop(arr: np.ndarray, *, threshold: float | None) -> np
     finite = np.isfinite(arr)
     if not finite.any():
         return np.zeros(arr.shape, dtype=bool)
+    vals = arr[finite]
     if threshold is None:
-        vals = arr[finite]
-        lo, hi = np.percentile(vals, [1.0, 99.0])
-        threshold = max(float(lo + 0.03 * (hi - lo)), float(lo) + 1e-6)
+        lo, hi = np.percentile(vals, [1.0, 99.5])
+        threshold = max(float(lo + 0.02 * (hi - lo)), float(lo) + 1e-6)
     mask = finite & (arr > float(threshold))
-    if mask.sum() < max(10, int(0.001 * arr.size)):
-        mask = finite
-    return mask
+    return _cleanup_foreground_mask(mask, min_area_fraction=0.001)
+
+
+def _cleanup_foreground_mask(mask: np.ndarray, *, min_area_fraction: float = 0.001) -> np.ndarray:
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any() or cv2 is None:
+        return mask
+    num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    if num_labels <= 1:
+        return mask
+    areas = stats[1:, cv2.CC_STAT_AREA].astype(np.int64)
+    if areas.size == 0:
+        return np.zeros_like(mask, dtype=bool)
+    largest_label = int(np.argmax(areas)) + 1
+    min_area = max(1, int(round(float(mask.size) * float(min_area_fraction))))
+    keep_labels = {largest_label}
+    for label_idx, area in enumerate(areas, start=1):
+        if int(area) >= min_area:
+            keep_labels.add(int(label_idx))
+    return np.isin(labels, list(keep_labels)).astype(bool, copy=False)
 
 
 # -----------------------------------------------------------------------------

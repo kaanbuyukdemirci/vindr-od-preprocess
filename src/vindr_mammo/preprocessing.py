@@ -141,10 +141,16 @@ def _image_to_numpy(image: torch.Tensor) -> np.ndarray:
 
 
 def _breast_mask(arr: np.ndarray, *, threshold: float | None = None) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float32)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return np.zeros(arr.shape, dtype=bool)
     if threshold is None:
-        p_low, p_high = np.percentile(arr, [1.0, 99.0])
-        threshold = max(float(p_low + 0.03 * (p_high - p_low)), float(p_low) + 1e-6)
-    return arr > float(threshold)
+        p_low, p_high = np.percentile(finite, [1.0, 99.5])
+        # Use a slightly higher range-based threshold so low-level detector or
+        # compression noise in the nominally black background is not counted as breast.
+        threshold = max(float(p_low + 0.02 * (p_high - p_low)), float(p_low) + 1e-6)
+    return np.isfinite(arr) & (arr > float(threshold))
 
 
 def _empty_boxes() -> torch.Tensor:

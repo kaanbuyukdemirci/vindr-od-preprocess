@@ -8,6 +8,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+try:
+    import cv2
+except Exception:  # pragma: no cover
+    cv2 = None
+
 
 DEFAULT_CROP_OPTIONS: dict[str, Any] = {
     "enabled": False,
@@ -37,6 +42,10 @@ DEFAULT_CROP_OPTIONS: dict[str, Any] = {
     "bbox_safe_left_bias_strength": 0.25,
     "bbox_safe_projection_bias_strength": 0.25,
     "bbox_safe_foreground_threshold": None,
+    "bbox_safe_foreground_threshold_fraction": 0.02,
+    "bbox_safe_foreground_keep_largest_component": True,
+    "bbox_safe_foreground_min_component_area_fraction": 0.001,
+    "bbox_safe_min_foreground_fraction": 0.35,
     # If True, bbox_safe_random may report an unsafe fallback, but exporters and
     # previews should skip it instead of writing a crop that violates the margin.
     "bbox_safe_skip_unsafe_fallbacks": True,
@@ -458,7 +467,7 @@ def sample_bbox_safe_breast_biased_square_window(
     shift = float(opts.get("bbox_safe_random_shift_fraction", opts.get("center_shift_fraction", 0.25))) * float(n)
 
     image_np = _image_tensor_to_2d_numpy(image_tensor)
-    foreground_mask = _foreground_mask_for_crop_sampling(image_np, opts.get("bbox_safe_foreground_threshold", None))
+    foreground_mask = _foreground_mask_for_crop_sampling(image_np, opts.get("bbox_safe_foreground_threshold", None), opts)
     projection = foreground_mask.sum(axis=0).astype(np.float32) if foreground_mask.size else np.zeros((max(1, int(image_width)),), dtype=np.float32)
     peak_x = int(np.argmax(projection)) if projection.size and float(projection.max()) > 0 else int(image_width) // 2
 
@@ -585,7 +594,7 @@ def sample_breast_biased_clean_square_window(
     max_tries = max(1, int(opts.get("max_random_tries", 80)))
     candidate_count = max(max_tries, int(opts.get("bbox_safe_candidate_count", max_tries)))
     image_np = _image_tensor_to_2d_numpy(image_tensor)
-    foreground_mask = _foreground_mask_for_crop_sampling(image_np, opts.get("bbox_safe_foreground_threshold", None))
+    foreground_mask = _foreground_mask_for_crop_sampling(image_np, opts.get("bbox_safe_foreground_threshold", None), opts)
     projection = foreground_mask.sum(axis=0).astype(np.float32) if foreground_mask.size else np.zeros((max(1, int(image_width)),), dtype=np.float32)
     peak_x = int(np.argmax(projection)) if projection.size and float(projection.max()) > 0 else int(image_width) // 2
     max_x = max(0, int(image_width) - n)
@@ -596,6 +605,9 @@ def sample_breast_biased_clean_square_window(
             continue
         x0 = window[0]
         fg = _foreground_fraction_from_mask(foreground_mask, window, n)
+        min_fg = float(opts.get("bbox_safe_min_foreground_fraction", opts.get("min_foreground_fraction", 0.0)) or 0.0)
+        if min_fg > 0.0 and fg < min_fg:
+            continue
         left_score = 1.0 - (float(x0) / float(max_x)) if max_x > 0 else 1.0
         projection_score = _projection_peak_score(peak_x, window, n)
         score = fg + 0.25 * left_score + 0.25 * projection_score
@@ -768,20 +780,55 @@ def _image_tensor_to_2d_numpy(image_tensor: torch.Tensor) -> np.ndarray:
     return arr
 
 
-def _foreground_mask_for_crop_sampling(image_np: np.ndarray, threshold: Any) -> np.ndarray:
+def _foreground_mask_for_crop_sampling(image_np: np.ndarray, threshold: Any, options: dict[str, Any] | None = None) -> np.ndarray:
+    """Robust breast foreground mask used for crop scoring/filtering.
+
+    The old version used a very low threshold, so tiny nonzero background noise
+    could turn most of the crop into foreground. This version uses a threshold
+    based on the image intensity range and then optionally keeps only the largest
+    connected component, which is normally the breast.
+    """
+    opts = options or {}
     arr = np.asarray(image_np, dtype=np.float32)
-    finite = arr[np.isfinite(arr)]
+    finite_mask = np.isfinite(arr)
+    finite = arr[finite_mask]
     if finite.size == 0:
         return np.zeros(arr.shape, dtype=bool)
     if threshold is None:
-        positive = finite[finite > 0]
-        if positive.size > 0:
-            thr = max(float(np.percentile(positive, 1.0)) * 0.25, 1e-8)
-        else:
-            thr = float(np.percentile(finite, 5.0))
+        lo, hi = np.percentile(finite, [1.0, 99.5])
+        frac = float(opts.get("bbox_safe_foreground_threshold_fraction", opts.get("foreground_threshold_fraction", 0.02)) or 0.02)
+        thr = max(float(lo + frac * (hi - lo)), float(lo) + 1e-6)
     else:
         thr = float(threshold)
-    return np.isfinite(arr) & (arr > thr)
+    mask = finite_mask & (arr > thr)
+    if bool(opts.get("bbox_safe_foreground_keep_largest_component", opts.get("foreground_keep_largest_component", True))):
+        min_area_fraction = float(opts.get("bbox_safe_foreground_min_component_area_fraction", opts.get("foreground_min_component_area_fraction", 0.001)) or 0.001)
+        mask = _keep_large_foreground_components(mask, min_area_fraction=min_area_fraction)
+    return mask
+
+
+def _keep_large_foreground_components(mask: np.ndarray, *, min_area_fraction: float = 0.001) -> np.ndarray:
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any():
+        return mask
+    if cv2 is None:
+        return mask
+    num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    if num_labels <= 1:
+        return mask
+    areas = stats[1:, cv2.CC_STAT_AREA].astype(np.int64)
+    if areas.size == 0:
+        return np.zeros_like(mask, dtype=bool)
+    min_area = max(1, int(round(float(mask.size) * float(min_area_fraction))))
+    largest_idx = int(np.argmax(areas)) + 1
+    # Keep the largest breast component and any other reasonably large connected
+    # foreground component. Tiny speckles from detector/background noise are removed.
+    keep_labels = {largest_idx}
+    for idx, area in enumerate(areas, start=1):
+        if int(area) >= min_area:
+            keep_labels.add(int(idx))
+    out = np.isin(labels, list(keep_labels))
+    return out.astype(bool, copy=False)
 
 
 def _foreground_fraction_from_mask(mask: np.ndarray, window_xyxy: tuple[int, int, int, int], crop_size: int) -> float:
