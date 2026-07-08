@@ -1213,7 +1213,14 @@ or, from the repository root:
 streamlit run inspect_preprocessing_app.py -- --config config/export_config.yaml
 ```
 
-The GUI can filter by train/val/test, positive images only or all images, vendor/device, crop positivity threshold, and crop index. It displays the full grayscale image, the selected grayscale crop, and the processed RGB crop together with mass boxes, statistics, metadata, optional per-channel panels with mass boxes, and compare-mode statistical similarity metrics. The old histogram plot was removed because it was not very informative for this workflow. See `docs/GUI_PREPROCESSING_INSPECTOR.md`.
+The GUI can filter by train/val/test, positive images only or all images, vendor/device, crop positivity threshold, and crop index. It displays the full grayscale image, the selected grayscale crop, and the processed RGB crop together with mass boxes, statistics, metadata, optional per-channel panels with mass boxes, and compare-mode statistical similarity metrics.
+
+For large DICOMs, keep **Manual preview refresh** enabled in the sidebar. You can change multiple parameters quickly, then click **Render / refresh preview** once to run the expensive DICOM read, breast crop, crop selection, RGB preprocessing, and rendering step.
+
+Detailed docs:
+
+- GUI workflow: `docs/GUI_PREPROCESSING_INSPECTOR.md`
+- Every GUI parameter: `docs/GUI_PARAMETER_REFERENCE.md`
 
 ## v26 GUI and crop-filter update
 

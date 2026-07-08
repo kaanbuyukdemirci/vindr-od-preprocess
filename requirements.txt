@@ -11,5 +11,6 @@ matplotlib
 pillow
 tqdm
 pyyaml
+scipy
 
 streamlit

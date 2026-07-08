@@ -35,6 +35,7 @@ dependencies = [
   "pillow",
   "tqdm",
   "pyyaml",
+  "scipy",
   "streamlit",
 ]
 

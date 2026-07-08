@@ -21,6 +21,13 @@ except Exception:  # pragma: no cover
     cv2 = None
 
 try:
+    from scipy import ndimage as scipy_ndimage
+    from scipy.signal import wiener as scipy_wiener
+except Exception:  # pragma: no cover
+    scipy_ndimage = None
+    scipy_wiener = None
+
+try:
     import yaml
 except Exception:  # pragma: no cover
     yaml = None
@@ -1893,6 +1900,10 @@ def _make_rgb_image(
         channels, ieg_meta = _make_intensity_equalized_gradient_rgb(arr, img_cfg, mask)
         meta.update(ieg_meta)
 
+    elif scheme in {"raw_clahe_detail", "raw_replicated", "raw_clahe_masked_raw", "raw_clahe_tophat"}:
+        channels, literature_meta = _make_literature_recipe_rgb(arr, img_cfg, mask, scheme)
+        meta.update(literature_meta)
+
     elif scheme in {"custom_channel_pipeline", "gui_channel_pipeline"}:
         channels, custom_meta = _make_custom_channel_pipeline_rgb(arr, img_cfg, mask, source_arrays=source_arrays)
         meta.update(custom_meta)
@@ -1923,10 +1934,11 @@ def _make_rgb_image(
         raise ValueError(
             "Unknown image_export.rgb_scheme. Expected one of: "
             "multi_window, grayscale_rgb, equalized_rgb, "
-            "intensity_equalized_gradient, custom_channel_pipeline, bitpack16."
+            "intensity_equalized_gradient, raw_clahe_detail, raw_replicated, "
+            "raw_clahe_masked_raw, raw_clahe_tophat, custom_channel_pipeline, bitpack16."
         )
 
-    if bool(eq_cfg.get("enabled", True)) and scheme not in {"equalized_rgb", "bitpack16", "intensity_equalized_gradient", "ieg", "normal_equalized_gradient", "custom_channel_pipeline", "gui_channel_pipeline"}:
+    if bool(eq_cfg.get("enabled", True)) and scheme not in {"equalized_rgb", "bitpack16", "intensity_equalized_gradient", "ieg", "normal_equalized_gradient", "raw_clahe_detail", "raw_replicated", "raw_clahe_masked_raw", "raw_clahe_tophat", "custom_channel_pipeline", "gui_channel_pipeline"}:
         apply_to = str(eq_cfg.get("apply_to", "all_channels")).casefold().strip()
         if apply_to == "all_channels":
             channels = [_equalize_uint8(ch, mask=mask) for ch in channels]
@@ -1941,6 +1953,77 @@ def _make_rgb_image(
     rgb = np.stack(channels, axis=-1).astype(np.uint8, copy=False)
     return rgb, meta
 
+
+def _make_literature_recipe_rgb(
+    arr: np.ndarray,
+    img_cfg: dict[str, Any],
+    mask: np.ndarray,
+    scheme: str,
+) -> tuple[list[np.ndarray], dict[str, Any]]:
+    cfg = dict(img_cfg.get("literature_recipes", {}) or {})
+    raw_window = cfg.get("raw_percentiles", img_cfg.get("single_window", [0.5, 99.5]))
+    raw = _apply_custom_channel_operation(arr, "percentile_normalize", {"percentiles": raw_window}, mask)
+    clahe = _apply_custom_channel_operation(
+        raw,
+        "clahe",
+        {
+            "clip_limit": float(cfg.get("clahe_clip_limit", 2.0)),
+            "tile_grid_size": int(cfg.get("clahe_tile_grid_size", 8)),
+        },
+        mask,
+    )
+    meta: dict[str, Any] = {
+        "rgb_scheme": scheme,
+        "literature_recipe": scheme,
+        "literature_raw_percentiles": list(raw_window),
+        "literature_clahe_clip_limit": float(cfg.get("clahe_clip_limit", 2.0)),
+        "literature_clahe_tile_grid_size": int(cfg.get("clahe_tile_grid_size", 8)),
+    }
+    if scheme == "raw_replicated":
+        return [_float_to_uint8_custom(raw)] * 3, {**meta, "rgb_channel_0": "raw", "rgb_channel_1": "raw", "rgb_channel_2": "raw"}
+    if scheme == "raw_clahe_masked_raw":
+        masked = raw.copy()
+        if mask is not None and mask.shape == raw.shape:
+            masked = np.where(mask, masked, 0.0).astype(np.float32)
+        return [_float_to_uint8_custom(raw), _float_to_uint8_custom(clahe), _float_to_uint8_custom(masked)], {
+            **meta,
+            "rgb_channel_0": "raw",
+            "rgb_channel_1": "clahe",
+            "rgb_channel_2": "masked_raw",
+        }
+    if scheme == "raw_clahe_tophat":
+        tophat = _apply_custom_channel_operation(
+            clahe if str(cfg.get("tophat_apply_to", "clahe")).casefold() == "clahe" else raw,
+            "white_tophat",
+            {
+                "kernel_size": int(cfg.get("tophat_kernel_size", 9)),
+                "kernel_shape": str(cfg.get("tophat_kernel_shape", "ellipse")),
+                "percentiles": cfg.get("detail_rescale_percentiles", [1.0, 99.0]),
+            },
+            mask,
+        )
+        return [_float_to_uint8_custom(raw), _float_to_uint8_custom(clahe), _float_to_uint8_custom(tophat)], {
+            **meta,
+            "rgb_channel_0": "raw",
+            "rgb_channel_1": "clahe",
+            "rgb_channel_2": "white_tophat",
+        }
+
+    detail = _apply_custom_channel_operation(
+        clahe,
+        "local_detail",
+        {
+            "sigma": float(cfg.get("detail_blur_sigma", 1.0)),
+            "percentiles": cfg.get("detail_rescale_percentiles", [1.0, 99.0]),
+        },
+        mask,
+    )
+    return [_float_to_uint8_custom(raw), _float_to_uint8_custom(clahe), _float_to_uint8_custom(detail)], {
+        **meta,
+        "rgb_channel_0": "raw",
+        "rgb_channel_1": "clahe",
+        "rgb_channel_2": "local_detail_residual",
+    }
 
 
 def _custom_channel_source(pipeline: dict[str, Any], channel: str) -> str:
@@ -2073,30 +2156,72 @@ def _apply_custom_channel_operation(
         tile = int(params.get("tile_grid_size", 8))
         clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile, tile))
         return clahe.apply(img).astype(np.float32) / 255.0
+    if op in {"mask_outside_breast", "artifact_cleanup"}:
+        if mask is None or mask.shape != arr.shape:
+            mask = _foreground_mask(arr)
+        return np.where(mask, arr, float(params.get("outside_value", 0.0))).astype(np.float32)
     if op == "gaussian_blur":
-        if cv2 is None:
-            return arr
         k = _odd_int_custom(params.get("ksize", 5))
         sigma = float(params.get("sigma", 1.0))
-        return cv2.GaussianBlur(arr.astype(np.float32), (k, k), sigmaX=sigma).astype(np.float32)
+        if cv2 is not None:
+            return cv2.GaussianBlur(arr.astype(np.float32), (k, k), sigmaX=sigma).astype(np.float32)
+        if scipy_ndimage is not None:
+            return scipy_ndimage.gaussian_filter(arr.astype(np.float32), sigma=max(sigma, 0.0)).astype(np.float32)
+        return arr
     if op == "median_blur":
+        k = _odd_int_custom(params.get("ksize", 3))
+        if cv2 is None and scipy_ndimage is not None:
+            return scipy_ndimage.median_filter(arr.astype(np.float32), size=k).astype(np.float32)
         if cv2 is None:
             return arr
-        k = _odd_int_custom(params.get("ksize", 3))
         return cv2.medianBlur(_float_to_uint8_custom(arr), k).astype(np.float32) / 255.0
+    if op == "bilateral_filter":
+        if cv2 is None:
+            sigma = float(params.get("sigma_space", 5.0))
+            if scipy_ndimage is not None:
+                return scipy_ndimage.gaussian_filter(arr.astype(np.float32), sigma=max(sigma / 3.0, 0.0)).astype(np.float32)
+            return arr
+        diameter = int(params.get("diameter", 5))
+        sigma_color = float(params.get("sigma_color", 0.05))
+        sigma_space = float(params.get("sigma_space", 5.0))
+        return cv2.bilateralFilter(arr.astype(np.float32), diameter, sigmaColor=sigma_color, sigmaSpace=sigma_space).astype(np.float32)
+    if op == "wiener_filter":
+        if scipy_wiener is None:
+            return arr
+        k = _odd_int_custom(params.get("ksize", 7))
+        noise = params.get("noise", None)
+        try:
+            out = scipy_wiener(arr.astype(np.float32), mysize=(k, k), noise=None if noise in {None, ""} else float(noise))
+        except Exception:
+            out = scipy_wiener(arr.astype(np.float32), mysize=(k, k))
+        return np.nan_to_num(out.astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0)
+    if op == "local_detail":
+        sigma = float(params.get("sigma", 1.0))
+        if cv2 is not None:
+            smooth = cv2.GaussianBlur(arr.astype(np.float32), (0, 0), sigmaX=sigma)
+        elif scipy_ndimage is not None:
+            smooth = scipy_ndimage.gaussian_filter(arr.astype(np.float32), sigma=max(sigma, 0.0))
+        else:
+            smooth = arr
+        detail = arr.astype(np.float32) - smooth.astype(np.float32)
+        lo, hi = _safe_percentile(detail, params.get("percentiles", [1.0, 99.0]), mask)
+        return ((np.clip(detail, lo, hi) - lo) / max(hi - lo, 1e-12)).astype(np.float32)
     if op == "sharpen":
         if cv2 is None:
-            return arr
+            return _apply_custom_channel_operation(arr, "unsharp_mask", {"amount": params.get("amount", 0.2), "sigma": 1.0}, mask)
         amount = float(params.get("amount", 1.0))
         kernel = np.array([[0, -1, 0], [-1, 4 + amount, -1], [0, -1, 0]], dtype=np.float32)
         kernel /= max(float(kernel.sum()), 1e-6)
         return cv2.filter2D(arr.astype(np.float32), -1, kernel).astype(np.float32)
     if op == "unsharp_mask":
-        if cv2 is None:
-            return arr
         amount = float(params.get("amount", 1.5))
         sigma = float(params.get("sigma", 2.0))
-        blurred = cv2.GaussianBlur(arr.astype(np.float32), (0, 0), sigmaX=sigma)
+        if cv2 is not None:
+            blurred = cv2.GaussianBlur(arr.astype(np.float32), (0, 0), sigmaX=sigma)
+        elif scipy_ndimage is not None:
+            blurred = scipy_ndimage.gaussian_filter(arr.astype(np.float32), sigma=max(sigma, 0.0))
+        else:
+            blurred = arr
         return (arr + amount * (arr - blurred)).astype(np.float32)
     if op == "sobel_gradient":
         ksize = _odd_int_custom(params.get("ksize", 3))
@@ -2119,6 +2244,16 @@ def _apply_custom_channel_operation(
             lap = np.abs(gxx + gyy).astype(np.float32)
         lo, hi = _safe_percentile(lap, params.get("percentiles", [1.0, 99.0]), mask)
         return ((np.clip(lap, lo, hi) - lo) / max(hi - lo, 1e-12)).astype(np.float32)
+    if op in {"white_tophat", "tophat"}:
+        return _morphology_contrast_custom(arr, params, mask, mode="white_tophat")
+    if op == "blackhat":
+        return _morphology_contrast_custom(arr, params, mask, mode="blackhat")
+    if op == "morphological_open":
+        return _morphology_basic_custom(arr, params, op_name="open")
+    if op == "morphological_close":
+        return _morphology_basic_custom(arr, params, op_name="close")
+    if op == "pectoral_suppression":
+        return _pectoral_suppression_custom(arr, params)
     if op == "gamma":
         gamma = max(float(params.get("gamma", 1.0)), 1e-6)
         return np.power(np.clip(_normalize_minmax_custom(arr, mask), 0.0, 1.0), gamma).astype(np.float32)
@@ -2129,6 +2264,69 @@ def _apply_custom_channel_operation(
     if op == "invert":
         return 1.0 - _normalize_minmax_custom(arr, mask)
     return arr
+
+
+def _morphology_kernel_custom(params: dict[str, Any]) -> np.ndarray | None:
+    k = _odd_int_custom(params.get("kernel_size", params.get("ksize", 9)))
+    shape = str(params.get("kernel_shape", "ellipse")).casefold().strip()
+    if cv2 is not None:
+        cv_shape = cv2.MORPH_ELLIPSE if shape == "ellipse" else cv2.MORPH_RECT
+        return cv2.getStructuringElement(cv_shape, (k, k))
+    return np.ones((k, k), dtype=bool)
+
+
+def _morphology_basic_custom(arr: np.ndarray, params: dict[str, Any], *, op_name: str) -> np.ndarray:
+    kernel = _morphology_kernel_custom(params)
+    if kernel is None:
+        return arr
+    if cv2 is not None:
+        code = cv2.MORPH_OPEN if op_name == "open" else cv2.MORPH_CLOSE
+        return cv2.morphologyEx(arr.astype(np.float32), code, kernel).astype(np.float32)
+    if scipy_ndimage is None:
+        return arr
+    fn = scipy_ndimage.grey_opening if op_name == "open" else scipy_ndimage.grey_closing
+    return fn(arr.astype(np.float32), footprint=kernel).astype(np.float32)
+
+
+def _morphology_contrast_custom(
+    arr: np.ndarray,
+    params: dict[str, Any],
+    mask: np.ndarray | None,
+    *,
+    mode: str,
+) -> np.ndarray:
+    if mode == "white_tophat":
+        opened = _morphology_basic_custom(arr, params, op_name="open")
+        out = arr.astype(np.float32) - opened.astype(np.float32)
+    else:
+        closed = _morphology_basic_custom(arr, params, op_name="close")
+        out = closed.astype(np.float32) - arr.astype(np.float32)
+    lo, hi = _safe_percentile(out, params.get("percentiles", [1.0, 99.0]), mask)
+    return ((np.clip(out, lo, hi) - lo) / max(hi - lo, 1e-12)).astype(np.float32)
+
+
+def _pectoral_suppression_custom(arr: np.ndarray, params: dict[str, Any]) -> np.ndarray:
+    """Conservative optional MLO pectoral suppression.
+
+    This masks a triangular upper-corner region only when explicitly requested.
+    It is intentionally simple and off by default because detection near the
+    chest wall can be clinically important.
+    """
+    out = arr.astype(np.float32).copy()
+    side = str(params.get("side", "left")).casefold().strip()
+    height, width = out.shape
+    width_fraction = float(params.get("width_fraction", 0.33))
+    height_fraction = float(params.get("height_fraction", 0.45))
+    fill_value = float(params.get("fill_value", 0.0))
+    tri_w = max(1, min(width, int(round(width * width_fraction))))
+    tri_h = max(1, min(height, int(round(height * height_fraction))))
+    for y in range(tri_h):
+        x_extent = int(round(tri_w * (1.0 - y / max(tri_h - 1, 1))))
+        if side == "right":
+            out[y, max(0, width - x_extent):width] = fill_value
+        else:
+            out[y, 0:min(width, x_extent)] = fill_value
+    return out
 
 
 def _standardize_to_target_custom(

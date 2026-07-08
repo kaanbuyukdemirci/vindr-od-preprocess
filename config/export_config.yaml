@@ -10,16 +10,39 @@ image:
   percentile_range:
   - 0.5
   - 99.5
-  use_voi_lut: false
+  use_voi_lut: true
 preprocess:
   invert_to_black_background: true
-  crop_breast: false
+  crop_breast: true
+  mask_outside_breast: true
   mirror_right_to_left: true
-  crop_padding: 20
+  crop_padding: null
+  crop_padding_fraction: 0.03
+  minimum_padding_px: 32
+  maximum_padding_px: 128
   crop_threshold: null
+  breast_mask_method: otsu_largest_connected_component
+  breast_mask_close_kernel: 21
+  breast_mask_open_kernel: 7
+  breast_mask_fill_holes: true
+  breast_mask_keep_largest_component: true
   min_component_area_fraction: 0.001
+  min_box_visibility_after_crop: 0.3
 image_export:
-  rgb_scheme: custom_channel_pipeline
+  rgb_scheme: raw_clahe_detail
+  literature_recipes:
+    raw_percentiles:
+    - 0.5
+    - 99.5
+    clahe_clip_limit: 2.0
+    clahe_tile_grid_size: 8
+    detail_blur_sigma: 1.0
+    detail_rescale_percentiles:
+    - 1.0
+    - 99.0
+    tophat_kernel_shape: ellipse
+    tophat_kernel_size: 9
+    tophat_apply_to: clahe
   multi_window_percentiles:
   - - 0.5
     - 99.5

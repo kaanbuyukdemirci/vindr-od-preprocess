@@ -15,10 +15,20 @@ except Exception:  # pragma: no cover
 DEFAULT_PREPROCESS_OPTIONS: dict[str, Any] = {
     "invert_to_black_background": False,  # handled in dicom_io through PhotometricInterpretation
     "crop_breast": False,
+    "mask_outside_breast": False,
     "mirror_right_to_left": False,
     "crop_padding": 10,
+    "crop_padding_fraction": 0.03,
+    "minimum_padding_px": 32,
+    "maximum_padding_px": 128,
     "crop_threshold": None,
+    "breast_mask_method": "otsu_largest_connected_component",
+    "breast_mask_close_kernel": 21,
+    "breast_mask_open_kernel": 7,
+    "breast_mask_fill_holes": True,
+    "breast_mask_keep_largest_component": True,
     "min_component_area_fraction": 0.001,
+    "min_box_visibility_after_crop": 0.30,
 }
 
 
@@ -62,23 +72,40 @@ def apply_geometry_preprocessing(
 
     info: dict[str, Any] = {
         "crop_breast": bool(opts["crop_breast"]),
+        "mask_outside_breast": bool(opts.get("mask_outside_breast", False)),
         "mirror_right_to_left": bool(opts["mirror_right_to_left"]),
         "crop_box_xyxy": None,
         "mirrored": False,
         "original_shape": (int(image.shape[-2]), int(image.shape[-1])),
     }
 
+    if opts.get("mask_outside_breast") and not opts["crop_breast"]:
+        mask = breast_mask(image, options=opts)
+        mask_t = torch.as_tensor(mask, dtype=image.dtype, device=image.device).unsqueeze(0)
+        image = image * mask_t
+        info["breast_mask_pixels"] = int(mask.sum())
+
     if opts["crop_breast"]:
         crop_box = breast_crop_box(
             image,
             threshold=opts.get("crop_threshold"),
-            padding=int(opts.get("crop_padding", 10)),
+            padding=opts.get("crop_padding", None),
+            padding_fraction=float(opts.get("crop_padding_fraction", 0.03)),
+            minimum_padding_px=int(opts.get("minimum_padding_px", 32)),
+            maximum_padding_px=opts.get("maximum_padding_px", 128),
             min_component_area_fraction=float(opts.get("min_component_area_fraction", 0.001)),
+            options=opts,
         )
+        mask = breast_mask(image, options=opts)
         x0, y0, x1, y1 = crop_box
         image = image[:, y0:y1, x0:x1].contiguous()
-        boxes, box_keep = _crop_boxes(boxes, crop_box)
-        mass_boxes, mass_box_keep = _crop_boxes(mass_boxes, crop_box)
+        boxes, box_keep = _crop_boxes(boxes, crop_box, min_visibility=float(opts.get("min_box_visibility_after_crop", 0.30)))
+        mass_boxes, mass_box_keep = _crop_boxes(mass_boxes, crop_box, min_visibility=float(opts.get("min_box_visibility_after_crop", 0.30)))
+        if opts.get("mask_outside_breast"):
+            crop_mask = mask[y0:y1, x0:x1]
+            mask_t = torch.as_tensor(crop_mask, dtype=image.dtype, device=image.device).unsqueeze(0)
+            image = image * mask_t
+            info["breast_mask_pixels"] = int(crop_mask.sum())
         info["crop_box_xyxy"] = crop_box
 
     if opts["mirror_right_to_left"]:
@@ -98,28 +125,35 @@ def breast_crop_box(
     image: torch.Tensor,
     *,
     threshold: float | None = None,
-    padding: int = 10,
+    padding: int | None = 10,
+    padding_fraction: float = 0.03,
+    minimum_padding_px: int = 32,
+    maximum_padding_px: int | None = 128,
     min_component_area_fraction: float = 0.001,
+    options: dict[str, Any] | None = None,
 ) -> tuple[int, int, int, int]:
     arr = _image_to_numpy(image)
     height, width = arr.shape
-    mask = _breast_mask(arr, threshold=threshold)
+    opts = make_preprocess_options(options)
+    opts["crop_threshold"] = threshold
+    opts["min_component_area_fraction"] = min_component_area_fraction
+    mask = _breast_mask(arr, threshold=threshold, options=opts)
     if not mask.any():
         return (0, 0, width, height)
 
-    if cv2 is not None:
-        num, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
-        if num > 1:
-            areas = stats[1:, cv2.CC_STAT_AREA]
-            largest = int(np.argmax(areas) + 1)
-            if areas[largest - 1] >= min_component_area_fraction * height * width:
-                mask = labels == largest
-
     ys, xs = np.where(mask)
-    x0 = max(0, int(xs.min()) - padding)
-    x1 = min(width, int(xs.max()) + 1 + padding)
-    y0 = max(0, int(ys.min()) - padding)
-    y1 = min(height, int(ys.max()) + 1 + padding)
+    if padding is None:
+        breast_h = int(ys.max()) - int(ys.min()) + 1
+        breast_w = int(xs.max()) - int(xs.min()) + 1
+        pad = max(int(minimum_padding_px), int(round(float(padding_fraction) * max(breast_h, breast_w))))
+        if maximum_padding_px is not None:
+            pad = min(pad, int(maximum_padding_px))
+    else:
+        pad = int(padding)
+    x0 = max(0, int(xs.min()) - pad)
+    x1 = min(width, int(xs.max()) + 1 + pad)
+    y0 = max(0, int(ys.min()) - pad)
+    y1 = min(height, int(ys.max()) + 1 + pad)
     if x1 <= x0 or y1 <= y0:
         return (0, 0, width, height)
     return (x0, y0, x1, y1)
@@ -140,33 +174,94 @@ def _image_to_numpy(image: torch.Tensor) -> np.ndarray:
     return arr
 
 
-def _breast_mask(arr: np.ndarray, *, threshold: float | None = None) -> np.ndarray:
+def breast_mask(image: torch.Tensor, *, options: dict[str, Any] | None = None) -> np.ndarray:
+    opts = make_preprocess_options(options)
+    return _breast_mask(_image_to_numpy(image), threshold=opts.get("crop_threshold"), options=opts)
+
+
+def _breast_mask(arr: np.ndarray, *, threshold: float | None = None, options: dict[str, Any] | None = None) -> np.ndarray:
+    opts = make_preprocess_options(options)
     arr = np.asarray(arr, dtype=np.float32)
     finite = arr[np.isfinite(arr)]
     if finite.size == 0:
         return np.zeros(arr.shape, dtype=bool)
     if threshold is None:
+        method = str(opts.get("breast_mask_method", "otsu_largest_connected_component")).casefold().strip()
+        if method.startswith("otsu") and cv2 is not None:
+            img = _arr_to_uint8_for_mask(arr)
+            threshold, _ = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            threshold = float(threshold) / 255.0
+            arr_for_threshold = img.astype(np.float32) / 255.0
+            mask = np.isfinite(arr_for_threshold) & (arr_for_threshold > threshold)
+            return _postprocess_breast_mask(mask, opts)
         p_low, p_high = np.percentile(finite, [1.0, 99.5])
-        # Use a slightly higher range-based threshold so low-level detector or
-        # compression noise in the nominally black background is not counted as breast.
         threshold = max(float(p_low + 0.02 * (p_high - p_low)), float(p_low) + 1e-6)
-    return np.isfinite(arr) & (arr > float(threshold))
+    mask = np.isfinite(arr) & (arr > float(threshold))
+    return _postprocess_breast_mask(mask, opts)
+
+
+def _arr_to_uint8_for_mask(arr: np.ndarray) -> np.ndarray:
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return np.zeros(arr.shape, dtype=np.uint8)
+    lo, hi = np.percentile(finite, [1.0, 99.5])
+    if hi <= lo:
+        lo, hi = float(finite.min()), float(finite.max())
+    if hi <= lo:
+        return np.zeros(arr.shape, dtype=np.uint8)
+    return np.round(np.clip((arr - lo) / (hi - lo), 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+def _postprocess_breast_mask(mask: np.ndarray, opts: dict[str, Any]) -> np.ndarray:
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any() or cv2 is None:
+        return mask
+    open_k = int(opts.get("breast_mask_open_kernel", 7) or 0)
+    close_k = int(opts.get("breast_mask_close_kernel", 21) or 0)
+    work = mask.astype(np.uint8)
+    if open_k > 1:
+        work = cv2.morphologyEx(work, cv2.MORPH_OPEN, _ellipse_kernel(open_k))
+    if close_k > 1:
+        work = cv2.morphologyEx(work, cv2.MORPH_CLOSE, _ellipse_kernel(close_k))
+    mask = work.astype(bool)
+    if bool(opts.get("breast_mask_keep_largest_component", True)):
+        mask = _largest_component_mask(mask, min_area_fraction=float(opts.get("min_component_area_fraction", 0.001)))
+    if bool(opts.get("breast_mask_fill_holes", True)):
+        flood = mask.astype(np.uint8).copy()
+        h, w = flood.shape
+        flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        cv2.floodFill(flood, flood_mask, (0, 0), 1)
+        holes = ~flood.astype(bool)
+        mask = mask | holes
+    return mask
+
+
+def _ellipse_kernel(size: int) -> np.ndarray:
+    k = int(size)
+    if k < 1:
+        k = 1
+    if k % 2 == 0:
+        k += 1
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
 
 
 def _empty_boxes() -> torch.Tensor:
     return torch.zeros((0, 4), dtype=torch.float32)
 
 
-def _crop_boxes(boxes: torch.Tensor, crop_box: tuple[int, int, int, int]) -> tuple[torch.Tensor, torch.Tensor]:
+def _crop_boxes(boxes: torch.Tensor, crop_box: tuple[int, int, int, int], *, min_visibility: float = 0.0) -> tuple[torch.Tensor, torch.Tensor]:
     if boxes.numel() == 0:
         return boxes.clone(), torch.zeros((0,), dtype=torch.bool)
     x0, y0, x1, y1 = crop_box
+    original = boxes.clone()
     out = boxes.clone()
     out[:, [0, 2]] -= float(x0)
     out[:, [1, 3]] -= float(y0)
     out[:, [0, 2]] = out[:, [0, 2]].clamp(0.0, float(x1 - x0))
     out[:, [1, 3]] = out[:, [1, 3]].clamp(0.0, float(y1 - y0))
-    keep = (out[:, 2] > out[:, 0]) & (out[:, 3] > out[:, 1])
+    original_area = ((original[:, 2] - original[:, 0]).clamp(min=0) * (original[:, 3] - original[:, 1]).clamp(min=0)).clamp(min=1e-12)
+    visible_area = ((out[:, 2] - out[:, 0]).clamp(min=0) * (out[:, 3] - out[:, 1]).clamp(min=0))
+    keep = (out[:, 2] > out[:, 0]) & (out[:, 3] > out[:, 1]) & ((visible_area / original_area) >= float(min_visibility))
     return out[keep].contiguous(), keep.cpu()
 
 
@@ -928,10 +1023,11 @@ def _pad_1d_to_length(arr: np.ndarray, length: int, *, value: Any) -> np.ndarray
     return out
 
 
-def _largest_component_mask(mask: np.ndarray) -> np.ndarray:
+def _largest_component_mask(mask: np.ndarray, *, min_area_fraction: float = 0.0) -> np.ndarray:
     mask = np.asarray(mask, dtype=bool)
     if not mask.any() or cv2 is None:
         return mask
+    height, width = mask.shape
     num, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
     if num <= 1:
         return mask
@@ -939,6 +1035,8 @@ def _largest_component_mask(mask: np.ndarray) -> np.ndarray:
     if areas.size == 0:
         return mask
     largest = int(np.argmax(areas) + 1)
+    if float(areas[largest - 1]) < float(min_area_fraction) * float(height * width):
+        return mask
     return labels == largest
 
 

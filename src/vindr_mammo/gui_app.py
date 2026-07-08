@@ -22,6 +22,13 @@ except Exception:  # pragma: no cover
     cv2 = None
 
 try:
+    from scipy import ndimage as scipy_ndimage
+    from scipy.signal import wiener as scipy_wiener
+except Exception:  # pragma: no cover
+    scipy_ndimage = None
+    scipy_wiener = None
+
+try:
     import streamlit as st
 except Exception as exc:  # pragma: no cover
     raise ImportError(
@@ -50,6 +57,7 @@ from .visualize import create_visualizations_from_export
 def main() -> None:
     """Run the interactive VinDr-Mammo preprocessing inspector."""
     st.set_page_config(page_title="VinDr-Mammo preprocessing inspector", layout="wide")
+    _inject_gui_style()
     st.title("VinDr-Mammo preprocessing inspector")
     st.caption(
         "Inspect raw/preprocessed mammography crops, saved exports, mass boxes, "
@@ -112,6 +120,8 @@ def main() -> None:
         crop_controls=crop_controls,
         pipeline=pipeline,
     )
+    if mode in {"Single image", "Vendor / image comparison"} and not _preview_refresh_gate():
+        return
 
     if mode == "Single image":
         _render_single_mode(dataset, enriched, crop_controls, pipeline, show_annotations, display_window, display_controls)
@@ -121,6 +131,87 @@ def main() -> None:
         _render_dataset_visualization_mode(cfg)
     else:
         _render_manifest_comparison_mode(cfg)
+
+
+def _inject_gui_style() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+          --vindr-accent: #2563eb;
+          --vindr-soft: #eff6ff;
+          --vindr-border: #dbe3ef;
+        }
+        .block-container {
+          padding-top: 1.6rem;
+          padding-bottom: 2rem;
+        }
+        h1 {
+          letter-spacing: 0;
+          font-size: 2.0rem;
+          margin-bottom: 0.25rem;
+        }
+        [data-testid="stSidebar"] {
+          border-right: 1px solid var(--vindr-border);
+        }
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+          line-height: 1.35;
+        }
+        div[data-testid="stExpander"] {
+          border: 1px solid var(--vindr-border);
+          border-radius: 8px;
+          background: #ffffff;
+        }
+        div[data-testid="stMetric"] {
+          background: #f8fafc;
+          border: 1px solid var(--vindr-border);
+          border-radius: 8px;
+          padding: 0.65rem 0.8rem;
+        }
+        .vindr-hint {
+          border: 1px solid #bfdbfe;
+          background: var(--vindr-soft);
+          border-radius: 8px;
+          padding: 0.8rem 0.95rem;
+          color: #1e3a8a;
+          margin: 0.5rem 0 1rem 0;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _preview_refresh_gate() -> bool:
+    st.sidebar.divider()
+    with st.sidebar.expander("Preview refresh and speed", expanded=True):
+        manual = st.checkbox(
+            "Manual preview refresh",
+            value=True,
+            key="manual_preview_refresh_enabled",
+            help=(
+                "Recommended for large DICOMs. Parameter changes update the controls immediately, "
+                "but the expensive image read, crop search, channel processing, and rendering run only when you click refresh."
+            ),
+        )
+        if not manual:
+            st.caption("Automatic mode refreshes images after every control change.")
+            return True
+        refresh = st.button("Render / refresh preview", type="primary", use_container_width=True)
+        st.caption("Use this after changing preprocessing, crop, or RGB parameters.")
+    if refresh:
+        st.session_state["manual_preview_refresh_count"] = int(st.session_state.get("manual_preview_refresh_count", 0)) + 1
+        return True
+    st.markdown(
+        """
+        <div class="vindr-hint">
+        Preview rendering is paused. Adjust parameters in the sidebar, then click
+        <strong>Render / refresh preview</strong> to read the DICOM and update the image panels.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    return False
 
 
 
@@ -1571,12 +1662,18 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     )
     pp["crop_breast"] = st.sidebar.checkbox(
         "Crop to breast foreground",
-        value=bool(pp.get("crop_breast", False)),
+        value=bool(pp.get("crop_breast", True)),
         key=_widget_key("fixed_preprocess_crop_breast"),
         help=(
             "Find the breast foreground and remove as much pure background as possible. "
-            "Default is off so deterministic full-image crop experiments are not silently altered."
+            "Recommended before sliding-window export because it preserves effective breast resolution."
         ),
+    )
+    pp["mask_outside_breast"] = st.sidebar.checkbox(
+        "Mask outside breast foreground",
+        value=bool(pp.get("mask_outside_breast", True)),
+        key=_widget_key("fixed_preprocess_mask_outside_breast"),
+        help="Set background, labels, borders, and markers outside the breast mask to zero.",
     )
     pp["mirror_right_to_left"] = st.sidebar.checkbox(
         "Mirror right-entering breasts to left-entering",
@@ -1584,15 +1681,51 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         key=_widget_key("fixed_preprocess_mirror_right_to_left"),
         help="If the breast foreground is mostly on the right side, flip horizontally and update boxes.",
     )
-    pp["crop_padding"] = st.sidebar.number_input(
-        "Breast crop padding, pixels",
-        min_value=0,
-        max_value=512,
-        step=5,
-        value=int(pp.get("crop_padding", 20)),
-        key=_widget_key("fixed_preprocess_crop_padding"),
-        help="Padding added around the detected breast foreground crop.",
+    padding_is_fractional = pp.get("crop_padding", None) is None
+    padding_mode = st.sidebar.radio(
+        "Breast crop padding",
+        ["fractional recommended", "fixed pixels"],
+        index=0 if padding_is_fractional else 1,
+        horizontal=True,
+        key=_widget_key("fixed_preprocess_crop_padding_mode"),
     )
+    if padding_mode == "fixed pixels":
+        pp["crop_padding"] = st.sidebar.number_input(
+            "Breast crop padding, pixels",
+            min_value=0,
+            max_value=512,
+            step=5,
+            value=int(pp.get("crop_padding", 20) if pp.get("crop_padding", None) is not None else 32),
+            key=_widget_key("fixed_preprocess_crop_padding"),
+            help="Fixed padding added around the detected breast foreground crop.",
+        )
+    else:
+        pp["crop_padding"] = None
+        pp["crop_padding_fraction"] = st.sidebar.slider(
+            "Breast crop padding fraction",
+            min_value=0.0,
+            max_value=0.15,
+            value=float(pp.get("crop_padding_fraction", 0.03)),
+            step=0.005,
+            key=_widget_key("fixed_preprocess_crop_padding_fraction"),
+            help="Fraction of the detected breast extent used as crop padding.",
+        )
+        pp["minimum_padding_px"] = st.sidebar.number_input(
+            "Minimum crop padding, pixels",
+            min_value=0,
+            max_value=512,
+            step=8,
+            value=int(pp.get("minimum_padding_px", 32)),
+            key=_widget_key("fixed_preprocess_minimum_padding_px"),
+        )
+        pp["maximum_padding_px"] = st.sidebar.number_input(
+            "Maximum crop padding, pixels",
+            min_value=0,
+            max_value=1024,
+            step=8,
+            value=int(pp.get("maximum_padding_px", 128)),
+            key=_widget_key("fixed_preprocess_maximum_padding_px"),
+        )
 
     threshold_mode = st.sidebar.radio(
         "Breast crop threshold",
@@ -1623,6 +1756,43 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         format="%.4f",
         help="Small connected components below this relative image area are ignored while finding the breast crop.",
     )
+    with st.sidebar.expander("Breast mask morphology", expanded=False):
+        pp["breast_mask_method"] = st.selectbox(
+            "Mask method",
+            ["otsu_largest_connected_component", "percentile_threshold_largest_component"],
+            index=0 if str(pp.get("breast_mask_method", "otsu_largest_connected_component")).startswith("otsu") else 1,
+            key=_widget_key("fixed_preprocess_breast_mask_method"),
+        )
+        pp["breast_mask_open_kernel"] = int(st.select_slider(
+            "Open kernel",
+            options=[0, 3, 5, 7, 9, 11, 15],
+            value=int(pp.get("breast_mask_open_kernel", 7) or 7),
+            key=_widget_key("fixed_preprocess_breast_mask_open_kernel"),
+        ))
+        pp["breast_mask_close_kernel"] = int(st.select_slider(
+            "Close kernel",
+            options=[0, 7, 11, 15, 21, 31, 41],
+            value=int(pp.get("breast_mask_close_kernel", 21) or 21),
+            key=_widget_key("fixed_preprocess_breast_mask_close_kernel"),
+        ))
+        pp["breast_mask_fill_holes"] = st.checkbox(
+            "Fill breast-mask holes",
+            value=bool(pp.get("breast_mask_fill_holes", True)),
+            key=_widget_key("fixed_preprocess_breast_mask_fill_holes"),
+        )
+        pp["breast_mask_keep_largest_component"] = st.checkbox(
+            "Keep largest connected component",
+            value=bool(pp.get("breast_mask_keep_largest_component", True)),
+            key=_widget_key("fixed_preprocess_breast_mask_keep_largest_component"),
+        )
+        pp["min_box_visibility_after_crop"] = st.slider(
+            "Minimum box visibility after breast crop",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(pp.get("min_box_visibility_after_crop", 0.30)),
+            step=0.05,
+            key=_widget_key("fixed_preprocess_min_box_visibility_after_crop"),
+        )
 
     with st.sidebar.expander("What happened to the image?", expanded=False):
         st.write(
@@ -2197,19 +2367,123 @@ OP_NAMES = [
     "percentile_normalize",
     "percentile_clip_only",
     "zscore_clip",
+    "aggressive_upper_percentile_normalize",
     "standardize_to_target",
+    "mask_outside_breast",
+    "artifact_cleanup",
     "hist_equalize",
     "clahe",
     "gaussian_blur",
     "median_blur",
+    "bilateral_filter",
+    "wiener_filter",
+    "local_detail",
     "sharpen",
     "unsharp_mask",
     "sobel_gradient",
     "laplacian",
+    "white_tophat",
+    "blackhat",
+    "morphological_open",
+    "morphological_close",
+    "pectoral_suppression",
     "gamma",
     "log",
     "invert",
 ]
+
+
+LITERATURE_PIPELINE_PRESETS: dict[str, dict[str, Any]] = {
+    "raw_clahe_detail": {
+        "label": "Recommended: raw + CLAHE + local detail",
+        "pipeline": {
+            "R": {"source": "current_crop", "steps": [{"op": "percentile_normalize", "params": {"percentiles": [0.5, 99.5]}}]},
+            "G": {
+                "source": "current_crop",
+                "steps": [
+                    {"op": "percentile_normalize", "params": {"percentiles": [0.5, 99.5]}},
+                    {"op": "clahe", "params": {"clip_limit": 2.0, "tile_grid_size": 8}},
+                ],
+            },
+            "B": {
+                "source": "current_crop",
+                "steps": [
+                    {"op": "percentile_normalize", "params": {"percentiles": [0.5, 99.5]}},
+                    {"op": "clahe", "params": {"clip_limit": 2.0, "tile_grid_size": 8}},
+                    {"op": "local_detail", "params": {"sigma": 1.0, "percentiles": [1.0, 99.0]}},
+                ],
+            },
+        },
+    },
+    "raw_replicated": {
+        "label": "Control: raw replicated",
+        "pipeline": {
+            ch: {"source": "current_crop", "steps": [{"op": "percentile_normalize", "params": {"percentiles": [0.5, 99.5]}}]}
+            for ch in ["R", "G", "B"]
+        },
+    },
+    "raw_clahe_masked_raw": {
+        "label": "Conservative: raw + CLAHE + masked raw",
+        "pipeline": {
+            "R": {"source": "current_crop", "steps": [{"op": "percentile_normalize", "params": {"percentiles": [0.5, 99.5]}}]},
+            "G": {
+                "source": "current_crop",
+                "steps": [
+                    {"op": "percentile_normalize", "params": {"percentiles": [0.5, 99.5]}},
+                    {"op": "clahe", "params": {"clip_limit": 2.0, "tile_grid_size": 8}},
+                ],
+            },
+            "B": {
+                "source": "current_crop",
+                "steps": [
+                    {"op": "percentile_normalize", "params": {"percentiles": [0.5, 99.5]}},
+                    {"op": "mask_outside_breast", "params": {"outside_value": 0.0}},
+                ],
+            },
+        },
+    },
+    "raw_clahe_tophat": {
+        "label": "Calcification-focused: raw + CLAHE + TopHat",
+        "pipeline": {
+            "R": {"source": "current_crop", "steps": [{"op": "percentile_normalize", "params": {"percentiles": [0.5, 99.5]}}]},
+            "G": {
+                "source": "current_crop",
+                "steps": [
+                    {"op": "percentile_normalize", "params": {"percentiles": [0.5, 99.5]}},
+                    {"op": "clahe", "params": {"clip_limit": 2.0, "tile_grid_size": 8}},
+                ],
+            },
+            "B": {
+                "source": "current_crop",
+                "steps": [
+                    {"op": "percentile_normalize", "params": {"percentiles": [0.5, 99.5]}},
+                    {"op": "clahe", "params": {"clip_limit": 2.0, "tile_grid_size": 8}},
+                    {"op": "white_tophat", "params": {"kernel_shape": "ellipse", "kernel_size": 9, "percentiles": [1.0, 99.0]}},
+                ],
+            },
+        },
+    },
+    "denoise_ablation": {
+        "label": "Ablation: raw + median + bilateral",
+        "pipeline": {
+            "R": {"source": "current_crop", "steps": [{"op": "percentile_normalize", "params": {"percentiles": [0.5, 99.5]}}]},
+            "G": {
+                "source": "current_crop",
+                "steps": [
+                    {"op": "percentile_normalize", "params": {"percentiles": [0.5, 99.5]}},
+                    {"op": "median_blur", "params": {"ksize": 3}},
+                ],
+            },
+            "B": {
+                "source": "current_crop",
+                "steps": [
+                    {"op": "percentile_normalize", "params": {"percentiles": [0.5, 99.5]}},
+                    {"op": "bilateral_filter", "params": {"diameter": 5, "sigma_color": 0.05, "sigma_space": 5.0}},
+                ],
+            },
+        },
+    },
+}
 
 
 def _custom_pipeline_from_image_export_config(cfg: dict[str, Any] | None) -> dict[str, Any]:
@@ -2225,6 +2499,10 @@ def _custom_pipeline_from_image_export_config(cfg: dict[str, Any] | None) -> dic
     scheme = str(image_export.get("rgb_scheme", "custom_channel_pipeline") or "custom_channel_pipeline")
     if scheme == "custom_channel_pipeline" and isinstance(explicit, dict) and explicit:
         return copy.deepcopy(explicit)
+
+    scheme_key = scheme.casefold().strip()
+    if scheme_key in LITERATURE_PIPELINE_PRESETS:
+        return copy.deepcopy(LITERATURE_PIPELINE_PRESETS[scheme_key]["pipeline"])
 
     single_window = image_export.get("single_window", [1.0, 99.0])
     if not isinstance(single_window, (list, tuple)) or len(single_window) < 2:
@@ -2287,6 +2565,26 @@ def _loaded_pipeline_debug_panel(cfg: dict[str, Any], pipeline: dict[str, Any]) 
 def _pipeline_controls(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     cfg_pipeline = _custom_pipeline_from_image_export_config(cfg)
     widget_suffix = _active_widget_suffix()
+    with st.sidebar.expander("Literature recipe presets", expanded=True):
+        preset_labels = ["Custom / loaded pipeline"] + [str(v["label"]) for v in LITERATURE_PIPELINE_PRESETS.values()]
+        preset_keys = ["custom"] + list(LITERATURE_PIPELINE_PRESETS.keys())
+        selected_label = st.selectbox(
+            "3-channel recipe",
+            preset_labels,
+            index=0,
+            key=f"literature_recipe_preset{widget_suffix}",
+            help=(
+                "Presets from the literature guide. Pick a preset to populate the channel editor below, "
+                "or keep Custom / loaded pipeline to use the config exactly as loaded."
+            ),
+        )
+        selected_preset = preset_keys[preset_labels.index(selected_label)]
+        st.caption(
+            "Crop strategy is controlled separately: use square_crops for sliding windows or baseline_uncropped for whole-image export."
+        )
+    if selected_preset != "custom":
+        cfg_pipeline = copy.deepcopy(LITERATURE_PIPELINE_PRESETS[selected_preset]["pipeline"])
+    control_suffix = f"{widget_suffix}_{selected_preset}"
     default_channel_sources = {
         "R": str(cfg_pipeline.get("R", {}).get("source", "current_crop")),
         "G": str(cfg_pipeline.get("G", {}).get("source", "current_crop")),
@@ -2311,7 +2609,7 @@ def _pipeline_controls(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
                 f"Source ({channel})",
                 options=list(source_options.values()),
                 index=list(source_options.keys()).index(default_source),
-                key=f"{channel}_source{widget_suffix}",
+                key=f"{channel}_source{control_suffix}",
                 help=(
                     "Use the selected crop, or use the same crop coordinates from the opposite breast "
                     "with the same view position in the same study. The opposite-breast source is computed "
@@ -2325,7 +2623,7 @@ def _pipeline_controls(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
                 min_value=0,
                 max_value=10,
                 value=len(default_channel_steps[channel]),
-                key=f"{channel}_n_steps{widget_suffix}",
+                key=f"{channel}_n_steps{control_suffix}",
             )
             steps = []
             for i in range(int(n_steps)):
@@ -2336,12 +2634,12 @@ def _pipeline_controls(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
                     f"Step {i + 1}",
                     OP_NAMES,
                     index=OP_NAMES.index(default_op),
-                    key=f"{channel}_op_{i}{widget_suffix}",
+                    key=f"{channel}_op_{i}{control_suffix}",
                 )
                 default_params = {}
                 if i < len(default_steps_raw) and isinstance(default_steps_raw[i], dict) and str(default_steps_raw[i].get("op", "none")) == op:
                     default_params = dict(default_steps_raw[i].get("params", {}) or {})
-                params = _op_parameter_controls(channel, i, op, default_params, widget_suffix=widget_suffix)
+                params = _op_parameter_controls(channel, i, op, default_params, widget_suffix=control_suffix)
                 steps.append({"op": op, "params": params})
             pipeline[channel] = {"source": source, "steps": steps}
     return pipeline
@@ -2459,6 +2757,16 @@ def _op_parameter_controls(
             "stat_percentiles": [float(stat_lo), float(stat_hi)],
             "clip_output": bool(clip_output),
         }
+    if op in {"mask_outside_breast", "artifact_cleanup"}:
+        outside_value = st.slider(
+            "Outside-breast fill value",
+            min_value=0.0,
+            max_value=1.0,
+            value=_clamp_float(params.get("outside_value", 0.0), 0.0, 1.0, 0.0),
+            step=0.01,
+            key=f"{prefix}_outside_value",
+        )
+        return {"outside_value": float(outside_value)}
     if op == "clahe":
         clip = st.slider("CLAHE clip limit", 0.5, 8.0, _clamp_float(params.get("clip_limit", 2.0), 0.5, 8.0, 2.0), 0.5, key=f"{prefix}_clip")
         tile_options = [4, 8, 16, 32]
@@ -2482,6 +2790,40 @@ def _op_parameter_controls(
             k_default = 3
         k = st.select_slider("Median kernel", options=k_options, value=k_default, key=f"{prefix}_k")
         return {"ksize": int(k)}
+    if op == "bilateral_filter":
+        diameter = st.select_slider("Bilateral diameter", options=[3, 5, 7, 9, 11], value=int(params.get("diameter", 5) or 5), key=f"{prefix}_diameter")
+        sigma_color = st.slider(
+            "Bilateral sigma color",
+            min_value=0.001,
+            max_value=0.30,
+            value=_clamp_float(params.get("sigma_color", 0.05), 0.001, 0.30, 0.05),
+            step=0.005,
+            key=f"{prefix}_sigma_color",
+        )
+        sigma_space = st.slider(
+            "Bilateral sigma space",
+            min_value=1.0,
+            max_value=25.0,
+            value=_clamp_float(params.get("sigma_space", 5.0), 1.0, 25.0, 5.0),
+            step=1.0,
+            key=f"{prefix}_sigma_space",
+        )
+        return {"diameter": int(diameter), "sigma_color": float(sigma_color), "sigma_space": float(sigma_space)}
+    if op == "wiener_filter":
+        k_options = [3, 5, 7, 9, 11, 15]
+        k_default = int(params.get("ksize", 7) or 7)
+        if k_default not in k_options:
+            k_default = 7
+        k = st.select_slider("Wiener kernel", options=k_options, value=k_default, key=f"{prefix}_k")
+        use_noise = st.checkbox("Set Wiener noise estimate", value=params.get("noise", None) is not None, key=f"{prefix}_use_noise")
+        if use_noise:
+            noise = st.number_input("Noise estimate", value=float(params.get("noise", 0.01) or 0.01), min_value=0.0, step=0.001, format="%.6f", key=f"{prefix}_noise")
+            return {"ksize": int(k), "noise": float(noise)}
+        return {"ksize": int(k), "noise": None}
+    if op == "local_detail":
+        sigma = st.slider("Detail blur sigma", 0.25, 10.0, _clamp_float(params.get("sigma", 1.0), 0.25, 10.0, 1.0), 0.25, key=f"{prefix}_sigma")
+        lo, hi = st.slider("Detail residual window", 0.0, 100.0, _pair_from_params(params, "percentiles", (1.0, 99.0)), 0.5, key=f"{prefix}_win")
+        return {"sigma": float(sigma), "percentiles": [float(lo), float(hi)]}
     if op == "sharpen":
         amount = st.slider("Sharpen strength", 0.0, 5.0, _clamp_float(params.get("amount", 1.0), 0.0, 5.0, 1.0), 0.25, key=f"{prefix}_amt")
         return {"amount": float(amount)}
@@ -2505,6 +2847,47 @@ def _op_parameter_controls(
         k = st.select_slider("Laplacian kernel", options=k_options, value=k_default, key=f"{prefix}_k")
         lo, hi = st.slider("Laplacian window", 0.0, 100.0, _pair_from_params(params, "percentiles", (1.0, 99.0)), 0.5, key=f"{prefix}_win")
         return {"ksize": int(k), "percentiles": [float(lo), float(hi)]}
+    if op in {"white_tophat", "blackhat"}:
+        k_options = [3, 5, 7, 9, 11, 15, 21, 31]
+        k_default = int(params.get("kernel_size", 9 if op == "white_tophat" else 15) or 9)
+        if k_default not in k_options:
+            k_default = 9 if op == "white_tophat" else 15
+        kernel_size = st.select_slider("Morphology kernel", options=k_options, value=k_default, key=f"{prefix}_kernel")
+        shape = st.radio(
+            "Kernel shape",
+            ["ellipse", "rectangle"],
+            index=0 if str(params.get("kernel_shape", "ellipse")) != "rectangle" else 1,
+            horizontal=True,
+            key=f"{prefix}_shape",
+        )
+        lo, hi = st.slider("Contrast window", 0.0, 100.0, _pair_from_params(params, "percentiles", (1.0, 99.0)), 0.5, key=f"{prefix}_win")
+        return {"kernel_shape": str(shape), "kernel_size": int(kernel_size), "percentiles": [float(lo), float(hi)]}
+    if op in {"morphological_open", "morphological_close"}:
+        k_options = [3, 5, 7, 9, 11, 15, 21, 31]
+        k_default = int(params.get("kernel_size", 9) or 9)
+        if k_default not in k_options:
+            k_default = 9
+        kernel_size = st.select_slider("Morphology kernel", options=k_options, value=k_default, key=f"{prefix}_kernel")
+        shape = st.radio(
+            "Kernel shape",
+            ["ellipse", "rectangle"],
+            index=0 if str(params.get("kernel_shape", "ellipse")) != "rectangle" else 1,
+            horizontal=True,
+            key=f"{prefix}_shape",
+        )
+        return {"kernel_shape": str(shape), "kernel_size": int(kernel_size)}
+    if op == "pectoral_suppression":
+        side = st.radio(
+            "Suppression side",
+            ["left", "right"],
+            index=0 if str(params.get("side", "left")) != "right" else 1,
+            horizontal=True,
+            key=f"{prefix}_side",
+        )
+        width_fraction = st.slider("Triangle width fraction", 0.05, 0.80, _clamp_float(params.get("width_fraction", 0.33), 0.05, 0.80, 0.33), 0.01, key=f"{prefix}_width")
+        height_fraction = st.slider("Triangle height fraction", 0.05, 0.80, _clamp_float(params.get("height_fraction", 0.45), 0.05, 0.80, 0.45), 0.01, key=f"{prefix}_height")
+        fill_value = st.slider("Fill value", 0.0, 1.0, _clamp_float(params.get("fill_value", 0.0), 0.0, 1.0, 0.0), 0.01, key=f"{prefix}_fill")
+        return {"side": str(side), "width_fraction": float(width_fraction), "height_fraction": float(height_fraction), "fill_value": float(fill_value)}
     if op == "gamma":
         gamma = st.slider("Gamma", 0.1, 5.0, _clamp_float(params.get("gamma", 1.0), 0.1, 5.0, 1.0), 0.1, key=f"{prefix}_gamma")
         return {"gamma": float(gamma)}
@@ -2749,14 +3132,16 @@ def _export_dataset_from_gui_panel(
             help="Enable only when you are sure the target folder can be removed.",
         )
         save_square = st.checkbox(
-            "Export square_crops dataset",
+            "Sliding crop export (square_crops)",
             value=bool(export_cfg_defaults.get("save_square_crops", True)),
             key=_widget_key("gui_export_square_crops"),
+            help="Creates overlapping fixed-size crop images for detector training/inference.",
         )
         save_baseline = st.checkbox(
-            "Also export baseline_uncropped dataset",
+            "Whole-image export (baseline_uncropped)",
             value=bool(export_cfg_defaults.get("save_baseline_uncropped", False)),
             key=_widget_key("gui_export_baseline"),
+            help="Creates one preprocessed image per mammogram without the final sliding square crop stage.",
         )
 
         vendors = _available_vendors(records_df)
@@ -4273,35 +4658,86 @@ def _apply_operation(arr: np.ndarray, op: str, params: dict[str, Any], stat_mask
         return _equalize(_float_to_uint8(arr)).astype(np.float32) / 255.0
     if op == "clahe":
         return _clahe(_float_to_uint8(arr), params).astype(np.float32) / 255.0
+    if op in {"mask_outside_breast", "artifact_cleanup"}:
+        if stat_mask is None or stat_mask.shape != arr.shape:
+            stat_mask = _operation_stat_mask(arr)
+        return np.where(stat_mask, arr, float(params.get("outside_value", 0.0))).astype(np.float32)
     if op == "gaussian_blur":
-        if cv2 is None:
-            return arr
         k = _odd_int(params.get("ksize", 5))
         sigma = float(params.get("sigma", 1.0))
-        return cv2.GaussianBlur(arr.astype(np.float32), (k, k), sigmaX=sigma).astype(np.float32)
+        if cv2 is not None:
+            return cv2.GaussianBlur(arr.astype(np.float32), (k, k), sigmaX=sigma).astype(np.float32)
+        if scipy_ndimage is not None:
+            return scipy_ndimage.gaussian_filter(arr.astype(np.float32), sigma=max(sigma, 0.0)).astype(np.float32)
+        return arr
     if op == "median_blur":
+        k = _odd_int(params.get("ksize", 3))
+        if cv2 is None and scipy_ndimage is not None:
+            return scipy_ndimage.median_filter(arr.astype(np.float32), size=k).astype(np.float32)
         if cv2 is None:
             return arr
-        k = _odd_int(params.get("ksize", 3))
         return cv2.medianBlur(_float_to_uint8(arr), k).astype(np.float32) / 255.0
+    if op == "bilateral_filter":
+        if cv2 is None:
+            sigma = float(params.get("sigma_space", 5.0))
+            if scipy_ndimage is not None:
+                return scipy_ndimage.gaussian_filter(arr.astype(np.float32), sigma=max(sigma / 3.0, 0.0)).astype(np.float32)
+            return arr
+        diameter = int(params.get("diameter", 5))
+        sigma_color = float(params.get("sigma_color", 0.05))
+        sigma_space = float(params.get("sigma_space", 5.0))
+        return cv2.bilateralFilter(arr.astype(np.float32), diameter, sigmaColor=sigma_color, sigmaSpace=sigma_space).astype(np.float32)
+    if op == "wiener_filter":
+        if scipy_wiener is None:
+            return arr
+        k = _odd_int(params.get("ksize", 7))
+        noise = params.get("noise", None)
+        try:
+            out = scipy_wiener(arr.astype(np.float32), mysize=(k, k), noise=None if noise in {None, ""} else float(noise))
+        except Exception:
+            out = scipy_wiener(arr.astype(np.float32), mysize=(k, k))
+        return np.nan_to_num(out.astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0)
+    if op == "local_detail":
+        sigma = float(params.get("sigma", 1.0))
+        if cv2 is not None:
+            smooth = cv2.GaussianBlur(arr.astype(np.float32), (0, 0), sigmaX=sigma)
+        elif scipy_ndimage is not None:
+            smooth = scipy_ndimage.gaussian_filter(arr.astype(np.float32), sigma=max(sigma, 0.0))
+        else:
+            smooth = arr
+        detail = arr.astype(np.float32) - smooth.astype(np.float32)
+        return _normalize_percentile(detail.astype(np.float32), params.get("percentiles", [1.0, 99.0]), stat_mask)
     if op == "sharpen":
         if cv2 is None:
-            return arr
+            return _apply_operation(arr, "unsharp_mask", {"amount": params.get("amount", 0.2), "sigma": 1.0}, stat_mask=stat_mask)
         amount = float(params.get("amount", 1.0))
         kernel = np.array([[0, -1, 0], [-1, 4 + amount, -1], [0, -1, 0]], dtype=np.float32)
         kernel /= max(float(kernel.sum()), 1e-6)
         return cv2.filter2D(arr.astype(np.float32), -1, kernel).astype(np.float32)
     if op == "unsharp_mask":
-        if cv2 is None:
-            return arr
         amount = float(params.get("amount", 1.5))
         sigma = float(params.get("sigma", 2.0))
-        blurred = cv2.GaussianBlur(arr.astype(np.float32), (0, 0), sigmaX=sigma)
+        if cv2 is not None:
+            blurred = cv2.GaussianBlur(arr.astype(np.float32), (0, 0), sigmaX=sigma)
+        elif scipy_ndimage is not None:
+            blurred = scipy_ndimage.gaussian_filter(arr.astype(np.float32), sigma=max(sigma, 0.0))
+        else:
+            blurred = arr
         return (arr + amount * (arr - blurred)).astype(np.float32)
     if op == "sobel_gradient":
         return _sobel(arr, params, stat_mask)
     if op == "laplacian":
         return _laplacian(arr, params, stat_mask)
+    if op in {"white_tophat", "tophat"}:
+        return _morphology_contrast(arr, params, stat_mask, mode="white_tophat")
+    if op == "blackhat":
+        return _morphology_contrast(arr, params, stat_mask, mode="blackhat")
+    if op == "morphological_open":
+        return _morphology_basic(arr, params, op_name="open")
+    if op == "morphological_close":
+        return _morphology_basic(arr, params, op_name="close")
+    if op == "pectoral_suppression":
+        return _pectoral_suppression(arr, params)
     if op == "gamma":
         gamma = max(float(params.get("gamma", 1.0)), 1e-6)
         return np.power(np.clip(_normalize_minmax(arr, stat_mask), 0.0, 1.0), gamma).astype(np.float32)
@@ -4375,6 +4811,58 @@ def _laplacian(arr: np.ndarray, params: dict[str, Any], stat_mask: np.ndarray | 
         k = _odd_int(params.get("ksize", 3))
         lap = np.abs(cv2.Laplacian(u8, cv2.CV_32F, ksize=k))
     return _normalize_percentile(lap.astype(np.float32), params.get("percentiles", [1.0, 99.0]))
+
+
+def _morphology_kernel(params: dict[str, Any]) -> np.ndarray | None:
+    k = _odd_int(params.get("kernel_size", params.get("ksize", 9)))
+    shape = str(params.get("kernel_shape", "ellipse")).casefold().strip()
+    if cv2 is not None:
+        cv_shape = cv2.MORPH_ELLIPSE if shape == "ellipse" else cv2.MORPH_RECT
+        return cv2.getStructuringElement(cv_shape, (k, k))
+    return np.ones((k, k), dtype=bool)
+
+
+def _morphology_basic(arr: np.ndarray, params: dict[str, Any], *, op_name: str) -> np.ndarray:
+    kernel = _morphology_kernel(params)
+    if kernel is None:
+        return arr
+    if cv2 is not None:
+        code = cv2.MORPH_OPEN if op_name == "open" else cv2.MORPH_CLOSE
+        return cv2.morphologyEx(arr.astype(np.float32), code, kernel).astype(np.float32)
+    if scipy_ndimage is None:
+        return arr
+    fn = scipy_ndimage.grey_opening if op_name == "open" else scipy_ndimage.grey_closing
+    return fn(arr.astype(np.float32), footprint=kernel).astype(np.float32)
+
+
+def _morphology_contrast(
+    arr: np.ndarray,
+    params: dict[str, Any],
+    stat_mask: np.ndarray | None,
+    *,
+    mode: str,
+) -> np.ndarray:
+    if mode == "white_tophat":
+        out = arr.astype(np.float32) - _morphology_basic(arr, params, op_name="open").astype(np.float32)
+    else:
+        out = _morphology_basic(arr, params, op_name="close").astype(np.float32) - arr.astype(np.float32)
+    return _normalize_percentile(out.astype(np.float32), params.get("percentiles", [1.0, 99.0]), stat_mask)
+
+
+def _pectoral_suppression(arr: np.ndarray, params: dict[str, Any]) -> np.ndarray:
+    out = arr.astype(np.float32).copy()
+    side = str(params.get("side", "left")).casefold().strip()
+    height, width = out.shape
+    tri_w = max(1, min(width, int(round(width * float(params.get("width_fraction", 0.33))))))
+    tri_h = max(1, min(height, int(round(height * float(params.get("height_fraction", 0.45))))))
+    fill_value = float(params.get("fill_value", 0.0))
+    for y in range(tri_h):
+        x_extent = int(round(tri_w * (1.0 - y / max(tri_h - 1, 1))))
+        if side == "right":
+            out[y, max(0, width - x_extent):width] = fill_value
+        else:
+            out[y, 0:min(width, x_extent)] = fill_value
+    return out
 
 
 

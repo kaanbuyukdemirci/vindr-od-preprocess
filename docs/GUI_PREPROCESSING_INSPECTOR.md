@@ -34,6 +34,10 @@ vindr-mammo-gui --config config/export_config.yaml
 
 A browser window should open automatically. If it does not, copy the local Streamlit URL from the terminal.
 
+For a complete list of sidebar controls and operation parameters, see `docs/GUI_PARAMETER_REFERENCE.md`.
+
+For faster interaction on large DICOMs, leave **Manual preview refresh** enabled. The sidebar controls update immediately, but the expensive image read and render step runs only after **Render / refresh preview** is clicked.
+
 ## What the GUI shows
 
 For each selected image and crop, the GUI shows three panels:
