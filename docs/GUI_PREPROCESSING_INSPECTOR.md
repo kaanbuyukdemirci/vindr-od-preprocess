@@ -1,6 +1,6 @@
 # VinDr-Mammo preprocessing inspector GUI
 
-This project includes a local Streamlit GUI for interactively checking how different image preprocessing choices affect mass visibility before you export another YOLO/MMDetection dataset.
+This project includes a local Dash GUI for interactively checking how different image preprocessing choices affect mass visibility before you export another YOLO/MMDetection dataset.
 
 ## Why this GUI exists
 
@@ -23,7 +23,7 @@ From the project root:
 
 ```bash
 pip install -e .
-streamlit run inspect_preprocessing_app.py -- --config config/export_config.yaml
+python inspect_preprocessing_app.py
 ```
 
 or use the package command:
@@ -32,11 +32,11 @@ or use the package command:
 vindr-mammo-gui --config config/export_config.yaml
 ```
 
-A browser window should open automatically. If it does not, copy the local Streamlit URL from the terminal.
+A browser window should open automatically. If it does not, copy the local Dash URL from the terminal.
 
-For a complete list of sidebar controls and operation parameters, see `docs/GUI_PARAMETER_REFERENCE.md`.
+For a complete list of controls and operation parameters, see `docs/GUI_PARAMETER_REFERENCE.md`.
 
-For faster interaction on large DICOMs, leave **Manual preview refresh** enabled. The sidebar controls update immediately, but the expensive image read and render step runs only after **Render / refresh preview** is clicked.
+For faster interaction on large DICOMs, change multiple controls first, then click **Render / refresh** once. The expensive image read and render step runs only when you request it.
 
 ## What the GUI shows
 
@@ -170,7 +170,7 @@ Use **Vendor / image comparison** mode to compare multiple images side by side. 
 ## Notes
 
 - The GUI is intended for qualitative inspection, not final training.
-- Very large DICOMs can still take a few seconds to load. Recently viewed images are cached by Streamlit.
+- Very large DICOMs can still take a few seconds to load.
 - If you change the YAML preprocessing settings, reload the app to ensure the cached dataset uses the new settings.
 
 ## Vendor selector notes
@@ -327,15 +327,15 @@ The exported dataset still writes the usual structure:
 The GUI also has a **Dataset visualizations** mode. Use this when you already exported a dataset and want to calculate or inspect the visualization report from an arbitrary path.
 
 1. Open the GUI with `vindr-mammo-gui --config config/export_config.yaml`.
-2. Select **Dataset visualizations** from the sidebar mode selector.
-3. Enter either the export root, for example `/mnt/t9/preprocessed-vindr-v3`, or a direct dataset folder such as `/mnt/t9/preprocessed-vindr-v3/square_crops`.
-4. Click **Calculate / refresh visualizations**.
+2. Select **Dataset visualizations** from the mode selector.
+3. The app reads visualization outputs under the configured export root, for example `/mnt/t9/preprocessed-vindr-v3/visualizations`.
+4. Regenerate visualization files with `vindr-mammo-visualize --config config/export_config.yaml` when needed.
 
 The GUI writes the usual visualization files under `<export_root>/visualizations` by default and displays the COCO small/medium/large box-size tables and plots directly in the app. The COCO bins follow the standard detection AP area ranges: small boxes have area less than `32^2`, medium boxes have area from `32^2` to less than `96^2`, and large boxes have area at least `96^2`.
 
 ## GUI export progress and split-specific deterministic sampling
 
-The GUI export panel now shows elapsed time and an estimated remaining time next to the Streamlit progress bar. The estimate is based on the current overall export fraction, so it becomes more stable after the first few export steps.
+The Dash export panel starts the exporter in a background thread and reports job status while it runs.
 
 For deterministic square-crop exports, each split can now use one of four selection modes:
 
@@ -362,9 +362,9 @@ The older `train_deterministic_include_empty`, `val_deterministic_include_empty`
 
 ## Manifest comparison and settings loading
 
-The GUI includes a `Manifest comparison / load settings` mode. Paste one exported dataset folder or manifest path per line. For a folder, the app tries `manifest.json`, then `export_summary.json`. It reads each manifest, summarizes it, and explains each dataset relative to the previous one.
+The GUI includes a `Manifest tools` mode. Paste one manifest/config path per line to inspect top-level settings and compare snapshots.
 
-This mode also has a `Load settings into GUI session` button. It loads the selected manifest's `config_snapshot` into the current GUI session. By default it keeps the current data/output paths to avoid accidentally overwriting old dataset folders, while loading preprocessing, RGB pipeline, crop, vendor, and annotation settings.
+Load a previous export's resolved YAML through the Config YAML field when you want to use that snapshot as the active GUI state.
 
 
 ### v43 ETA fix
@@ -374,19 +374,12 @@ The GUI export progress panel now estimates remaining time from the current acti
 
 ## Manifest/config loading and strict replay
 
-The **Manifest comparison / load settings** mode can load either an exported
+The **Manifest tools** mode can inspect either an exported
 `manifest.json`, `export_summary.json`, or a resolved `export_config_resolved.yaml`.
-When a settings file is loaded, the GUI rebuilds config-backed widgets from the
-loaded `config_snapshot`, including fixed preprocessing, crop controls, vendor
-filtering, deterministic crop selection, annotation policy, and RGB channel
-pipelines.
+Use the top Config YAML loader to make a resolved config the active GUI config.
 
-The **Export dataset from GUI** panel now includes **Strict replay loaded config,
-ignore GUI control edits**. Leave this enabled if the goal is to reproduce a
-loaded manifest/config. In strict replay, export uses the loaded config snapshot
-directly and only applies the output path and clean-output checkbox from the
-export panel. This avoids stale Streamlit widget state changing the RGB pipeline
-or crop settings after loading.
+The **Export** tab previews the effective export YAML before running, so the crop,
+vendor, preprocessing, and RGB pipeline settings can be checked in one place.
 
 ## BBox-safe breast-biased random crop mode
 

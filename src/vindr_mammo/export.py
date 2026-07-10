@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterable
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 try:
@@ -49,7 +50,7 @@ from .crops import (
     window_has_positive_mass,
 )
 from .dataset import VindrMammoDataset
-from .preprocessing import align_contralateral_image_to_reference, estimate_contralateral_alignment_info
+from .preprocessing import _breast_chest_wall_side, _robust_tissue_threshold, align_contralateral_image_to_reference, estimate_contralateral_alignment_info
 
 CLASS_NAMES = ["mass"]
 COCO_CATEGORIES = [{"id": 1, "name": "mass", "supercategory": "lesion"}]
@@ -1643,6 +1644,7 @@ def export_baseline_dataset(
     save_empty_labels = bool(config.get("export", {}).get("save_empty_label_files", True))
     show_progress = bool(config.get("runtime", {}).get("show_progress", True))
     crop_cfg = dict(config.get("square_crops", {}) or {})
+    baseline_cfg = dict(config.get("baseline_uncropped", {}) or {})
 
     coco_by_split = {split: _empty_coco() for split in ["train", "val", "test"]}
     stats_rows: list[dict[str, Any]] = []
@@ -1758,10 +1760,12 @@ def export_baseline_dataset(
         iterator = _progress(records, show_progress, f"Export baseline {split_name}", unit="img")
         for record in iterator:
             image, target = dataset._read_preprocessed_record_no_square(record)
+            image, target, baseline_resize_info = _resize_baseline_image_and_target(image, target, baseline_cfg)
             height, width = int(image.shape[-2]), int(image.shape[-1])
             filename = _make_baseline_filename(record)
             rel_img_path = Path("images") / split_name / filename
             save_info = _save_export_images(image, base_root, rel_img_path, config)
+            save_info.update(baseline_resize_info)
 
             boxes = target["mass"]["boxes"]
             labels_path = base_root / "labels" / split_name / f"{Path(filename).stem}.txt"
@@ -1811,6 +1815,105 @@ def export_baseline_dataset(
 
     created = _write_shared_export_files(base_root, coco_by_split, stats_rows, metadata_rows, dataset_kind="baseline_uncropped")
     return _summary_from_stats(stats_rows), created
+
+
+def _resize_baseline_image_and_target(
+    image: torch.Tensor,
+    target: dict[str, Any],
+    cfg: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, Any], dict[str, Any]]:
+    mode = str(cfg.get("resize_mode", "none") or "none").strip().casefold()
+    if mode in {"", "none", "native", "original"}:
+        return image, target, {"baseline_resize_mode": "none"}
+
+    target_w = max(1, int(cfg.get("target_width", cfg.get("size", 640)) or 640))
+    target_h = max(1, int(cfg.get("target_height", cfg.get("size", 640)) or 640))
+    pad_value = float(cfg.get("pad_value", 0.0))
+    pad_anchor = str(cfg.get("pad_anchor", "left_top") or "left_top").strip().casefold()
+    src_h, src_w = int(image.shape[-2]), int(image.shape[-1])
+    boxes = target.get("mass", {}).get("boxes", torch.zeros((0, 4), dtype=torch.float32))
+    boxes = boxes.detach().clone().float().reshape(-1, 4)
+
+    def _resize_to(tensor: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        return F.interpolate(tensor.unsqueeze(0).float(), size=(int(h), int(w)), mode="bilinear", align_corners=False).squeeze(0)
+
+    if mode == "stretch":
+        out = _resize_to(image, target_h, target_w)
+        if boxes.numel():
+            boxes[:, [0, 2]] *= float(target_w) / max(float(src_w), 1.0)
+            boxes[:, [1, 3]] *= float(target_h) / max(float(src_h), 1.0)
+        meta = {"baseline_resize_mode": "stretch", "baseline_resize_target_width": target_w, "baseline_resize_target_height": target_h}
+        return out, _target_with_boxes(target, boxes, target_w, target_h), meta
+
+    scale = max(float(target_w) / max(float(src_w), 1.0), float(target_h) / max(float(src_h), 1.0)) if mode == "fill_crop" else min(float(target_w) / max(float(src_w), 1.0), float(target_h) / max(float(src_h), 1.0))
+    resized_w = max(1, int(round(src_w * scale)))
+    resized_h = max(1, int(round(src_h * scale)))
+    resized = _resize_to(image, resized_h, resized_w)
+    if boxes.numel():
+        boxes *= float(scale)
+
+    if mode == "fill_crop":
+        left = max(0, (resized_w - target_w) // 2)
+        top = max(0, (resized_h - target_h) // 2)
+        out = resized[..., top:top + target_h, left:left + target_w]
+        if out.shape[-2] != target_h or out.shape[-1] != target_w:
+            padded = torch.full((*out.shape[:-2], target_h, target_w), pad_value, dtype=out.dtype, device=out.device)
+            padded[..., : out.shape[-2], : out.shape[-1]] = out
+            out = padded
+        if boxes.numel():
+            boxes[:, [0, 2]] -= float(left)
+            boxes[:, [1, 3]] -= float(top)
+    else:
+        mode = "fit_pad"
+        extra_x = max(0, target_w - resized_w)
+        extra_y = max(0, target_h - resized_h)
+        if pad_anchor in {"center", "centre"}:
+            left = extra_x // 2
+            top = extra_y // 2
+        elif pad_anchor in {"left_center", "left-centre", "left_centered"}:
+            left = 0
+            top = extra_y // 2
+        elif pad_anchor in {"right_center", "right-centre", "right_centered"}:
+            left = extra_x
+            top = extra_y // 2
+        else:
+            left = 0
+            top = 0
+        out = torch.full((*resized.shape[:-2], target_h, target_w), pad_value, dtype=resized.dtype, device=resized.device)
+        out[..., top:top + resized_h, left:left + resized_w] = resized
+        if boxes.numel():
+            boxes[:, [0, 2]] += float(left)
+            boxes[:, [1, 3]] += float(top)
+
+    meta = {
+        "baseline_resize_mode": mode,
+        "baseline_resize_target_width": target_w,
+        "baseline_resize_target_height": target_h,
+        "baseline_resize_scale": float(scale),
+        "baseline_resize_pad_left": int(left),
+        "baseline_resize_pad_top": int(top),
+        "baseline_resize_pad_value": pad_value,
+        "baseline_resize_pad_anchor": pad_anchor,
+    }
+    return out, _target_with_boxes(target, boxes, target_w, target_h), meta
+
+
+def _target_with_boxes(target: dict[str, Any], boxes: torch.Tensor, width: int, height: int) -> dict[str, Any]:
+    out = dict(target)
+    mass = dict(out.get("mass", {}) or {})
+    mass["boxes"] = _clip_boxes_xyxy(boxes, width=width, height=height)
+    out["mass"] = mass
+    return out
+
+
+def _clip_boxes_xyxy(boxes: torch.Tensor, *, width: int, height: int) -> torch.Tensor:
+    if boxes.numel() == 0:
+        return boxes.reshape(0, 4)
+    boxes = boxes.reshape(-1, 4).clone()
+    boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, float(width))
+    boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, float(height))
+    keep = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+    return boxes[keep]
 
 
 # -----------------------------------------------------------------------------
@@ -1963,6 +2066,8 @@ def _make_literature_recipe_rgb(
     cfg = dict(img_cfg.get("literature_recipes", {}) or {})
     raw_window = cfg.get("raw_percentiles", img_cfg.get("single_window", [0.5, 99.5]))
     raw = _apply_custom_channel_operation(arr, "percentile_normalize", {"percentiles": raw_window}, mask)
+    if mask is not None and mask.shape == raw.shape:
+        raw = np.where(mask, raw, 0.0).astype(np.float32)
     clahe = _apply_custom_channel_operation(
         raw,
         "clahe",
@@ -1972,6 +2077,8 @@ def _make_literature_recipe_rgb(
         },
         mask,
     )
+    if mask is not None and mask.shape == clahe.shape:
+        clahe = np.where(mask, clahe, 0.0).astype(np.float32)
     meta: dict[str, Any] = {
         "rgb_scheme": scheme,
         "literature_recipe": scheme,
@@ -2002,6 +2109,8 @@ def _make_literature_recipe_rgb(
             },
             mask,
         )
+        if mask is not None and mask.shape == tophat.shape:
+            tophat = np.where(mask, tophat, 0.0).astype(np.float32)
         return [_float_to_uint8_custom(raw), _float_to_uint8_custom(clahe), _float_to_uint8_custom(tophat)], {
             **meta,
             "rgb_channel_0": "raw",
@@ -2018,6 +2127,8 @@ def _make_literature_recipe_rgb(
         },
         mask,
     )
+    if mask is not None and mask.shape == detail.shape:
+        detail = np.where(mask, detail, 0.0).astype(np.float32)
     return [_float_to_uint8_custom(raw), _float_to_uint8_custom(clahe), _float_to_uint8_custom(detail)], {
         **meta,
         "rgb_channel_0": "raw",
@@ -2110,6 +2221,8 @@ def _make_custom_channel_pipeline_rgb(
             work = _apply_custom_channel_operation(work, op, params, stat_mask)
             if stat_mask is not None and stat_mask.shape != work.shape:
                 stat_mask = _foreground_mask(work)
+            elif _custom_operation_should_preserve_background(op) and stat_mask is not None and stat_mask.any():
+                work = np.where(stat_mask, work, float(params.get("outside_value", 0.0))).astype(np.float32)
             applied.append({"op": op, "params": params})
         channels.append(_float_to_uint8_custom(work))
         meta[f"custom_{channel}_source_requested"] = source_name
@@ -2147,11 +2260,11 @@ def _apply_custom_channel_operation(
         lo, hi = _safe_percentile(arr, params.get("percentiles", [70.0, 100.0]), mask)
         return ((np.clip(arr, lo, hi) - lo) / max(hi - lo, 1e-12)).astype(np.float32)
     if op == "hist_equalize":
-        return _equalize_uint8(_float_to_uint8_custom(arr), mask=mask).astype(np.float32) / 255.0
+        return _equalize_uint8(_float_to_uint8_custom(arr), mask=mask, params=params).astype(np.float32) / 255.0
     if op == "clahe":
         img = _float_to_uint8_custom(arr)
         if cv2 is None:
-            return _equalize_uint8(img, mask=mask).astype(np.float32) / 255.0
+            return _equalize_uint8(img, mask=mask, params=params).astype(np.float32) / 255.0
         clip_limit = float(params.get("clip_limit", 2.0))
         tile = int(params.get("tile_grid_size", 8))
         clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile, tile))
@@ -2264,6 +2377,20 @@ def _apply_custom_channel_operation(
     if op == "invert":
         return 1.0 - _normalize_minmax_custom(arr, mask)
     return arr
+
+
+def _custom_operation_should_preserve_background(op: str) -> bool:
+    return str(op or "").casefold().strip() in {
+        "hist_equalize",
+        "clahe",
+        "percentile_normalize",
+        "aggressive_upper_percentile_normalize",
+        "standardize_to_target",
+        "zscore_clip",
+        "gamma",
+        "log",
+        "invert",
+    }
 
 
 def _morphology_kernel_custom(params: dict[str, Any]) -> np.ndarray | None:
@@ -2543,8 +2670,11 @@ def _foreground_mask(arr: np.ndarray, threshold: float | None = None) -> np.ndar
         return np.zeros_like(arr, dtype=bool)
     vals = arr[finite]
     if threshold is None:
-        lo, hi = np.percentile(vals, [1.0, 99.5])
-        threshold = max(float(lo + 0.02 * (hi - lo)), float(lo) + 1e-6)
+        try:
+            threshold = _robust_tissue_threshold(arr)
+        except Exception:
+            lo, hi = np.percentile(vals, [1.0, 99.5])
+            threshold = max(float(lo + 0.02 * (hi - lo)), float(lo) + 1e-6)
     mask = finite & (arr > float(threshold))
     mask = _cleanup_foreground_mask(mask, min_area_fraction=0.001, keep_largest=True)
     return mask
@@ -2598,12 +2728,19 @@ def _to_uint8_window(arr: np.ndarray, lo: float, hi: float) -> np.ndarray:
     return np.round(np.clip(scaled, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
-def _equalize_uint8(img: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
-    """Simple histogram equalization for an 8-bit single-channel image."""
+def _equalize_uint8(img: np.ndarray, mask: np.ndarray | None = None, params: dict[str, Any] | None = None) -> np.ndarray:
+    """Histogram equalization for an 8-bit single-channel image.
+
+    When a foreground mask is available, the equalization LUT is estimated from
+    a trimmed tissue region. This keeps MLO views with a large chest-wall/pectoral
+    area from getting a noticeably different global contrast curve than CC views.
+    The transform is still applied to the full breast.
+    """
     if img.dtype != np.uint8:
         img = img.astype(np.uint8)
-    if mask is not None and mask.any():
-        values = img[mask]
+    stat_mask = _hist_equalization_stat_mask_uint8(img, mask, params)
+    if stat_mask is not None and stat_mask.any():
+        values = img[stat_mask]
     else:
         values = img.reshape(-1)
     hist = np.bincount(values, minlength=256).astype(np.float64)
@@ -2614,7 +2751,53 @@ def _equalize_uint8(img: np.ndarray, mask: np.ndarray | None = None) -> np.ndarr
     cdf_min = cdf[valid][0]
     denom = max(float(cdf[-1] - cdf_min), 1.0)
     lut = np.round((cdf - cdf_min) / denom * 255.0).clip(0, 255).astype(np.uint8)
-    return lut[img]
+    out = lut[img]
+    if mask is not None and mask.shape == img.shape:
+        out = np.where(mask, out, 0).astype(np.uint8)
+    return out
+
+
+def _hist_equalization_stat_mask_uint8(
+    img: np.ndarray,
+    mask: np.ndarray | None,
+    params: dict[str, Any] | None = None,
+) -> np.ndarray | None:
+    params = params or {}
+    if mask is None or mask.shape != img.shape or not mask.any():
+        return mask
+    stat_mask = np.asarray(mask, dtype=bool).copy()
+
+    try:
+        exclude_fraction = float(params.get("exclude_chest_wall_fraction", 0.0) or 0.0)
+    except Exception:
+        exclude_fraction = 0.0
+    exclude_fraction = min(max(exclude_fraction, 0.0), 0.45)
+    if exclude_fraction > 0.0:
+        ys, xs = np.where(stat_mask)
+        if xs.size:
+            x0, x1 = int(xs.min()), int(xs.max())
+            width = max(1, x1 - x0 + 1)
+            band = max(1, int(round(width * exclude_fraction)))
+            try:
+                side = _breast_chest_wall_side(stat_mask) or "left"
+            except Exception:
+                side = "left"
+            if side == "right":
+                stat_mask[:, max(x0, x1 - band + 1):x1 + 1] = False
+            else:
+                stat_mask[:, x0:min(x1 + 1, x0 + band)] = False
+            if not stat_mask.any():
+                stat_mask = np.asarray(mask, dtype=bool).copy()
+
+    percentiles = params.get("stat_percentiles", [1.0, 99.5])
+    try:
+        lo, hi = _safe_percentile(img, percentiles, stat_mask)
+        trimmed = stat_mask & np.isfinite(img) & (img >= lo) & (img <= hi)
+        if trimmed.any():
+            stat_mask = trimmed
+    except Exception:
+        pass
+    return stat_mask
 
 
 # -----------------------------------------------------------------------------

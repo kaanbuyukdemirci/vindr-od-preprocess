@@ -45,7 +45,7 @@ from .crops import (
 )
 from .dataset import VindrMammoDataset
 from .export import export_from_config, load_export_config, make_train_val_test_split
-from .preprocessing import align_contralateral_image_to_reference
+from .preprocessing import _breast_chest_wall_side, _robust_tissue_threshold, align_contralateral_image_to_reference
 from .visualize import create_visualizations_from_export
 
 
@@ -2591,9 +2591,9 @@ def _pipeline_controls(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
         "B": str(cfg_pipeline.get("B", {}).get("source", "contralateral_same_view_crop")),
     }
     default_channel_steps = {
-        "R": [str(s.get("op", "none")) for s in cfg_pipeline.get("R", {}).get("steps", [])] or ["percentile_normalize", "hist_equalize", "standardize_to_target"],
-        "G": [str(s.get("op", "none")) for s in cfg_pipeline.get("G", {}).get("steps", [])] or ["percentile_normalize", "hist_equalize", "percentile_normalize", "hist_equalize", "standardize_to_target"],
-        "B": [str(s.get("op", "none")) for s in cfg_pipeline.get("B", {}).get("steps", [])] or ["percentile_normalize", "hist_equalize", "standardize_to_target"],
+        "R": [str(s.get("op", "none")) for s in cfg_pipeline.get("R", {}).get("steps", [])] or ["percentile_normalize", "mask_outside_breast"],
+        "G": [str(s.get("op", "none")) for s in cfg_pipeline.get("G", {}).get("steps", [])] or ["percentile_normalize", "mask_outside_breast", "clahe", "mask_outside_breast"],
+        "B": [str(s.get("op", "none")) for s in cfg_pipeline.get("B", {}).get("steps", [])] or ["percentile_normalize", "mask_outside_breast"],
     }
     source_options = {
         "current_crop": "current crop",
@@ -4620,6 +4620,8 @@ def apply_channel_pipeline(
             # point-wise transforms; recompute only if the shape changes.
             if stat_mask.shape != arr.shape:
                 stat_mask = _operation_stat_mask(arr)
+            elif _operation_should_preserve_background(op) and stat_mask is not None and stat_mask.any():
+                arr = np.where(stat_mask, arr, float(params.get("outside_value", 0.0))).astype(np.float32)
             applied.append({"op": op, "params": params})
         ch = _float_to_uint8(arr)
         channels.append(ch)
@@ -4655,7 +4657,7 @@ def _apply_operation(arr: np.ndarray, op: str, params: dict[str, Any], stat_mask
     if op == "aggressive_upper_percentile_normalize":
         return _normalize_percentile(arr, params.get("percentiles", [70.0, 100.0]), stat_mask)
     if op == "hist_equalize":
-        return _equalize(_float_to_uint8(arr)).astype(np.float32) / 255.0
+        return _equalize_masked(_float_to_uint8(arr), mask=stat_mask, params=params).astype(np.float32) / 255.0
     if op == "clahe":
         return _clahe(_float_to_uint8(arr), params).astype(np.float32) / 255.0
     if op in {"mask_outside_breast", "artifact_cleanup"}:
@@ -4748,6 +4750,20 @@ def _apply_operation(arr: np.ndarray, op: str, params: dict[str, Any], stat_mask
     if op == "invert":
         return 1.0 - _normalize_minmax(arr, stat_mask)
     return arr
+
+
+def _operation_should_preserve_background(op: str) -> bool:
+    return str(op or "").casefold().strip() in {
+        "hist_equalize",
+        "clahe",
+        "percentile_normalize",
+        "aggressive_upper_percentile_normalize",
+        "standardize_to_target",
+        "zscore_clip",
+        "gamma",
+        "log",
+        "invert",
+    }
 
 
 def _standardize_to_target(arr: np.ndarray, params: dict[str, Any], stat_mask: np.ndarray | None = None) -> np.ndarray:
@@ -4897,8 +4913,11 @@ def _foreground_mask_for_crop(arr: np.ndarray, *, threshold: float | None) -> np
         return np.zeros(arr.shape, dtype=bool)
     vals = arr[finite]
     if threshold is None:
-        lo, hi = np.percentile(vals, [1.0, 99.5])
-        threshold = max(float(lo + 0.02 * (hi - lo)), float(lo) + 1e-6)
+        try:
+            threshold = _robust_tissue_threshold(arr)
+        except Exception:
+            lo, hi = np.percentile(vals, [1.0, 99.5])
+            threshold = max(float(lo + 0.02 * (hi - lo)), float(lo) + 1e-6)
     mask = finite & (arr > float(threshold))
     return _cleanup_foreground_mask(mask, min_area_fraction=0.001)
 
@@ -5011,6 +5030,75 @@ def _equalize(img: np.ndarray) -> np.ndarray:
         return img.copy()
     lut = np.round((cdf - cdf[valid][0]) / max(cdf[-1] - cdf[valid][0], 1.0) * 255).clip(0, 255).astype(np.uint8)
     return lut[img]
+
+
+def _equalize_masked(img: np.ndarray, mask: np.ndarray | None = None, params: dict[str, Any] | None = None) -> np.ndarray:
+    """Histogram equalization using a stable breast-tissue statistics region.
+
+    MLO views often include more dense chest-wall/pectoral tissue than CC views.
+    If that region dominates the histogram, the same global equalization step can
+    make the two views look artificially different. Build the LUT from a trimmed
+    foreground region, then apply it to the full image and keep background black.
+    """
+    img = img.astype(np.uint8, copy=False)
+    stat_mask = _hist_equalization_stat_mask(img, mask, params)
+    if stat_mask is None or not stat_mask.any():
+        return _equalize(img)
+    values = img[stat_mask]
+    hist = np.bincount(values, minlength=256).astype(np.float64)
+    cdf = hist.cumsum()
+    valid = cdf > 0
+    if not valid.any():
+        return img.copy()
+    cdf_min = cdf[valid][0]
+    lut = np.round((cdf - cdf_min) / max(float(cdf[-1] - cdf_min), 1.0) * 255.0).clip(0, 255).astype(np.uint8)
+    out = lut[img]
+    if mask is not None and mask.shape == img.shape:
+        out = np.where(mask, out, 0).astype(np.uint8)
+    return out
+
+
+def _hist_equalization_stat_mask(
+    img: np.ndarray,
+    mask: np.ndarray | None,
+    params: dict[str, Any] | None = None,
+) -> np.ndarray | None:
+    params = params or {}
+    if mask is None or mask.shape != img.shape or not mask.any():
+        return mask
+    stat_mask = np.asarray(mask, dtype=bool).copy()
+
+    try:
+        exclude_fraction = float(params.get("exclude_chest_wall_fraction", 0.0) or 0.0)
+    except Exception:
+        exclude_fraction = 0.0
+    exclude_fraction = min(max(exclude_fraction, 0.0), 0.45)
+    if exclude_fraction > 0.0:
+        ys, xs = np.where(stat_mask)
+        if xs.size:
+            x0, x1 = int(xs.min()), int(xs.max())
+            width = max(1, x1 - x0 + 1)
+            band = max(1, int(round(width * exclude_fraction)))
+            try:
+                side = _breast_chest_wall_side(stat_mask) or "left"
+            except Exception:
+                side = "left"
+            if side == "right":
+                stat_mask[:, max(x0, x1 - band + 1):x1 + 1] = False
+            else:
+                stat_mask[:, x0:min(x1 + 1, x0 + band)] = False
+            if not stat_mask.any():
+                stat_mask = np.asarray(mask, dtype=bool).copy()
+
+    percentiles = params.get("stat_percentiles", [1.0, 99.5])
+    try:
+        lo, hi = _safe_percentile(img, percentiles, stat_mask)
+        trimmed = stat_mask & np.isfinite(img) & (img >= lo) & (img <= hi)
+        if trimmed.any():
+            stat_mask = trimmed
+    except Exception:
+        pass
+    return stat_mask
 
 
 def _clahe(img: np.ndarray, params: dict[str, Any]) -> np.ndarray:

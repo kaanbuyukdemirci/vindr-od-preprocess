@@ -22,7 +22,7 @@ DEFAULT_PREPROCESS_OPTIONS: dict[str, Any] = {
     "minimum_padding_px": 32,
     "maximum_padding_px": 128,
     "crop_threshold": None,
-    "breast_mask_method": "otsu_largest_connected_component",
+    "breast_mask_method": "largest_connected_tissue",
     "breast_mask_close_kernel": 21,
     "breast_mask_open_kernel": 7,
     "breast_mask_fill_holes": True,
@@ -85,6 +85,11 @@ def apply_geometry_preprocessing(
         image = image * mask_t
         info["breast_mask_pixels"] = int(mask.sum())
 
+    pre_crop_should_mirror: bool | None = None
+    if opts["mirror_right_to_left"] and opts["crop_breast"]:
+        pre_crop_should_mirror = breast_is_on_right(image, threshold=opts.get("crop_threshold"), options=opts)
+        info["mirror_decision_before_crop"] = bool(pre_crop_should_mirror)
+
     if opts["crop_breast"]:
         crop_box = breast_crop_box(
             image,
@@ -109,7 +114,10 @@ def apply_geometry_preprocessing(
         info["crop_box_xyxy"] = crop_box
 
     if opts["mirror_right_to_left"]:
-        should_mirror = breast_is_on_right(image, threshold=opts.get("crop_threshold"))
+        if pre_crop_should_mirror is None:
+            should_mirror = breast_is_on_right(image, threshold=opts.get("crop_threshold"), options=opts)
+        else:
+            should_mirror = pre_crop_should_mirror
         info["mirrored"] = bool(should_mirror)
         if should_mirror:
             width = int(image.shape[-1])
@@ -159,13 +167,127 @@ def breast_crop_box(
     return (x0, y0, x1, y1)
 
 
-def breast_is_on_right(image: torch.Tensor, *, threshold: float | None = None) -> bool:
+def breast_is_on_right(image: torch.Tensor, *, threshold: float | None = None, options: dict[str, Any] | None = None) -> bool:
     arr = _image_to_numpy(image)
-    mask = _breast_mask(arr, threshold=threshold)
+    mask = _breast_mask(arr, threshold=threshold, options=options)
     if not mask.any():
         return False
+    side = _breast_chest_wall_side(mask)
+    if side in {"left", "right"}:
+        return side == "right"
     xs = np.where(mask)[1]
     return float(xs.mean()) > (arr.shape[1] / 2.0)
+
+
+def _breast_chest_wall_side(mask: np.ndarray) -> str | None:
+    """Return the likely chest-wall side from the foreground edge profile.
+
+    A centroid-only mirror rule fails on rare cropped mammograms where the breast
+    pixels are mostly left of center but the broad chest wall is on the right.
+    The chest-wall side is usually the straighter vertical boundary, while the
+    nipple side is tapered/curved. Use boundary straightness first, then fall
+    back to edge-band foreground support.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any():
+        return None
+    ys, xs = np.where(mask)
+    if xs.size == 0:
+        return None
+    height, width = mask.shape
+    x0 = int(xs.min())
+    x1 = int(xs.max())
+    fg_width = max(1, x1 - x0 + 1)
+
+    boundary_side = _breast_chest_wall_side_from_boundaries(mask, x0=x0, x1=x1)
+    if boundary_side in {"left", "right"}:
+        return boundary_side
+
+    band = max(4, min(max(4, int(round(0.08 * fg_width))), max(1, fg_width // 3)))
+    left = mask[:, x0:min(x1 + 1, x0 + band)]
+    right = mask[:, max(x0, x1 - band + 1):x1 + 1]
+    if left.size == 0 or right.size == 0:
+        return None
+
+    def _edge_score(strip: np.ndarray) -> float:
+        row_hits = strip.any(axis=1)
+        if not row_hits.any():
+            return 0.0
+        edge_height = float(row_hits.sum())
+        area_per_col = float(strip.sum()) / max(float(strip.shape[1]), 1.0)
+        rows = np.where(row_hits)[0]
+        span = float(int(rows.max()) - int(rows.min()) + 1) if rows.size else 0.0
+        return edge_height + 0.25 * area_per_col + 0.10 * span
+
+    left_score = _edge_score(left)
+    right_score = _edge_score(right)
+    if max(left_score, right_score) <= 0:
+        return None
+    margin = max(6.0, 0.04 * float(height))
+    if abs(left_score - right_score) < margin:
+        return None
+    return "right" if right_score > left_score else "left"
+
+
+def _breast_chest_wall_side_from_boundaries(mask: np.ndarray, *, x0: int, x1: int) -> str | None:
+    row_has = mask.any(axis=1)
+    rows = np.where(row_has)[0]
+    if rows.size < 20:
+        return None
+
+    left_x = np.empty(rows.shape[0], dtype=np.float32)
+    right_x = np.empty(rows.shape[0], dtype=np.float32)
+    widths = np.empty(rows.shape[0], dtype=np.float32)
+    for out_idx, row in enumerate(rows):
+        cols = np.where(mask[row])[0]
+        left_x[out_idx] = float(cols.min())
+        right_x[out_idx] = float(cols.max())
+        widths[out_idx] = float(cols.max() - cols.min() + 1)
+
+    max_width = float(widths.max()) if widths.size else 0.0
+    fg_width = max(1.0, float(x1 - x0 + 1))
+    if max_width < max(8.0, 0.10 * fg_width):
+        return None
+
+    # Ignore rows that only contain the tapered tip or tiny artifacts; they make
+    # both boundaries look unstable and are not useful for wall detection.
+    core = widths >= max(8.0, 0.25 * max_width)
+    if int(core.sum()) < max(12, int(0.20 * rows.size)):
+        core = widths >= max(4.0, 0.15 * max_width)
+    if int(core.sum()) < 8:
+        return None
+
+    left_core = left_x[core]
+    right_core = right_x[core]
+    row_core = rows[core].astype(np.float32)
+    left_score = _vertical_boundary_score(left_core, row_core, fg_width)
+    right_score = _vertical_boundary_score(right_core, row_core, fg_width)
+    if max(left_score, right_score) <= 0.0:
+        return None
+    if abs(left_score - right_score) < 0.08:
+        return None
+    return "right" if right_score > left_score else "left"
+
+
+def _vertical_boundary_score(boundary_x: np.ndarray, rows: np.ndarray, fg_width: float) -> float:
+    if boundary_x.size < 8:
+        return 0.0
+    # Remove the best straight-line trend over rows. Slight gantry rotation or
+    # pectoral slant should still count as a wall; waviness after detrending is
+    # what distinguishes nipple-side curvature.
+    x = boundary_x.astype(np.float32)
+    y = rows.astype(np.float32)
+    try:
+        slope, intercept = np.polyfit(y, x, 1)
+        residual = x - (float(slope) * y + float(intercept))
+    except Exception:
+        residual = x - float(np.median(x))
+    spread = float(np.percentile(residual, 90) - np.percentile(residual, 10))
+    mad = float(np.median(np.abs(residual - np.median(residual))))
+    normalized_spread = spread / max(float(fg_width), 1.0)
+    normalized_mad = mad / max(float(fg_width), 1.0)
+    coverage_bonus = min(1.0, float(boundary_x.size) / max(float(rows.size), 1.0))
+    return float(1.0 / (1.0 + 8.0 * normalized_spread + 12.0 * normalized_mad) + 0.05 * coverage_bonus)
 
 
 def _image_to_numpy(image: torch.Tensor) -> np.ndarray:
@@ -186,7 +308,11 @@ def _breast_mask(arr: np.ndarray, *, threshold: float | None = None, options: di
     if finite.size == 0:
         return np.zeros(arr.shape, dtype=bool)
     if threshold is None:
-        method = str(opts.get("breast_mask_method", "otsu_largest_connected_component")).casefold().strip()
+        method = str(opts.get("breast_mask_method", "largest_connected_tissue")).casefold().strip()
+        if method in {"largest_connected_tissue", "largest_component", "simple_largest_connected_tissue", "robust_largest_connected_tissue"}:
+            threshold = _robust_tissue_threshold(arr)
+            mask = np.isfinite(arr) & (arr > float(threshold))
+            return _postprocess_breast_mask(mask, opts)
         if method.startswith("otsu") and cv2 is not None:
             img = _arr_to_uint8_for_mask(arr)
             threshold, _ = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -198,6 +324,29 @@ def _breast_mask(arr: np.ndarray, *, threshold: float | None = None, options: di
         threshold = max(float(p_low + 0.02 * (p_high - p_low)), float(p_low) + 1e-6)
     mask = np.isfinite(arr) & (arr > float(threshold))
     return _postprocess_breast_mask(mask, opts)
+
+
+def _robust_tissue_threshold(arr: np.ndarray) -> float:
+    finite_mask = np.isfinite(arr)
+    finite = arr[finite_mask]
+    if finite.size == 0:
+        return 0.0
+    h, w = arr.shape
+    border = max(8, int(round(min(h, w) * 0.03)))
+    border_parts = [
+        arr[:border, :],
+        arr[max(0, h - border):, :],
+        arr[:, :border],
+        arr[:, max(0, w - border):],
+    ]
+    border_vals = np.concatenate([part[np.isfinite(part)].reshape(-1) for part in border_parts])
+    bg_vals = border_vals if border_vals.size >= 64 else finite
+    bg_med = float(np.median(bg_vals))
+    bg_mad = float(np.median(np.abs(bg_vals - bg_med)))
+    p01, p995 = np.percentile(finite, [1.0, 99.5])
+    dynamic = max(float(p995 - p01), 1e-6)
+    noise_margin = max(6.0 * 1.4826 * bg_mad, 0.025 * dynamic, 1e-6)
+    return max(float(bg_med + noise_margin), float(p01 + 0.015 * dynamic))
 
 
 def _arr_to_uint8_for_mask(arr: np.ndarray) -> np.ndarray:

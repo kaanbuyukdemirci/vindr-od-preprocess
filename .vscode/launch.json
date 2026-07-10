@@ -2,6 +2,21 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "Run Dash GUI",
+      "type": "python",
+      "request": "launch",
+      "module": "vindr_mammo.dash_app",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "--config",
+        "config/export_config.yaml"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      }
+    },
+    {
       "name": "Run VinDr-Mammo main.py",
       "type": "python",
       "request": "launch",

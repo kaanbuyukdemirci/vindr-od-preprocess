@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+import warnings
 
 import numpy as np
 import torch
@@ -44,7 +45,13 @@ def _as_float_array(ds: Any, use_voi_lut: bool, invert_monochrome1: bool) -> np.
 
     if use_voi_lut and apply_voi_lut is not None:
         try:
-            arr = apply_voi_lut(arr, ds)
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Applying a VOI LUT on a float input array may give incorrect results",
+                    category=UserWarning,
+                )
+                arr = apply_voi_lut(arr, ds)
         except Exception:
             pass
 

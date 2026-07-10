@@ -46,11 +46,12 @@ This project is now installable as a normal Python package. For development, use
 pip install -e .
 ```
 
-This reads `pyproject.toml`, installs the package from `src/vindr_mammo`, and creates two console commands:
+This reads `pyproject.toml`, installs the package from `src/vindr_mammo`, and creates the console commands:
 
 ```bash
 vindr-mammo-export --config config/export_config.yaml
 vindr-mammo-visualize --config config/export_config.yaml
+vindr-mammo-gui --config config/export_config.yaml
 ```
 
 You can still install from the requirements file if you only want the dependencies:
@@ -98,6 +99,20 @@ vindr-mammo-visualize --config config/export_config.yaml
 ```
 
 `main.py` and `visualize_export.py` are kept as simple VSCode-friendly wrappers around those same command-line entry points.
+
+## Dash preprocessing GUI
+
+The interactive preprocessing inspector now runs as a Dash app:
+
+```bash
+vindr-mammo-gui --config config/export_config.yaml
+```
+
+It organizes the workflow into Preview, Preprocess, Crops, Pipeline, Export, Saved Data, Manifests, and Guide tabs. Each important parameter has an in-app `?` explanation with practical examples. The legacy Streamlit inspector is still available for comparison:
+
+```bash
+vindr-mammo-streamlit-gui --config config/export_config.yaml
+```
 
 ## Basic usage
 
@@ -1200,7 +1215,7 @@ yolo detect train model=yolo11n.pt data=/mnt/t9/preprocessed-vindr-v3/square_cro
 
 ## Interactive preprocessing inspector GUI
 
-This version includes a local Streamlit GUI for inspecting mammograms, square crops, mass boxes, vendors, and experimental RGB preprocessing pipelines before exporting a new dataset. Run it with:
+This version includes a local Dash GUI for inspecting mammograms, square crops, mass boxes, vendors, and experimental RGB preprocessing pipelines before exporting a new dataset. Run it with:
 
 ```bash
 pip install -e .
@@ -1210,12 +1225,12 @@ vindr-mammo-gui --config config/export_config.yaml
 or, from the repository root:
 
 ```bash
-streamlit run inspect_preprocessing_app.py -- --config config/export_config.yaml
+python inspect_preprocessing_app.py
 ```
 
 The GUI can filter by train/val/test, positive images only or all images, vendor/device, crop positivity threshold, and crop index. It displays the full grayscale image, the selected grayscale crop, and the processed RGB crop together with mass boxes, statistics, metadata, optional per-channel panels with mass boxes, and compare-mode statistical similarity metrics.
 
-For large DICOMs, keep **Manual preview refresh** enabled in the sidebar. You can change multiple parameters quickly, then click **Render / refresh preview** once to run the expensive DICOM read, breast crop, crop selection, RGB preprocessing, and rendering step.
+For large DICOMs, change multiple parameters quickly, then click **Render / refresh** once to run the expensive DICOM read, breast crop, crop selection, RGB preprocessing, and rendering step.
 
 Detailed docs:
 
@@ -1298,7 +1313,7 @@ The report now includes COCO-style box-size statistics from the exported COCO/MM
 
 ### GUI visualization of an exported dataset
 
-The Streamlit GUI includes a **Dataset visualizations** mode. Enter an exported dataset root such as `/mnt/t9/preprocessed-vindr-v3`, click **Calculate / refresh visualizations**, and the app will display the COCO small/medium/large box-size tables and plots directly.
+The Dash GUI includes a **Dataset visualizations** mode for viewing visualization files under an exported dataset root such as `/mnt/t9/preprocessed-vindr-v3/visualizations`.
 
 ### v41 GUI export additions
 
@@ -1320,7 +1335,7 @@ The GUI export progress panel now estimates remaining time from the current acti
 
 ## v48 note, manifest loading and crop-control refresh
 
-Manifest/config loading now treats the loaded `config_snapshot` as the source of truth for export-related settings. The GUI includes refresh buttons in the loaded-manifest panel, crop settings panel, and export panel to rebuild Streamlit widgets from the loaded config. This is useful when Streamlit session state has stale widget values after loading or reloading a manifest.
+Manifest/config loading treats the active YAML as the source of truth for export-related settings. Load a previous resolved config with the Config YAML field to rebuild the Dash controls from that snapshot.
 
 A new `Loaded crop settings check` sidebar expander shows the crop-size, stride, split crop modes, deterministic selection modes, target positive ratios, foreground filtering options, random-crop options, and crop annotation policy currently active from the loaded config.
 
@@ -1489,7 +1504,7 @@ The contralateral source path is faster now. Instead of shifting the whole oppos
 
 ## Saved dataset viewer
 
-The Streamlit GUI includes a **Saved dataset viewer** mode for checking exported `square_crops` without reloading the original DICOM files. It reads the exported PNG crops, YOLO labels, `stats/samples.csv`, `debug_logs/crop_log.csv`, and `metadata/export_config_resolved.yaml`.
+The Dash GUI includes a **Saved dataset viewer** mode for checking exported `square_crops` without reloading the original DICOM files. It reads the exported PNG crops, YOLO labels, `stats/samples.csv`, `debug_logs/crop_log.csv`, and `metadata/export_config_resolved.yaml`.
 
 Features:
 

@@ -13,4 +13,6 @@ tqdm
 pyyaml
 scipy
 
+dash
+plotly
 streamlit

@@ -21,7 +21,7 @@ preprocess:
   minimum_padding_px: 32
   maximum_padding_px: 128
   crop_threshold: null
-  breast_mask_method: otsu_largest_connected_component
+  breast_mask_method: largest_connected_tissue
   breast_mask_close_kernel: 21
   breast_mask_open_kernel: 7
   breast_mask_fill_holes: true
@@ -29,12 +29,12 @@ preprocess:
   min_component_area_fraction: 0.001
   min_box_visibility_after_crop: 0.3
 image_export:
-  rgb_scheme: raw_clahe_detail
+  rgb_scheme: custom_channel_pipeline
   literature_recipes:
     raw_percentiles:
     - 0.5
     - 99.5
-    clahe_clip_limit: 2.0
+    clahe_clip_limit: 4.0
     clahe_tile_grid_size: 8
     detail_blur_sigma: 1.0
     detail_rescale_percentiles:
@@ -89,8 +89,9 @@ image_export:
           percentiles:
           - 0.0
           - 100.0
-      - op: hist_equalize
-        params: {}
+      - op: mask_outside_breast
+        params:
+          outside_value: 0.0
     G:
       source: current_crop
       steps:
@@ -99,24 +100,29 @@ image_export:
           percentiles:
           - 0.0
           - 100.0
-      - op: hist_equalize
-        params: {}
+      - op: mask_outside_breast
+        params:
+          outside_value: 0.0
       - op: clahe
         params:
-          clip_limit: 8.0
+          clip_limit: 4.0
           tile_grid_size: 8
+      - op: mask_outside_breast
+        params:
+          outside_value: 0.0
     B:
       source: contralateral_same_view_crop
       steps:
       - op: percentile_normalize
         params:
           percentiles:
-          - 0.0
+          - 50.0
           - 100.0
-      - op: hist_equalize
-        params: {}
+      - op: mask_outside_breast
+        params:
+          outside_value: 0.0
 histogram_equalization:
-  enabled: true
+  enabled: false
   apply_to: third_channel
 preserved_16bit:
   save: true
@@ -147,17 +153,17 @@ square_crops:
   random_crops_per_negative_image: 1
   positive_fraction: 0.5
   train_positive_fraction: 0.5
-  val_positive_fraction: 1.0
-  test_positive_fraction: 1.0
+  val_positive_fraction: 0.5
+  test_positive_fraction: 0.5
   train_bbox_safe_positive_fraction: 0.5
-  val_bbox_safe_positive_fraction: 1.0
-  test_bbox_safe_positive_fraction: 1.0
+  val_bbox_safe_positive_fraction: 0.5
+  test_bbox_safe_positive_fraction: 0.5
   train_deterministic_selection_mode: positive_ratio
   val_deterministic_selection_mode: positive_ratio
   test_deterministic_selection_mode: positive_ratio
   train_deterministic_target_positive_ratio: 0.5
-  val_deterministic_target_positive_ratio: 1.0
-  test_deterministic_target_positive_ratio: 1.0
+  val_deterministic_target_positive_ratio: 0.5
+  test_deterministic_target_positive_ratio: 0.5
   center_shift_fraction: 0.25
   max_random_tries: 80
   bbox_safe_boundary_margin_fraction: 0.02
@@ -194,6 +200,12 @@ square_crops:
   bbox_safe_foreground_min_component_area_fraction: 0.001
   bbox_safe_min_foreground_fraction: 0.35
   deduplicate_windows_per_source: true
+baseline_uncropped:
+  resize_mode: fit_pad
+  target_width: 1024
+  target_height: 1024
+  pad_value: 0.0
+  pad_anchor: left_top
 crop_annotation_policy:
   allow_partial_annotations: true
   min_box_visibility: 0.3

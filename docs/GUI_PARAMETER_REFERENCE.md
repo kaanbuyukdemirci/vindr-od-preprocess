@@ -11,11 +11,19 @@ pip install -e .
 vindr-mammo-gui --config config/export_config.yaml
 ```
 
-Alternative direct Streamlit command:
+Alternative direct local wrapper:
 
 ```bash
-streamlit run inspect_preprocessing_app.py -- --config config/export_config.yaml
+python inspect_preprocessing_app.py
 ```
+
+Legacy Streamlit command, kept only for transition/comparison:
+
+```bash
+vindr-mammo-streamlit-gui --config config/export_config.yaml
+```
+
+The Dash GUI is organized into Preview, Preprocess, Crops, Pipeline, Export, Saved Data, Manifests, and Guide tabs. Click the `?` control beside a parameter to open a plain-language explanation with examples.
 
 ## Performance Controls
 
@@ -116,6 +124,7 @@ Used only when an RGB channel source is `contralateral_same_view_crop`.
 | GUI label | Config key | Meaning |
 |---|---|---|
 | 3-channel recipe | `image_export.rgb_scheme` or `image_export.custom_channel_pipeline` | Loads presets such as raw+CLAHE+detail, raw replicated, masked raw, TopHat, or a denoise ablation. |
+| Editable pipeline YAML | `image_export.custom_channel_pipeline` | Dash editor for every R/G/B source, ordered operation, and operation parameter. Render/export uses it when the YAML parses successfully. |
 | Source | `image_export.custom_channel_pipeline.<R/G/B>.source` | Uses the current crop or the aligned opposite-breast crop. |
 | Number of steps | `image_export.custom_channel_pipeline.<R/G/B>.steps` | Number of ordered preprocessing operations in that channel. |
 | Step | `image_export.custom_channel_pipeline.<R/G/B>.steps[].op` | Operation name. Parameters below depend on the selected operation. |
@@ -174,4 +183,3 @@ Used only when an RGB channel source is `contralateral_same_view_crop`.
 | BBox-safe export parameters | `square_crops.bbox_safe_*` | Reuses the crop-preview bbox-safe controls for export. |
 | Show simple timing breakdown during export | `runtime.simple_profiler_enabled` | Enables coarse timing buckets during export. |
 | Profiler GUI update frequency | `runtime.simple_profiler_emit_every` | Reduces UI overhead by updating timing every N progress events. |
-
