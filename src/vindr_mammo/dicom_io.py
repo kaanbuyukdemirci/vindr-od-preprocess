@@ -33,16 +33,29 @@ class DicomImage:
     output_shape: tuple[int, int]
 
 
-def _as_float_array(ds: Any, use_voi_lut: bool, invert_monochrome1: bool) -> np.ndarray:
+def _as_float_array(
+    ds: Any,
+    use_voi_lut: bool,
+    invert_monochrome1: bool,
+    *,
+    strict_voi_lut: bool = False,
+    trace: dict[str, Any] | None = None,
+) -> np.ndarray:
     """Read pixels from a pydicom dataset and convert them to float32."""
     arr = ds.pixel_array
 
     if apply_modality_lut is not None:
         try:
             arr = apply_modality_lut(arr, ds)
+            if trace is not None:
+                trace["ModalityLUTApplied"] = True
         except Exception:
+            if trace is not None:
+                trace["ModalityLUTApplied"] = False
             pass
 
+    if use_voi_lut and apply_voi_lut is None and strict_voi_lut:
+        raise RuntimeError("VOI LUT/windowing was required, but pydicom.apply_voi_lut is unavailable.")
     if use_voi_lut and apply_voi_lut is not None:
         try:
             with warnings.catch_warnings():
@@ -52,8 +65,14 @@ def _as_float_array(ds: Any, use_voi_lut: bool, invert_monochrome1: bool) -> np.
                     category=UserWarning,
                 )
                 arr = apply_voi_lut(arr, ds)
-        except Exception:
-            pass
+            if trace is not None:
+                trace["VOILUTApplied"] = True
+        except Exception as exc:
+            if trace is not None:
+                trace["VOILUTApplied"] = False
+                trace["VOILUTError"] = repr(exc)
+            if strict_voi_lut:
+                raise RuntimeError("Required DICOM VOI LUT/windowing failed.") from exc
 
     arr = np.asarray(arr, dtype=np.float32)
 
@@ -63,6 +82,13 @@ def _as_float_array(ds: Any, use_voi_lut: bool, invert_monochrome1: bool) -> np.
     photometric = str(getattr(ds, "PhotometricInterpretation", "")).upper()
     if invert_monochrome1 and photometric == "MONOCHROME1":
         arr = arr.max() + arr.min() - arr
+
+    if trace is not None:
+        trace.setdefault("ModalityLUTApplied", False)
+        trace.setdefault("VOILUTApplied", False)
+        trace["VOILUTRequested"] = bool(use_voi_lut)
+        trace["Monochrome1Inverted"] = bool(invert_monochrome1 and photometric == "MONOCHROME1")
+        trace["IntensityTransformOrder"] = "modality_lut_then_voi_lut_then_monochrome1_inversion_then_normalization"
 
     return arr
 
@@ -115,6 +141,7 @@ def read_dicom_image(
     add_channel_dim: bool = True,
     return_dicom_meta: bool = False,
     invert_monochrome1: bool = False,
+    strict_voi_lut: bool = False,
 ) -> DicomImage:
     """Read a mammography DICOM file as a torch tensor.
 
@@ -139,6 +166,9 @@ def read_dicom_image(
         If True and the DICOM tag ``PhotometricInterpretation`` is ``MONOCHROME1``,
         invert pixel intensities so the returned image follows the MONOCHROME2-style
         convention: black background and bright tissue.
+    strict_voi_lut:
+        If True, raise instead of silently falling back when requested VOI
+        LUT/windowing cannot be applied.
     """
     if pydicom is None:  # pragma: no cover
         raise ImportError(
@@ -148,7 +178,14 @@ def read_dicom_image(
 
     path = Path(path)
     ds = pydicom.dcmread(str(path))
-    arr = _as_float_array(ds, use_voi_lut=use_voi_lut, invert_monochrome1=invert_monochrome1)
+    transform_trace: dict[str, Any] = {}
+    arr = _as_float_array(
+        ds,
+        use_voi_lut=use_voi_lut,
+        invert_monochrome1=invert_monochrome1,
+        strict_voi_lut=strict_voi_lut,
+        trace=transform_trace,
+    )
 
     if arr.ndim != 2:
         # VinDr-Mammo should be grayscale. This keeps the code explicit if a handler
@@ -173,7 +210,8 @@ def read_dicom_image(
     output_shape = (int(tensor.shape[-2]), int(tensor.shape[-1]))
 
     dicom_meta: dict[str, Any] = {
-        "InvertedMonochrome1": bool(invert_monochrome1 and str(getattr(ds, "PhotometricInterpretation", "")).upper() == "MONOCHROME1")
+        "InvertedMonochrome1": bool(invert_monochrome1 and str(getattr(ds, "PhotometricInterpretation", "")).upper() == "MONOCHROME1"),
+        **transform_trace,
     } if return_dicom_meta else {}
     if return_dicom_meta:
         for tag in [

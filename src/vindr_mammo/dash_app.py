@@ -22,6 +22,7 @@ from PIL import Image
 
 from .dataset import VindrMammoDataset
 from .export import export_from_config, load_export_config
+from .presets import STUDY_PRESETS, apply_study_preset
 
 logging.getLogger("streamlit").setLevel(logging.ERROR)
 logging.getLogger("streamlit.runtime").setLevel(logging.ERROR)
@@ -343,6 +344,16 @@ PARAM_HELP: dict[str, dict[str, str]] = {
         "body": "Loads a complete R/G/B preprocessing recipe. Custom keeps the pipeline from the active YAML.",
         "example": "raw + CLAHE + local detail puts normalized raw in R, local contrast in G, and a detail residual in B.",
     },
+    "study_preset": {
+        "title": "Study preset",
+        "body": "Applies one paper's full data recipe across DICOM loading, fixed preprocessing, patch geometry, sampling, channel export, and save options.",
+        "example": "Apply this before fine-tuning individual tabs. Local input/output paths are preserved.",
+    },
+    "negative_keep_fraction": {
+        "title": "Negative patch keep fraction",
+        "body": "Keeps this fraction of all eligible negative sliding-window candidates while retaining every positive patch.",
+        "example": "0.20 means a seeded 20% sample of negative candidates; it does not mean negatives are 20% of the final dataset.",
+    },
     "channel_source": {
         "title": "Channel Source",
         "body": "Each channel can use the current crop or the same window from the aligned opposite breast in the same study/view.",
@@ -632,21 +643,9 @@ PIPELINE_OP_LABELS = {
     "invert": "Invert",
 }
 
-DEFAULT_VISUAL_OPS: dict[str, dict[int, str]] = {
-    "common_start": {
-        0: "percentile_normalize",
-        1: "mask_outside_breast",
-    },
-    "G": {
-        0: "clahe",
-    },
-    "B": {
-        0: "percentile_normalize",
-    },
-    "common_end": {
-        0: "mask_outside_breast",
-    },
-}
+# A loaded YAML or study preset is the initial source of truth. The visual
+# builder starts empty and takes over only after the user adds a step.
+DEFAULT_VISUAL_OPS: dict[str, dict[int, str]] = {}
 
 DATASET_OBJECT_CACHE: dict[str, VindrMammoDataset] = {}
 
@@ -730,6 +729,7 @@ def _layout(config_path: Path, cfg: dict[str, Any]) -> html.Div:
             dcc.Store(id="config-store", data=_jsonable(cfg)),
             dcc.Store(id="dataset-store", data={}),
             dcc.Store(id="pipeline-store", data=_initial_pipeline(cfg)),
+            dcc.Store(id="pipeline-mode", data="yaml"),
             dcc.Store(id="selected-help-store", data="config_path"),
             dcc.Interval(id="job-poll", interval=1200, disabled=True),
             _style_block(),
@@ -781,6 +781,7 @@ def _layout(config_path: Path, cfg: dict[str, Any]) -> html.Div:
                     html.Section(
                         className="control-pane",
                         children=[
+                            _study_preset_controls(),
                             dcc.Tabs(
                                 id="control-tabs",
                                 value="preview",
@@ -862,6 +863,28 @@ def _layout(config_path: Path, cfg: dict[str, Any]) -> html.Div:
                     ),
                 ],
             ),
+        ],
+    )
+
+
+def _study_preset_controls() -> html.Div:
+    options = [{"label": "Custom / loaded configuration", "value": "custom"}] + [
+        {"label": str(preset["label"]), "value": key}
+        for key, preset in STUDY_PRESETS.items()
+    ]
+    return html.Div(
+        className="study-preset-panel",
+        children=[
+            _field(
+                "Study preset",
+                dcc.Dropdown(id="study-preset", options=options, value="custom", clearable=False),
+                "study_preset",
+            ),
+            html.Div(
+                "Study presets are placed first because they intentionally update settings across multiple tabs.",
+                className="note",
+            ),
+            html.Div(id="study-preset-status", className="status-line"),
         ],
     )
 
@@ -998,16 +1021,18 @@ def _register_callbacks(app: Dash) -> None:
         Output("config-store", "data"),
         Output("pipeline-store", "data"),
         Output("pipeline-yaml", "value"),
+        Output("pipeline-mode", "data"),
         Output("load-status", "children"),
+        Output("study-preset", "value"),
         Input("load-config", "n_clicks"),
         State("config-path", "value"),
         prevent_initial_call=True,
     )
-    def _load_config(_n: int, path_text: str) -> tuple[dict[str, Any], dict[str, Any], str, Any]:
+    def _load_config(_n: int, path_text: str) -> tuple[dict[str, Any], dict[str, Any], str, str, Any, str]:
         started = time.perf_counter()
         path = Path(str(path_text or "")).expanduser()
         if not path.exists():
-            return no_update, no_update, no_update, html.Div(f"Config not found: {path}", className="error note")
+            return no_update, no_update, no_update, no_update, html.Div(f"Config not found: {path}", className="error note"), no_update
         try:
             cfg = _load_config_for_dash(path)
             pipeline = _initial_pipeline(cfg)
@@ -1017,10 +1042,40 @@ def _register_callbacks(app: Dash) -> None:
                 _jsonable(cfg),
                 pipeline,
                 pipeline_yaml,
+                "yaml",
                 html.Div(f"Loaded {path} in {elapsed:.2f}s. Controls synced from YAML.", className="note"),
+                "custom",
             )
         except Exception as exc:
-            return no_update, no_update, no_update, html.Div(f"Could not load config: {exc}", className="error note")
+            return no_update, no_update, no_update, no_update, html.Div(f"Could not load config: {exc}", className="error note"), no_update
+
+    @app.callback(
+        Output("config-store", "data", allow_duplicate=True),
+        Output("pipeline-store", "data", allow_duplicate=True),
+        Output("pipeline-yaml", "value", allow_duplicate=True),
+        Output("pipeline-mode", "data", allow_duplicate=True),
+        Output("study-preset-status", "children"),
+        Input("study-preset", "value"),
+        State("config-store", "data"),
+        prevent_initial_call=True,
+    )
+    def _apply_cross_section_preset(preset_key: str, cfg: dict[str, Any]) -> tuple[Any, Any, Any, Any, Any]:
+        if not preset_key or preset_key == "custom":
+            raise PreventUpdate
+        try:
+            effective = apply_study_preset(cfg or {}, str(preset_key))
+            pipeline = _initial_pipeline(effective)
+            pipeline_yaml = yaml.safe_dump(_make_yaml_safe(pipeline), sort_keys=False, width=100)
+            preset = STUDY_PRESETS[str(preset_key)]
+            return (
+                _jsonable(effective),
+                pipeline,
+                pipeline_yaml,
+                "yaml",
+                html.Div([html.Strong("Applied. "), str(preset["description"])], className="note"),
+            )
+        except Exception as exc:
+            return no_update, no_update, no_update, no_update, html.Div(f"Could not apply preset: {exc}", className="error note")
 
     @app.callback(
         *_config_control_outputs(),
@@ -1033,16 +1088,33 @@ def _register_callbacks(app: Dash) -> None:
     @app.callback(
         Output("pipeline-store", "data", allow_duplicate=True),
         Output("pipeline-yaml", "value", allow_duplicate=True),
+        Output("pipeline-mode", "data", allow_duplicate=True),
         Input("pipeline-preset", "value"),
         State("config-store", "data"),
         prevent_initial_call=True,
     )
-    def _preset_pipeline(preset: str, cfg: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    def _preset_pipeline(preset: str, cfg: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
         if not preset or preset == "custom":
             pipeline = _initial_pipeline(cfg or {})
         else:
             pipeline = copy.deepcopy(LITERATURE_PIPELINE_PRESETS[str(preset)]["pipeline"])
-        return pipeline, yaml.safe_dump(_make_yaml_safe(pipeline), sort_keys=False, width=100)
+        return pipeline, yaml.safe_dump(_make_yaml_safe(pipeline), sort_keys=False, width=100), "yaml"
+
+    @app.callback(
+        Output("pipeline-mode", "data", allow_duplicate=True),
+        Input({"type": "stage-op", "stage": ALL, "idx": ALL}, "value"),
+        prevent_initial_call=True,
+    )
+    def _activate_visual_pipeline(_ops: list[Any]) -> str:
+        return "visual"
+
+    @app.callback(
+        Output("pipeline-mode", "data", allow_duplicate=True),
+        Input("pipeline-yaml", "value"),
+        prevent_initial_call=True,
+    )
+    def _activate_yaml_pipeline(_yaml_text: str) -> str:
+        return "yaml"
 
     @app.callback(
         Output({"type": "stage-row", "stage": ALL, "idx": ALL}, "style"),
@@ -1956,16 +2028,38 @@ def _export_controls_dash(cfg: dict[str, Any]) -> Any:
                         id="export-balance-mode",
                         options=[
                             {"label": "All mass + sampled empty", "value": "positive_ratio"},
+                            {"label": "All positive + fraction of negative candidates (training)", "value": "negative_fraction"},
                             {"label": "Mass only", "value": "mass_only"},
                             {"label": "All windows/candidates", "value": "all"},
                         ],
-                        value=str(crop_cfg.get("deterministic_selection_mode", "positive_ratio") or "positive_ratio"),
+                        value=str(crop_cfg.get("train_deterministic_selection_mode", crop_cfg.get("deterministic_selection_mode", "positive_ratio")) or "positive_ratio"),
                         clearable=False,
                     ),
                     "positive_fraction",
                 ),
                 _field("Target mass ratio", _number("export-target-positive-ratio", float(crop_cfg.get("deterministic_target_positive_ratio", crop_cfg.get("positive_fraction", 0.50))), min_=0.01, max_=1.0, step=0.01), "positive_fraction"),
-                html.Div("Mass-positive crops are always saved. Empty crops are skipped or accepted to stay close to this ratio; 0.50 means about half mass and half empty.", className="note"),
+                _field(
+                    "Training negative patch keep fraction",
+                    _number(
+                        "export-negative-keep-fraction",
+                        float(crop_cfg.get("train_deterministic_negative_keep_fraction", crop_cfg.get("deterministic_negative_keep_fraction", 0.20))),
+                        min_=0.0,
+                        max_=1.0,
+                        step=0.01,
+                    ),
+                    "negative_keep_fraction",
+                ),
+                html.Div(
+                    "Target-ratio mode keeps all positive crops and samples empty crops toward the requested final ratio. "
+                    "Negative-fraction mode instead keeps all positive training patches plus the requested fraction of "
+                    "eligible negative candidates; validation and test keep all eligible windows.",
+                    className="note",
+                ),
+                html.Div(
+                    "The Source tab's Images = all images setting controls which source images are available for inspection. "
+                    "It is separate from patch-level export balance.",
+                    className="note",
+                ),
             ]),
             html.Details(children=[
                 html.Summary("Vendor filter"),
@@ -2032,7 +2126,7 @@ def _all_preview_states() -> list[State]:
         State("fg-threshold-mode", "value"), State("fg-threshold", "value"), State("show-foreground-mask", "value"),
         State("alignment-enabled", "value"), State("alignment-method", "value"), State("alignment-fallback", "value"), State("alignment-max-shift", "value"), State("alignment-min-overlap", "value"),
         State("alignment-min-score", "value"), State("alignment-score-margin", "value"), State("alignment-projection-smooth", "value"), State("alignment-boundary-smooth", "value"),
-        State("pipeline-store", "data"), State("pipeline-yaml", "value"), State("common-steps-yaml", "value"),
+        State("pipeline-store", "data"), State("pipeline-yaml", "value"), State("pipeline-mode", "data"), State("common-steps-yaml", "value"),
         State({"type": "stage-source", "stage": ALL}, "value"),
         State({"type": "stage-op", "stage": ALL, "idx": ALL}, "value"),
         State({"type": "stage-lo", "stage": ALL, "idx": ALL}, "value"),
@@ -2075,7 +2169,7 @@ def _all_preview_states() -> list[State]:
         State({"type": "stage-pectoral-fill", "stage": ALL, "idx": ALL}, "value"),
         State("whole-resize-mode", "value"), State("whole-resize-width", "value"), State("whole-resize-height", "value"), State("whole-pad-value", "value"), State("whole-pad-anchor", "value"),
         State("export-parent", "value"), State("export-name", "value"), State("clean-output", "value"), State("save-square-crops", "value"), State("save-baseline", "value"),
-        State("train-crop-mode", "value"), State("val-crop-mode", "value"), State("test-crop-mode", "value"), State("export-balance-mode", "value"), State("export-target-positive-ratio", "value"), State("export-vendor-mode", "value"), State("export-vendors", "value"), State("export-confirm", "value"),
+        State("train-crop-mode", "value"), State("val-crop-mode", "value"), State("test-crop-mode", "value"), State("export-balance-mode", "value"), State("export-target-positive-ratio", "value"), State("export-negative-keep-fraction", "value"), State("export-vendor-mode", "value"), State("export-vendors", "value"), State("export-confirm", "value"),
         State("saved-root", "value"), State("saved-split", "value"), State("saved-positive", "value"), State("saved-search", "value"), State("saved-existing-only", "value"), State("saved-show-boxes", "value"), State("saved-index", "value"),
         State("manifest-paths", "value"),
     ]
@@ -2083,11 +2177,12 @@ def _all_preview_states() -> list[State]:
 
 def _config_control_outputs() -> list[Output]:
     ids = [
+        "filter-split", "filter-positive", "filter-vendor-mode", "view-geometry",
         "pp-invert", "pp-crop-breast", "pp-mask-outside", "pp-mirror", "pp-padding-mode",
         "pp-padding-fraction", "pp-padding-fixed", "pp-min-padding", "pp-max-padding",
         "pp-threshold-mode", "pp-threshold", "pp-min-component", "pp-mask-method",
         "pp-open-kernel", "pp-close-kernel", "pp-fill-holes", "pp-largest-component",
-        "pp-min-box-after-crop", "crop-size", "crop-stride", "preview-mode",
+        "pp-min-box-after-crop", "crop-size", "final-crop-resize", "crop-stride", "preview-mode",
         "only-mass-crops", "positivity-threshold", "allow-partial", "min-box-visibility",
         "random-preview-count", "random-seed", "random-positive-fraction",
         "center-shift-fraction", "bbox-boundary-margin", "bbox-random-shift",
@@ -2101,7 +2196,7 @@ def _config_control_outputs() -> list[Output]:
         "whole-resize-height", "whole-pad-value", "whole-pad-anchor",
         "export-parent", "export-name", "clean-output",
         "save-square-crops", "save-baseline", "train-crop-mode", "val-crop-mode",
-        "test-crop-mode", "export-balance-mode", "export-target-positive-ratio",
+        "test-crop-mode", "export-balance-mode", "export-target-positive-ratio", "export-negative-keep-fraction",
         "export-vendor-mode", "saved-root",
     ]
     return [Output(component_id, "value") for component_id in ids]
@@ -2112,6 +2207,7 @@ def _on_value(value: bool) -> list[str]:
 
 
 def _config_control_values(cfg: dict[str, Any]) -> tuple[Any, ...]:
+    gui_cfg = cfg.get("gui", {}) or {}
     pp = cfg.get("preprocess", {}) or {}
     crop = cfg.get("square_crops", {}) or {}
     policy = cfg.get("crop_annotation_policy", {}) or {}
@@ -2127,6 +2223,10 @@ def _config_control_values(cfg: dict[str, Any]) -> tuple[Any, ...]:
     if preview_mode not in {"deterministic", "random", "bbox_safe_random"}:
         preview_mode = "deterministic"
     return (
+        str(gui_cfg.get("filter_split", "all")),
+        str(gui_cfg.get("filter_positive", "positive only")),
+        str(gui_cfg.get("filter_vendor_mode", "all vendors")),
+        "crop" if bool(export_cfg.get("save_square_crops", True)) else "whole",
         _on_value(pp.get("invert_to_black_background", True)),
         _on_value(pp.get("crop_breast", True)),
         _on_value(pp.get("mask_outside_breast", True)),
@@ -2145,6 +2245,7 @@ def _config_control_values(cfg: dict[str, Any]) -> tuple[Any, ...]:
         _on_value(pp.get("breast_mask_fill_holes", True)),
         _on_value(pp.get("breast_mask_keep_largest_component", True)),
         float(pp.get("min_box_visibility_after_crop", 0.30)),
+        int(crop.get("crop_size", 1024)),
         int(crop.get("crop_size", 1024)),
         int(crop.get("stride", 512)),
         preview_mode,
@@ -2190,8 +2291,9 @@ def _config_control_values(cfg: dict[str, Any]) -> tuple[Any, ...]:
         str(crop.get("train_crop_mode", "deterministic")),
         str(crop.get("val_crop_mode", "deterministic")),
         str(crop.get("test_crop_mode", "deterministic")),
-        str(crop.get("deterministic_selection_mode", "positive_ratio") or "positive_ratio"),
-        float(crop.get("deterministic_target_positive_ratio", crop.get("positive_fraction", 0.50))),
+        str(crop.get("train_deterministic_selection_mode", crop.get("deterministic_selection_mode", "positive_ratio")) or "positive_ratio"),
+        float(crop.get("train_deterministic_target_positive_ratio", crop.get("deterministic_target_positive_ratio", crop.get("positive_fraction", 0.50)))),
+        float(crop.get("train_deterministic_negative_keep_fraction", crop.get("deterministic_negative_keep_fraction", 0.20))),
         "selected vendors only" if bool(vendor_cfg.get("enabled", False)) else "all vendors",
         str(cfg.get("paths", {}).get("output_root", "/mnt/t9/preprocessed-vindr-gui")),
     )
@@ -2208,7 +2310,7 @@ def _state_to_params(values: tuple[Any, ...]) -> dict[str, Any]:
         "random_positive_fraction", "center_shift_fraction", "bbox_boundary_margin", "bbox_random_shift", "bbox_candidate_count", "bbox_top_k", "bbox_breast_bias", "bbox_left_bias",
         "bbox_projection_bias", "require_foreground", "min_foreground_fraction", "fg_threshold_mode", "fg_threshold", "show_foreground_mask",
         "alignment_enabled", "alignment_method", "alignment_fallback", "alignment_max_shift", "alignment_min_overlap", "alignment_min_score", "alignment_score_margin",
-        "alignment_projection_smooth", "alignment_boundary_smooth", "pipeline", "pipeline_yaml", "common_steps_yaml",
+        "alignment_projection_smooth", "alignment_boundary_smooth", "pipeline", "pipeline_yaml", "pipeline_mode", "common_steps_yaml",
         "stage_sources", "stage_ops", "stage_los", "stage_his", "stage_kernels", "stage_sigmas", "stage_amounts", "stage_clips",
         "stage_tiles", "stage_histeq_excludes", "stage_histeq_los", "stage_histeq_his", "stage_outside_values", "stage_median_kernels", "stage_bilateral_diameters", "stage_sigma_colors", "stage_sigma_spaces",
         "stage_local_los", "stage_local_his", "stage_detail_sigmas", "stage_unsharp_sigmas", "stage_edge_los", "stage_edge_his",
@@ -2217,7 +2319,7 @@ def _state_to_params(values: tuple[Any, ...]) -> dict[str, Any]:
         "stage_wiener_kernels", "stage_wiener_noises", "stage_sharpen_amounts", "stage_pectoral_sides",
         "stage_pectoral_widths", "stage_pectoral_heights", "stage_pectoral_fills",
         "whole_resize_mode", "whole_resize_width", "whole_resize_height", "whole_pad_value", "whole_pad_anchor",
-        "export_parent", "export_name", "clean_output", "save_square_crops", "save_baseline", "train_crop_mode", "val_crop_mode", "test_crop_mode", "export_balance_mode", "export_target_positive_ratio", "export_vendor_mode", "export_vendors", "export_confirm",
+        "export_parent", "export_name", "clean_output", "save_square_crops", "save_baseline", "train_crop_mode", "val_crop_mode", "test_crop_mode", "export_balance_mode", "export_target_positive_ratio", "export_negative_keep_fraction", "export_vendor_mode", "export_vendors", "export_confirm",
         "saved_root", "saved_split", "saved_positive", "saved_search", "saved_existing_only", "saved_show_boxes", "saved_index", "manifest_paths",
     ]
     return dict(zip(keys, values, strict=False))
@@ -2302,9 +2404,10 @@ def _is_on(value: Any) -> bool:
 
 
 def _pipeline_from_params(params: dict[str, Any]) -> dict[str, Any]:
-    visual = _visual_pipeline_from_params(params)
-    if visual is not None:
-        return visual
+    if str(params.get("pipeline_mode") or "yaml") == "visual":
+        visual = _visual_pipeline_from_params(params)
+        if visual is not None:
+            return visual
     pipeline: dict[str, Any] = {}
     text = params.get("pipeline_yaml")
     if isinstance(text, str) and text.strip():
@@ -2792,6 +2895,7 @@ def _dataset_from_cfg(
         "normalize": image_cfg.get("normalize", "none"),
         "percentile_range": tuple(image_cfg.get("percentile_range", [0.5, 99.5])),
         "use_voi_lut": bool(image_cfg.get("use_voi_lut", False)),
+        "strict_voi_lut": bool(image_cfg.get("strict_voi_lut", False)),
         "return_dicom_meta": bool(read_image) and bool(cfg.get("metadata", {}).get("include_dicom_meta", True)),
         "validate_paths": bool(cfg.get("dataset", {}).get("validate_paths", False)),
         "preprocess_options": pp,
@@ -3103,14 +3207,22 @@ def _build_export_cfg_from_params(cfg: dict[str, Any], records: pd.DataFrame, pa
         "test": str(params.get("test_crop_mode") or "deterministic"),
     }
     balance_mode = str(params.get("export_balance_mode") or "positive_ratio")
-    if balance_mode not in {"positive_ratio", "mass_only", "all"}:
+    if balance_mode not in {"positive_ratio", "negative_fraction", "mass_only", "all"}:
         balance_mode = "positive_ratio"
     try:
         target_ratio = min(max(float(params.get("export_target_positive_ratio") or 0.50), 0.01), 1.0)
     except Exception:
         target_ratio = 0.50
+    try:
+        negative_keep_fraction = min(max(float(params.get("export_negative_keep_fraction") or 0.20), 0.0), 1.0)
+    except Exception:
+        negative_keep_fraction = 0.20
     deterministic_selection = {
-        split: {"mode": balance_mode, "target_positive_ratio": target_ratio}
+        split: {
+            "mode": ("negative_fraction" if split == "train" else "all") if balance_mode == "negative_fraction" else balance_mode,
+            "target_positive_ratio": target_ratio,
+            "negative_keep_fraction": negative_keep_fraction,
+        }
         for split in ["train", "val", "test"]
     }
     out = _build_gui_export_config(
@@ -3142,7 +3254,12 @@ def _build_export_cfg_from_params(cfg: dict[str, Any], records: pd.DataFrame, pa
     for split in ["train", "val", "test"]:
         square[f"{split}_positive_fraction"] = float(target_ratio)
         square[f"{split}_deterministic_target_positive_ratio"] = float(target_ratio)
-        square[f"{split}_deterministic_selection_mode"] = balance_mode
+        square[f"{split}_deterministic_selection_mode"] = (
+            ("negative_fraction" if split == "train" else "all")
+            if balance_mode == "negative_fraction"
+            else balance_mode
+        )
+        square[f"{split}_deterministic_negative_keep_fraction"] = float(negative_keep_fraction)
         square[f"{split}_online_positive_ratio_selection_for_random"] = True
     return out
 

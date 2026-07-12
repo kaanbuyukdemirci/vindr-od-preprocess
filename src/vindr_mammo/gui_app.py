@@ -1536,6 +1536,7 @@ def _load_dataset_cached(config_json: str) -> VindrMammoDataset:
         normalize=image_cfg.get("normalize", "none"),
         percentile_range=tuple(image_cfg.get("percentile_range", [0.5, 99.5])),
         use_voi_lut=bool(image_cfg.get("use_voi_lut", False)),
+        strict_voi_lut=bool(image_cfg.get("strict_voi_lut", False)),
         return_dicom_meta=bool(cfg.get("metadata", {}).get("include_dicom_meta", True)),
         validate_paths=bool(cfg.get("dataset", {}).get("validate_paths", False)),
         preprocess_options=cfg.get("preprocess", {}),
@@ -1570,6 +1571,7 @@ def _load_split_records(dataset: VindrMammoDataset, cfg: dict[str, Any]) -> tupl
         dataset.image_records,
         val_fraction=float(split_cfg.get("val_fraction_from_training", 0.15)),
         seed=int(split_cfg.get("seed", 123)),
+        stratify_by_birads=bool(split_cfg.get("stratify_by_birads", False)),
     )
     return split_records, split_df
 
@@ -2915,6 +2917,9 @@ def _selection_mode_from_config(crop_cfg: dict[str, Any], split: str) -> str:
         "positive_ratio": "positive_ratio",
         "all mass + sampled non-mass": "positive_ratio",
         "all_mass_plus_sampled_non_mass": "positive_ratio",
+        "negative_fraction": "negative_fraction",
+        "negative fraction": "negative_fraction",
+        "all positive + fraction of negatives": "negative_fraction",
         "finding_images_all_windows": "finding_images_all_windows",
         "finding_images_only_all_windows": "finding_images_all_windows",
         "findings_images_all_windows": "finding_images_all_windows",
@@ -2952,6 +2957,7 @@ def _deterministic_selection_controls(crop_cfg: dict[str, Any], split_crop_modes
     split_crop_modes = dict(split_crop_modes or {})
     options = [
         "all mass + sampled non-mass",
+        "all positive + fraction of negatives",
         "mass only",
         "all",
         "finding images only, all crops",
@@ -2960,6 +2966,7 @@ def _deterministic_selection_controls(crop_cfg: dict[str, Any], split_crop_modes
         "mass_only": "mass only",
         "all": "all",
         "positive_ratio": "all mass + sampled non-mass",
+        "negative_fraction": "all positive + fraction of negatives",
         "finding_images_all_windows": "finding images only, all crops",
     }
     payload: dict[str, dict[str, Any]] = {}
@@ -3002,14 +3009,30 @@ def _deterministic_selection_controls(crop_cfg: dict[str, Any], split_crop_modes
                         "0.80 means approximately 80% mass crops and 20% empty crops. The exact achieved ratio is saved in summary.csv."
                     ),
                 )
+            negative_keep_fraction = float(crop_cfg.get(
+                f"{split}_deterministic_negative_keep_fraction",
+                crop_cfg.get("deterministic_negative_keep_fraction", 0.20),
+            ))
+            if selected_label == "all positive + fraction of negatives":
+                negative_keep_fraction = st.slider(
+                    f"{split.title()} negative-candidate keep fraction",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=min(max(negative_keep_fraction, 0.0), 1.0),
+                    step=0.01,
+                    key=_widget_key(f"gui_export_{split}_negative_keep_fraction"),
+                    help="0.20 retains a seeded 20% sample of eligible negative sliding-window candidates while keeping every positive patch.",
+                )
             payload[split] = {
                 "mode": {
                     "mass only": "mass_only",
                     "all": "all",
                     "all mass + sampled non-mass": "positive_ratio",
+                    "all positive + fraction of negatives": "negative_fraction",
                     "finding images only, all crops": "finding_images_all_windows",
                 }[selected_label],
                 "target_positive_ratio": float(target_ratio),
+                "negative_keep_fraction": float(negative_keep_fraction),
             }
     return payload
 
@@ -3018,12 +3041,17 @@ def _apply_deterministic_selection_to_config(square: dict[str, Any], payload: di
     for split in ["train", "val", "test"]:
         split_payload = payload.get(split, {})
         mode = str(split_payload.get("mode", "all")).strip().casefold()
-        if mode not in {"mass_only", "all", "positive_ratio", "finding_images_all_windows"}:
+        if mode not in {"mass_only", "all", "positive_ratio", "negative_fraction", "finding_images_all_windows"}:
             mode = "all"
         ratio = float(split_payload.get("target_positive_ratio", square.get("positive_fraction", 0.50)))
         ratio = min(max(ratio, 0.01), 1.0)
         square[f"{split}_deterministic_selection_mode"] = mode
         square[f"{split}_deterministic_target_positive_ratio"] = ratio
+        negative_fraction = float(split_payload.get(
+            "negative_keep_fraction",
+            square.get(f"{split}_deterministic_negative_keep_fraction", square.get("deterministic_negative_keep_fraction", 0.20)),
+        ))
+        square[f"{split}_deterministic_negative_keep_fraction"] = min(max(negative_fraction, 0.0), 1.0)
         # The same target is also used by random and bbox-safe random export modes.
         # This removes the old ambiguity where the sidebar preview positive_fraction
         # and the export positive-ratio slider could disagree.

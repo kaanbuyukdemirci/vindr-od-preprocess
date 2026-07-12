@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
+import platform
 import shutil
+import subprocess
+import sys
 from collections import OrderedDict
 import time
 from dataclasses import dataclass
@@ -39,6 +43,7 @@ except Exception:  # pragma: no cover
     tqdm = None
 
 from .crops import (
+    _foreground_fraction_from_mask,
     crop_image_and_boxes_to_window,
     exported_boxes_satisfy_bbox_safe_margin,
     sample_bbox_safe_breast_biased_square_window,
@@ -47,6 +52,7 @@ from .crops import (
     sample_random_square_window,
     sliding_square_windows,
     validate_bbox_safe_window,
+    window_is_clean,
     window_has_positive_mass,
 )
 from .dataset import VindrMammoDataset
@@ -218,6 +224,7 @@ def export_from_config(config: dict[str, Any], progress_callback: Callable[[dict
             normalize=image_cfg.get("normalize", "none"),
             percentile_range=tuple(image_cfg.get("percentile_range", [0.5, 99.5])),
             use_voi_lut=bool(image_cfg.get("use_voi_lut", False)),
+            strict_voi_lut=bool(image_cfg.get("strict_voi_lut", False)),
             return_dicom_meta=bool(config.get("metadata", {}).get("include_dicom_meta", True)),
             validate_paths=bool(config.get("dataset", {}).get("validate_paths", False)),
             preprocess_options=config.get("preprocess", {}),
@@ -228,17 +235,29 @@ def export_from_config(config: dict[str, Any], progress_callback: Callable[[dict
     dataset = timed_stage("initialize_dataset", build_dataset)
 
     def make_splits():
+        cohort_records_, cohort_summary_ = _records_for_source_cohort(dataset, config)
         split_records_, split_table_ = make_train_val_test_split(
-            dataset.image_records,
+            cohort_records_,
             val_fraction=float(config.get("splits", {}).get("val_fraction_from_training", 0.15)),
             seed=int(config.get("splits", {}).get("seed", 123)),
+            stratify_by_birads=bool(config.get("splits", {}).get("stratify_by_birads", False)),
+            validation_study_count=config.get("splits", {}).get("validation_study_count"),
+            validation_image_count=config.get("splits", {}).get("validation_image_count"),
         )
         split_records_, split_table_, vendor_summary_ = _apply_vendor_filter_to_splits(dataset, split_records_, split_table_, config)
+        contract_report_ = _validate_source_split_contract(dataset, split_records_, config)
         split_path = output_root / "split_assignments.csv"
         split_table_.to_csv(split_path, index=False)
-        return split_records_, split_table_, split_path, vendor_summary_
+        return split_records_, split_table_, split_path, vendor_summary_, cohort_summary_, contract_report_
 
-    split_records, split_table, split_path, vendor_filter_summary = timed_stage("make_train_val_test_split", make_splits)
+    (
+        split_records,
+        split_table,
+        split_path,
+        vendor_filter_summary,
+        source_cohort_summary,
+        source_contract_report,
+    ) = timed_stage("make_train_val_test_split", make_splits)
 
     created_files: list[Path] = [split_path]
     created_files.extend(timed_stage("write_source_metadata_and_config", lambda: _write_global_metadata_files(output_root, dataset, config)))
@@ -246,6 +265,9 @@ def export_from_config(config: dict[str, Any], progress_callback: Callable[[dict
     crop_cfg_for_summary = config.get("square_crops", {})
     summary: dict[str, Any] = {
         "num_source_images": len(dataset.image_records),
+        "num_selected_source_images": sum(len(records) for records in split_records.values()),
+        "source_cohort": source_cohort_summary,
+        "source_contract": source_contract_report,
         "splits": {k: len(v) for k, v in split_records.items()},
         "rgb_scheme": config.get("image_export", {}).get("rgb_scheme", "multi_window"),
         "histogram_equalization_enabled": bool(config.get("histogram_equalization", {}).get("enabled", True)),
@@ -265,6 +287,10 @@ def export_from_config(config: dict[str, Any], progress_callback: Callable[[dict
         },
         "deterministic_target_positive_ratio": {
             split: _deterministic_target_positive_ratio(crop_cfg_for_summary, split)
+            for split in ["train", "val", "test"]
+        },
+        "deterministic_negative_keep_fraction": {
+            split: _deterministic_negative_keep_fraction(crop_cfg_for_summary, split)
             for split in ["train", "val", "test"]
         },
         "vendor_filter": vendor_filter_summary,
@@ -440,14 +466,22 @@ _METADATA_IMAGE_ID_KEYS_EXPORT = [
 
 
 def make_train_val_test_split(
-    image_records: list[dict[str, Any]], *, val_fraction: float, seed: int
+    image_records: list[dict[str, Any]],
+    *,
+    val_fraction: float,
+    seed: int,
+    stratify_by_birads: bool = False,
+    validation_study_count: int | None = None,
+    validation_image_count: int | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], pd.DataFrame]:
     """Use VinDr's official test split and make a study-level val split from training.
 
     VinDr-Mammo already contains official ``training`` and ``test`` values. This
-    function keeps official ``test`` untouched, then randomly splits official
-    ``training`` studies into train and val. Splitting by ``study_id`` prevents
-    views from the same exam leaking across train and validation.
+    function keeps official ``test`` untouched, then splits official
+    ``training`` studies into train and val. When ``stratify_by_birads`` is
+    enabled, validation studies are sampled proportionally within study-level
+    BI-RADS strata. Splitting by ``study_id`` prevents views from the same exam
+    leaking across train and validation.
     """
     rng = np.random.default_rng(seed)
     rows = []
@@ -462,17 +496,46 @@ def make_train_val_test_split(
             training_records.append(record)
 
     study_ids = sorted({str(r.get("study_id")) for r in training_records})
-    shuffled = np.array(study_ids, dtype=object)
-    rng.shuffle(shuffled)
-    n_val = int(round(float(val_fraction) * len(shuffled)))
-    n_val = max(1, n_val) if len(shuffled) > 1 and val_fraction > 0 else 0
-    val_ids = set(str(x) for x in shuffled[:n_val])
+    if validation_study_count is None:
+        n_val = int(round(float(val_fraction) * len(study_ids)))
+        n_val = max(1, n_val) if len(study_ids) > 1 and val_fraction > 0 else 0
+    else:
+        n_val = int(validation_study_count)
+        if not 0 <= n_val <= len(study_ids):
+            raise ValueError(
+                f"validation_study_count={n_val} is outside [0, {len(study_ids)}]."
+            )
+
+    target_val_images = None if validation_image_count is None else int(validation_image_count)
+    if target_val_images is not None and target_val_images < 0:
+        raise ValueError("validation_image_count must be non-negative.")
+
+    if n_val > 0 and target_val_images is not None:
+        val_ids = _count_matched_study_sample(
+            training_records,
+            n_val=n_val,
+            n_val_images=target_val_images,
+            rng=rng,
+            stratify_by_birads=stratify_by_birads,
+        )
+    elif stratify_by_birads and n_val > 0:
+        val_ids = _stratified_study_sample(training_records, n_val=n_val, rng=rng)
+    else:
+        shuffled = np.array(study_ids, dtype=object)
+        rng.shuffle(shuffled)
+        val_ids = set(str(x) for x in shuffled[:n_val])
 
     out = {"train": [], "val": [], "test": []}
     for record in training_records:
         export_split = "val" if str(record.get("study_id")) in val_ids else "train"
         out[export_split].append(record)
     out["test"].extend(test_records)
+
+    if target_val_images is not None and len(out["val"]) != target_val_images:
+        raise RuntimeError(
+            f"Count-matched split selected {len(out['val'])} validation images; "
+            f"expected {target_val_images}."
+        )
 
     for split_name, records in out.items():
         for r in records:
@@ -487,6 +550,326 @@ def make_train_val_test_split(
                 }
             )
     return out, pd.DataFrame(rows)
+
+
+def _stratified_study_sample(
+    training_records: list[dict[str, Any]], *, n_val: int, rng: np.random.Generator
+) -> set[str]:
+    """Sample validation studies within their study-level BI-RADS strata."""
+    records_by_study: dict[str, list[dict[str, Any]]] = {}
+    for record in training_records:
+        records_by_study.setdefault(str(record.get("study_id")), []).append(record)
+
+    strata: dict[str, list[str]] = {}
+    for study_id, records in records_by_study.items():
+        labels = sorted({
+            str(record.get("breast_birads", "unknown")).strip().casefold() or "unknown"
+            for record in records
+        })
+        strata.setdefault("|".join(labels), []).append(study_id)
+
+    total = max(1, len(records_by_study))
+    allocation: dict[str, int] = {}
+    remainders: list[tuple[float, str]] = []
+    for label, ids in strata.items():
+        exact = float(n_val) * len(ids) / total
+        base = min(len(ids), int(math.floor(exact)))
+        allocation[label] = base
+        remainders.append((exact - base, label))
+
+    remaining = max(0, int(n_val) - sum(allocation.values()))
+    for _remainder, label in sorted(remainders, key=lambda item: (-item[0], item[1])):
+        if remaining <= 0:
+            break
+        if allocation[label] < len(strata[label]):
+            allocation[label] += 1
+            remaining -= 1
+
+    selected: set[str] = set()
+    for label in sorted(strata):
+        ids = np.asarray(sorted(strata[label]), dtype=object)
+        rng.shuffle(ids)
+        selected.update(str(value) for value in ids[: allocation[label]])
+    return selected
+
+
+def _records_for_source_cohort(
+    dataset: VindrMammoDataset,
+    config: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Apply an explicit finding-positive cohort before any split is made."""
+    cohort_cfg = dict(config.get("source_cohort", {}) or {})
+    positive_only = bool(cohort_cfg.get("positive_images_only", False))
+    category = str(cohort_cfg.get("finding_category", "Mass") or "Mass").strip()
+    all_records = list(dataset.image_records)
+    if not positive_only:
+        return all_records, {
+            "finding_category": category,
+            "positive_images_only": False,
+            "input_images": len(all_records),
+            "selected_images": len(all_records),
+        }
+    if category.casefold() != "mass":
+        raise ValueError(
+            "source_cohort.positive_images_only currently supports finding_category='Mass' only."
+        )
+
+    positive_ids: set[str] = set()
+    valid_annotations = 0
+    for image_id, findings in dataset.findings_by_image_id.items():
+        mass_findings = dataset._filter_mass_findings(findings)
+        if mass_findings:
+            positive_ids.add(str(image_id))
+            valid_annotations += len(mass_findings)
+    selected = [r for r in all_records if str(r.get("image_id", "")) in positive_ids]
+    by_official_split: dict[str, int] = {}
+    for record in selected:
+        split = str(record.get("split", ""))
+        by_official_split[split] = by_official_split.get(split, 0) + 1
+    return selected, {
+        "finding_category": category,
+        "positive_images_only": True,
+        "input_images": len(all_records),
+        "selected_images": len(selected),
+        "selected_studies": len({str(r.get("study_id", "")) for r in selected}),
+        "valid_source_annotations": int(valid_annotations),
+        "selected_images_by_official_split": by_official_split,
+    }
+
+
+def _validate_source_split_contract(
+    dataset: VindrMammoDataset,
+    split_records: dict[str, list[dict[str, Any]]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Fail early when an enabled replication source/split contract is violated."""
+    contract = dict(config.get("replication_contract", {}) or {})
+    if not bool(contract.get("enabled", False)):
+        return {"enabled": False, "status": "not_requested"}
+
+    expected_images = dict(contract.get("expected_source_images", {}) or {})
+    expected_studies = dict(contract.get("expected_source_studies", {}) or {})
+    expected_annotations = dict(contract.get("expected_source_annotations", {}) or {})
+    require_positive = bool(contract.get("require_positive_source_images", False))
+    errors: list[str] = []
+    observed: dict[str, Any] = {}
+    images_seen: dict[str, set[str]] = {}
+    studies_seen: dict[str, set[str]] = {}
+
+    for split_name in ["train", "val", "test"]:
+        records = list(split_records.get(split_name, []))
+        image_ids = {str(record.get("image_id", "")) for record in records}
+        study_ids = {str(record.get("study_id", "")) for record in records}
+        images_seen[split_name] = image_ids
+        studies_seen[split_name] = study_ids
+        annotation_count = 0
+        nonpositive: list[str] = []
+        records_by_study: dict[str, list[dict[str, Any]]] = {}
+        for record in records:
+            records_by_study.setdefault(str(record.get("study_id", "")), []).append(record)
+        stratum_counts: dict[str, int] = {}
+        for study_records in records_by_study.values():
+            stratum = _study_birads_stratum(study_records)
+            stratum_counts[stratum] = stratum_counts.get(stratum, 0) + 1
+        for image_id in image_ids:
+            findings = dataset.findings_by_image_id.get(image_id, [])
+            count = len(dataset._filter_mass_findings(findings))
+            annotation_count += count
+            if count == 0:
+                nonpositive.append(image_id)
+        observed[split_name] = {
+            "source_images": len(image_ids),
+            "source_studies": len(study_ids),
+            "source_annotations": int(annotation_count),
+            "nonpositive_source_images": len(nonpositive),
+            "study_birads_strata": dict(sorted(stratum_counts.items())),
+        }
+        if split_name in expected_images and len(image_ids) != int(expected_images[split_name]):
+            errors.append(
+                f"{split_name}: expected {int(expected_images[split_name])} source images, got {len(image_ids)}"
+            )
+        if split_name in expected_studies and len(study_ids) != int(expected_studies[split_name]):
+            errors.append(
+                f"{split_name}: expected {int(expected_studies[split_name])} source studies, got {len(study_ids)}"
+            )
+        if split_name in expected_annotations and annotation_count != int(expected_annotations[split_name]):
+            errors.append(
+                f"{split_name}: expected {int(expected_annotations[split_name])} source annotations, got {annotation_count}"
+            )
+        if require_positive and nonpositive:
+            errors.append(
+                f"{split_name}: {len(nonpositive)} source images have no valid Mass annotation"
+            )
+
+    split_names = ["train", "val", "test"]
+    for index, left in enumerate(split_names):
+        for right in split_names[index + 1:]:
+            image_overlap = images_seen[left] & images_seen[right]
+            study_overlap = studies_seen[left] & studies_seen[right]
+            if image_overlap:
+                errors.append(f"{left}/{right}: {len(image_overlap)} source image IDs overlap")
+            if study_overlap:
+                errors.append(f"{left}/{right}: {len(study_overlap)} source study IDs overlap")
+
+    if bool(contract.get("preserve_official_test", False)):
+        official_positive_test_ids = {
+            str(record.get("image_id", ""))
+            for record in dataset.image_records
+            if str(record.get("split", "")).casefold().strip() == "test"
+            and dataset._filter_mass_findings(
+                dataset.findings_by_image_id.get(str(record.get("image_id", "")), [])
+            )
+        }
+        observed_test_ids = images_seen.get("test", set())
+        wrong_test = [
+            record for record in split_records.get("test", [])
+            if str(record.get("split", "")).casefold().strip() != "test"
+        ]
+        displaced_test = [
+            record
+            for split_name in ["train", "val"]
+            for record in split_records.get(split_name, [])
+            if str(record.get("split", "")).casefold().strip() == "test"
+        ]
+        if wrong_test or displaced_test or observed_test_ids != official_positive_test_ids:
+            errors.append("official VinDr test membership was not preserved")
+
+    report = {
+        "enabled": True,
+        "name": contract.get("name", "replication_contract"),
+        "status": "pass" if not errors else "fail",
+        "observed": observed,
+        "errors": errors,
+    }
+    if errors and bool(contract.get("strict", True)):
+        raise ValueError("Replication source/split contract failed: " + "; ".join(errors))
+    return report
+
+
+def _study_birads_stratum(records: list[dict[str, Any]]) -> str:
+    labels = sorted({
+        str(record.get("breast_birads", "unknown")).strip().casefold() or "unknown"
+        for record in records
+    })
+    return "|".join(labels)
+
+
+def _stratum_allocations(strata: dict[str, list[str]], n_val: int) -> dict[str, int]:
+    total = max(1, sum(len(ids) for ids in strata.values()))
+    allocation: dict[str, int] = {}
+    remainders: list[tuple[float, str]] = []
+    for label, ids in strata.items():
+        exact = float(n_val) * len(ids) / total
+        base = min(len(ids), int(math.floor(exact)))
+        allocation[label] = base
+        remainders.append((exact - base, label))
+    remaining = max(0, int(n_val) - sum(allocation.values()))
+    for _remainder, label in sorted(remainders, key=lambda item: (-item[0], item[1])):
+        if remaining <= 0:
+            break
+        if allocation[label] < len(strata[label]):
+            allocation[label] += 1
+            remaining -= 1
+    return allocation
+
+
+def _count_matched_study_sample(
+    training_records: list[dict[str, Any]],
+    *,
+    n_val: int,
+    n_val_images: int,
+    rng: np.random.Generator,
+    stratify_by_birads: bool,
+) -> set[str]:
+    """Select exact validation study/image counts with seeded tie-breaking.
+
+    Paper 22 does not publish its split identities or seed. The result is thus a
+    deterministic count-matched split, kept as close as possible to proportional
+    study-level BI-RADS strata, rather than a claim of author-identical IDs.
+    """
+    records_by_study: dict[str, list[dict[str, Any]]] = {}
+    for record in training_records:
+        records_by_study.setdefault(str(record.get("study_id")), []).append(record)
+    if n_val == 0:
+        if n_val_images != 0:
+            raise ValueError("Cannot select validation images when validation_study_count is zero.")
+        return set()
+
+    study_sizes = [len(records) for records in records_by_study.values()]
+    min_images = sum(sorted(study_sizes)[:n_val])
+    max_images = sum(sorted(study_sizes, reverse=True)[:n_val])
+    if not min_images <= n_val_images <= max_images:
+        raise ValueError(
+            f"No {n_val}-study split can contain {n_val_images} images; feasible range is "
+            f"[{min_images}, {max_images}]."
+        )
+
+    strata: dict[str, list[str]] = {}
+    for study_id, records in records_by_study.items():
+        label = _study_birads_stratum(records) if stratify_by_birads else "all"
+        strata.setdefault(label, []).append(study_id)
+    allocation = _stratum_allocations(strata, n_val)
+
+    all_ids = sorted(records_by_study)
+    bit_for = {study_id: 1 << index for index, study_id in enumerate(all_ids)}
+    priority = {study_id: float(rng.random()) for study_id in all_ids}
+
+    options_by_stratum: dict[str, dict[tuple[int, int], tuple[float, int]]] = {}
+    for label in sorted(strata):
+        states: dict[tuple[int, int], tuple[float, int]] = {(0, 0): (0.0, 0)}
+        for study_id in sorted(strata[label]):
+            image_count = len(records_by_study[study_id])
+            additions: dict[tuple[int, int], tuple[float, int]] = {}
+            for (count, images), (score, mask) in list(states.items()):
+                new_key = (count + 1, images + image_count)
+                if new_key[0] > n_val or new_key[1] > n_val_images:
+                    continue
+                candidate = (score + priority[study_id], mask | bit_for[study_id])
+                current = states.get(new_key) or additions.get(new_key)
+                if current is None or candidate[0] < current[0]:
+                    additions[new_key] = candidate
+            for key, candidate in additions.items():
+                current = states.get(key)
+                if current is None or candidate[0] < current[0]:
+                    states[key] = candidate
+        options_by_stratum[label] = states
+
+    chosen_mask: int | None = None
+    max_radius = max(n_val, max(allocation.values(), default=0))
+    for radius in range(max_radius + 1):
+        combined: dict[tuple[int, int], tuple[float, int]] = {(0, 0): (0.0, 0)}
+        for label in sorted(strata):
+            target = allocation[label]
+            options = [
+                (key, value)
+                for key, value in options_by_stratum[label].items()
+                if abs(key[0] - target) <= radius
+            ]
+            next_combined: dict[tuple[int, int], tuple[float, int]] = {}
+            for (total_count, total_images), (total_score, total_mask) in combined.items():
+                for (count, images), (score, mask) in options:
+                    new_key = (total_count + count, total_images + images)
+                    if new_key[0] > n_val or new_key[1] > n_val_images:
+                        continue
+                    penalty = 1000.0 * float((count - target) ** 2)
+                    candidate = (total_score + score + penalty, total_mask | mask)
+                    current = next_combined.get(new_key)
+                    if current is None or candidate[0] < current[0]:
+                        next_combined[new_key] = candidate
+            combined = next_combined
+            if not combined:
+                break
+        match = combined.get((n_val, n_val_images))
+        if match is not None:
+            chosen_mask = match[1]
+            break
+
+    if chosen_mask is None:
+        raise RuntimeError(
+            f"Could not construct an exact count-matched split of {n_val} studies / "
+            f"{n_val_images} images."
+        )
+    return {study_id for study_id in all_ids if chosen_mask & bit_for[study_id]}
 
 
 def export_square_crop_datasets(
@@ -560,6 +943,8 @@ def export_square_crop_datasets(
     source_index_lookup: dict[tuple[str, str], int] = {}
     source_debug: dict[tuple[str, str], dict[str, Any]] = {}
     saved_window_keys: set[tuple[str, str, int, int, int, int]] = set()
+    candidate_positive_window_keys: set[tuple[str, str, int, int, int, int]] = set()
+    saved_positive_window_keys: set[tuple[str, str, int, int, int, int]] = set()
     for _split_name, _records in split_records.items():
         for _idx, _record in enumerate(_records):
             _image_id = str(_record.get("image_id", ""))
@@ -576,6 +961,9 @@ def export_square_crop_datasets(
                 "n_source_mass_boxes": 0,
                 "has_source_mass": 0,
                 "candidate_windows": 0,
+                "complete_grid_windows": 0,
+                "positive_candidate_windows": 0,
+                "ambiguous_partial_windows": 0,
                 "attempted_save_windows": 0,
                 "saved_crops": 0,
                 "saved_positive_crops": 0,
@@ -605,6 +993,9 @@ def export_square_crop_datasets(
                 "n_source_mass_boxes": 0,
                 "has_source_mass": 0,
                 "candidate_windows": 0,
+                "complete_grid_windows": 0,
+                "positive_candidate_windows": 0,
+                "ambiguous_partial_windows": 0,
                 "attempted_save_windows": 0,
                 "saved_crops": 0,
                 "saved_positive_crops": 0,
@@ -637,6 +1028,22 @@ def export_square_crop_datasets(
         key_name = f"skip_{reason}"
         if key_name in row_:
             row_[key_name] = int(row_.get(key_name, 0)) + 1
+
+    def note_candidate_windows(
+        split_name_: str,
+        record_: dict[str, Any],
+        windows_: list[tuple[tuple[int, int, int, int], dict[str, Any]]],
+    ) -> None:
+        row_ = source_row_for(split_name_, record_)
+        row_["candidate_windows"] = int(row_.get("candidate_windows", 0)) + len(windows_)
+        image_id_ = str(record_.get("image_id", ""))
+        for window_, info_ in windows_:
+            if int(info_.get("is_positive_window", 0)) != 1:
+                continue
+            candidate_positive_window_keys.add((
+                split_name_, image_id_,
+                int(window_[0]), int(window_[1]), int(window_[2]), int(window_[3]),
+            ))
 
     def profiler_snapshot_event() -> dict[str, Any]:
         return {"simple_profiler": profiler.snapshot()} if profiler.enabled else {}
@@ -730,18 +1137,33 @@ def export_square_crop_datasets(
                 mark_source_skip(split_name, record, "duplicate_window")
                 return False
 
+        planned_positive = int(extra_info.get("is_positive_window", 0)) == 1
+        if planned_positive and boxes.shape[0] == 0:
+            message = (
+                f"Planned positive window {window} for image {record.get('image_id')} "
+                "produced no exported Mass box."
+            )
+            if bool(config.get("replication_contract", {}).get("strict", False)):
+                raise RuntimeError(message)
+            mark_source_skip(split_name, record, "empty_disallowed")
+            return False
+
         # Optional hard foreground filter for empty crops. This prevents low-level
         # background noise from creating apparently valid empty/background crops.
-        if boxes.shape[0] == 0 and bool(_split_crop_cfg(crop_cfg, split_name, "negative_require_foreground", crop_cfg.get("require_foreground_for_empty_crops", True))):
+        # Reuse the fraction planned from the complete source mask; never estimate
+        # foreground independently from the cropped patch.
+        if boxes.shape[0] == 0 and not planned_positive and bool(_split_crop_cfg(crop_cfg, split_name, "negative_require_foreground", crop_cfg.get("require_foreground_for_empty_crops", True))):
             min_empty_fg = float(_split_crop_cfg(crop_cfg, split_name, "negative_min_foreground_fraction", crop_cfg.get("min_foreground_fraction", 0.35)))
             fg_threshold = _split_crop_cfg(crop_cfg, split_name, "foreground_threshold", crop_cfg.get("deterministic_foreground_threshold", None))
-            fg_fraction = _foreground_fraction_in_window(
-                _tensor_to_float2d(image),
-                window,
-                crop_size=crop_size,
-                threshold=fg_threshold,
-                pad_value=float(crop_cfg.get("pad_value", 0.0)),
-            )
+            fg_fraction = extra_info.get("foreground_fraction")
+            if fg_fraction is None:
+                full_mask = target.get("_foreground_mask")
+                if full_mask is None:
+                    full_mask = _foreground_mask(_tensor_to_float2d(image), threshold=fg_threshold)
+                fg_fraction = _foreground_fraction_from_mask(
+                    np.asarray(full_mask, dtype=bool), window, crop_size
+                )
+            fg_fraction = float(fg_fraction)
             extra_info = {**extra_info, "negative_foreground_filter_enabled": 1, "negative_min_foreground_fraction": float(min_empty_fg), "negative_foreground_fraction": float(fg_fraction)}
             if fg_fraction < min_empty_fg:
                 mark_source_skip(split_name, record, "foreground_too_low")
@@ -799,7 +1221,23 @@ def export_square_crop_datasets(
         )
         coco = coco_by_split[split_name]
         coco["images"].append(image_meta)
-        ann_rows = _append_coco_annotations(coco, image_id_counter, ann_id_counter, boxes)
+        keep_flags = crop_result.mass_box_keep.tolist()
+        source_findings = list(target.get("mass", {}).get("findings", []) or [])
+        kept_findings = [
+            finding for finding, keep in zip(source_findings, keep_flags) if keep
+        ]
+        source_boxes = target["mass"]["boxes"][crop_result.mass_box_keep]
+        source_annotation_ids = [finding.get("source_annotation_id") for finding in kept_findings]
+        source_annotation_rows = [finding.get("source_annotation_row") for finding in kept_findings]
+        ann_rows = _append_coco_annotations(
+            coco,
+            image_id_counter,
+            ann_id_counter,
+            boxes,
+            source_annotation_ids=source_annotation_ids,
+            source_annotation_rows=source_annotation_rows,
+            source_boxes=source_boxes,
+        )
         ann_id_counter += ann_rows
         stats_rows.append(
             _sample_stats_row(
@@ -832,14 +1270,18 @@ def export_square_crop_datasets(
         else:
             source_row["saved_negative_crops"] = int(source_row.get("saved_negative_crops", 0)) + 1
         source_row["exported_mass_box_instances"] = int(source_row.get("exported_mass_box_instances", 0)) + int(boxes.shape[0])
-        ann_index = extra_info.get("annotation_index", None)
-        if ann_index is not None and boxes.shape[0] > 0:
-            try:
-                source_row.setdefault("_included_annotation_indices", set()).add(int(ann_index))
-            except Exception:
-                pass
+        for source_annotation_id in source_annotation_ids:
+            if source_annotation_id is not None:
+                source_row.setdefault("_included_annotation_indices", set()).add(source_annotation_id)
+        window_key = (
+            split_name,
+            str(record.get("image_id", "")),
+            int(window[0]), int(window[1]), int(window[2]), int(window[3]),
+        )
+        if boxes.shape[0] > 0:
+            saved_positive_window_keys.add(window_key)
         if deduplicate:
-            saved_window_keys.add((split_name, str(record.get("image_id", "")), int(window[0]), int(window[1]), int(window[2]), int(window[3])))
+            saved_window_keys.add(window_key)
         image_id_counter += 1
         profiler.stop("write labels and metadata rows")
         return True
@@ -881,9 +1323,11 @@ def export_square_crop_datasets(
                         crop_options=common_crop_options,
                         crop_cfg=crop_cfg,
                         rng=rng,
+                        foreground_mask=target.get("_foreground_mask"),
+                        diagnostics=source_row_for(split_name, record),
                     ),
                 )
-                source_row_for(split_name, record)["candidate_windows"] = int(source_row_for(split_name, record).get("candidate_windows", 0)) + len(windows)
+                note_candidate_windows(split_name, record, windows)
                 for window, extra_info in windows:
                     is_positive_window = int(extra_info.get("is_positive_window", 0)) == 1
                     if not is_positive_window and not _online_should_save_negative(positive_saved, negative_saved, target_ratio):
@@ -949,9 +1393,11 @@ def export_square_crop_datasets(
                         crop_options=common_crop_options,
                         crop_cfg=crop_cfg,
                         rng=rng,
+                        foreground_mask=target.get("_foreground_mask"),
+                        diagnostics=source_row_for(split_name, record),
                     ),
                 )
-                source_row_for(split_name, record)["candidate_windows"] = int(source_row_for(split_name, record).get("candidate_windows", 0)) + len(windows)
+                note_candidate_windows(split_name, record, windows)
                 candidates.extend((record, window, extra_info) for window, extra_info in windows)
                 processed_records_for_progress += 1
                 maybe_emit_profiler_progress({
@@ -988,7 +1434,7 @@ def export_square_crop_datasets(
                 })
             continue
 
-        if split_mode == "deterministic" and selection_mode == "positive_ratio":
+        if split_mode == "deterministic" and selection_mode in {"positive_ratio", "negative_fraction"}:
             candidates: list[tuple[dict[str, Any], tuple[int, int, int, int], dict[str, Any]]] = []
             iterator = _progress(records, show_progress, f"Plan square crops {split_name}", unit="img")
             for record in iterator:
@@ -1008,9 +1454,11 @@ def export_square_crop_datasets(
                         crop_options=common_crop_options,
                         crop_cfg=crop_cfg,
                         rng=rng,
+                        foreground_mask=target.get("_foreground_mask"),
+                        diagnostics=source_row_for(split_name, record),
                     ),
                 )
-                source_row_for(split_name, record)["candidate_windows"] = int(source_row_for(split_name, record).get("candidate_windows", 0)) + len(windows)
+                note_candidate_windows(split_name, record, windows)
                 candidates.extend((record, window, extra_info) for window, extra_info in windows)
                 processed_records_for_progress += 1
                 maybe_emit_profiler_progress({
@@ -1022,7 +1470,10 @@ def export_square_crop_datasets(
                     "unit": "source images",
                 })
 
-            selected = _select_positive_ratio_candidates(candidates, crop_cfg, split_name, rng)
+            if selection_mode == "negative_fraction":
+                selected = _select_negative_fraction_candidates(candidates, crop_cfg, split_name, rng)
+            else:
+                selected = _select_positive_ratio_candidates(candidates, crop_cfg, split_name, rng)
             save_iter = _progress(selected, show_progress, f"Save square crops {split_name}", unit="crop")
             total_selected = len(selected)
             saved_count = 0
@@ -1057,9 +1508,11 @@ def export_square_crop_datasets(
                     crop_options=common_crop_options,
                     crop_cfg=crop_cfg,
                     rng=rng,
+                    foreground_mask=target.get("_foreground_mask"),
+                    diagnostics=source_row_for(split_name, record),
                 ),
             )
-            source_row_for(split_name, record)["candidate_windows"] = int(source_row_for(split_name, record).get("candidate_windows", 0)) + len(windows)
+            note_candidate_windows(split_name, record, windows)
             for crop_number, (window, extra_info) in enumerate(windows):
                 save_window(record=record, split_name=split_name, crop_number=crop_number, window=window, extra_info=extra_info)
             processed_records_for_progress += 1
@@ -1086,6 +1539,15 @@ def export_square_crop_datasets(
         "crops_per_source_histogram_csv": _path_as_posix(crop_root / "debug_logs" / "crops_per_source_histogram.csv"),
         "split_mass_coverage_csv": _path_as_posix(crop_root / "debug_logs" / "split_mass_coverage.csv"),
     }
+    summary["replication_contract"] = _validate_square_crop_contract(
+        split_records=split_records,
+        coco_by_split=coco_by_split,
+        source_debug=source_debug,
+        candidate_positive_window_keys=candidate_positive_window_keys,
+        saved_positive_window_keys=saved_positive_window_keys,
+        crop_cfg=crop_cfg,
+        config=config,
+    )
     summary["simple_profiler"] = profiler.snapshot()
     if progress_callback is not None:
         progress_callback({"event": "profiler_update", "stage": "export_square_crops", **profiler_snapshot_event()})
@@ -1118,6 +1580,10 @@ def _deterministic_selection_mode(crop_cfg: dict[str, Any], split_name: str) -> 
         "positive_ratio": "positive_ratio",
         "all_mass_plus_sampled_non_mass": "positive_ratio",
         "all mass + sampled non-mass": "positive_ratio",
+        "negative_fraction": "negative_fraction",
+        "negative fraction": "negative_fraction",
+        "all_positive_plus_negative_fraction": "negative_fraction",
+        "all positive + fraction of negatives": "negative_fraction",
         "finding_images_all_windows": "finding_images_all_windows",
         "finding_images_only_all_windows": "finding_images_all_windows",
         "findings_images_all_windows": "finding_images_all_windows",
@@ -1149,6 +1615,21 @@ def _deterministic_target_positive_ratio(crop_cfg: dict[str, Any], split_name: s
     except Exception:
         ratio = 0.50
     return min(max(ratio, 0.01), 1.0)
+
+
+def _deterministic_negative_keep_fraction(crop_cfg: dict[str, Any], split_name: str) -> float:
+    """Fraction of negative deterministic candidates retained for a split."""
+    value = _split_crop_cfg(
+        crop_cfg,
+        split_name,
+        "deterministic_negative_keep_fraction",
+        crop_cfg.get("deterministic_negative_keep_fraction", 0.20),
+    )
+    try:
+        fraction = float(value)
+    except Exception:
+        fraction = 0.20
+    return min(max(fraction, 0.0), 1.0)
 
 
 def _target_positive_fraction(crop_cfg: dict[str, Any], split_name: str, *, bbox_safe: bool = False) -> float:
@@ -1311,6 +1792,47 @@ def _select_positive_ratio_candidates(
     return out
 
 
+def _select_negative_fraction_candidates(
+    candidates: list[tuple[dict[str, Any], tuple[int, int, int, int], dict[str, Any]]],
+    crop_cfg: dict[str, Any],
+    split_name: str,
+    rng: np.random.Generator,
+) -> list[tuple[dict[str, Any], tuple[int, int, int, int], dict[str, Any]]]:
+    """Keep every positive candidate and a seeded fraction of negatives.
+
+    This is deliberately different from target-positive-ratio balancing. A
+    20% negative keep fraction means 20% of all eligible negative patch
+    candidates, matching papers that report negative *retention* rather than a
+    final positive/negative class ratio.
+    """
+    positives = [c for c in candidates if int(c[2].get("is_positive_window", 0)) == 1]
+    negatives = [c for c in candidates if int(c[2].get("is_positive_window", 0)) == 0]
+    keep_fraction = _deterministic_negative_keep_fraction(crop_cfg, split_name)
+    wanted = min(len(negatives), max(0, int(round(len(negatives) * keep_fraction))))
+    if wanted >= len(negatives):
+        selected_negatives = negatives
+    elif wanted > 0:
+        indices = rng.choice(len(negatives), size=wanted, replace=False)
+        selected_negatives = [negatives[int(i)] for i in indices]
+    else:
+        selected_negatives = []
+
+    selected = positives + selected_negatives
+    selected.sort(key=lambda c: (str(c[0].get("image_id", "")), int(c[1][1]), int(c[1][0]), int(c[1][3]), int(c[1][2])))
+    achieved = float(len(selected_negatives) / len(negatives)) if negatives else 0.0
+    out = []
+    for record, window, extra in selected:
+        out.append((record, window, {
+            **dict(extra),
+            "negative_fraction_selection": f"global_{split_name}_negative_fraction",
+            "negative_candidate_count": int(len(negatives)),
+            "negative_keep_fraction": float(keep_fraction),
+            "negative_selected_count": int(len(selected_negatives)),
+            "negative_achieved_keep_fraction": float(achieved),
+        }))
+    return out
+
+
 def _windows_for_export_split(
     *,
     split_name: str,
@@ -1321,6 +1843,8 @@ def _windows_for_export_split(
     crop_options: dict[str, Any],
     crop_cfg: dict[str, Any],
     rng: np.random.Generator,
+    foreground_mask: np.ndarray | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> list[tuple[tuple[int, int, int, int], dict[str, Any]]]:
     """Return crop windows for one image according to train/val/test policy."""
     split_mode = str(crop_cfg.get(f"{split_name}_crop_mode", "random" if split_name == "train" else "deterministic")).casefold().strip()
@@ -1350,10 +1874,28 @@ def _windows_for_export_split(
             w: bool(window_has_positive_mass(w, mass_boxes, crop_options))
             for w in windows
         }
+        clean_negative_by_window = {
+            w: bool(window_is_clean(w, mass_boxes, crop_options))
+            for w in windows
+            if not positive_by_window.get(w, False)
+        }
+        require_clean_negatives = bool(_split_crop_cfg(
+            crop_cfg,
+            split_name,
+            "require_clean_negative_windows",
+            selection_mode == "negative_fraction",
+        ))
+        complete_grid_count = len(windows)
+        positive_grid_count = sum(int(value) for value in positive_by_window.values())
         if selection_mode == "mass_only":
             windows = [w for w in windows if positive_by_window.get(w, False)]
         elif selection_mode == "finding_images_all_windows" and not source_image_has_finding:
             windows = []
+        if require_clean_negatives:
+            windows = [
+                w for w in windows
+                if positive_by_window.get(w, False) or clean_negative_by_window.get(w, False)
+            ]
 
         foreground_filter_enabled = bool(_split_crop_cfg(
             crop_cfg,
@@ -1370,24 +1912,39 @@ def _windows_for_export_split(
         foreground_threshold = crop_cfg.get("deterministic_foreground_threshold", None)
         foreground_fractions: dict[tuple[int, int, int, int], float] = {}
         if foreground_filter_enabled:
-            image_np = image_tensor.detach().cpu().squeeze(0).numpy().astype(np.float32, copy=False)
+            if foreground_mask is None:
+                image_np = image_tensor.detach().cpu().squeeze(0).numpy().astype(np.float32, copy=False)
+                foreground_mask = _foreground_mask(image_np, threshold=foreground_threshold)
+            else:
+                foreground_mask = np.asarray(foreground_mask, dtype=bool)
             kept_windows = []
             for w in windows:
-                frac = _foreground_fraction_in_window(
-                    image_np,
+                frac = _foreground_fraction_from_mask(
+                    foreground_mask,
                     w,
-                    crop_size=int(crop_cfg.get("crop_size", 1024)),
-                    threshold=foreground_threshold,
-                    pad_value=float(crop_cfg.get("pad_value", 0.0)),
+                    int(crop_cfg.get("crop_size", 1024)),
                 )
                 foreground_fractions[w] = frac
-                if frac >= min_foreground_fraction:
+                # Paper-positive windows are unconditional. Foreground rejection
+                # is only an optimization for non-annotation windows.
+                if positive_by_window.get(w, False) or frac >= min_foreground_fraction:
                     kept_windows.append(w)
             windows = kept_windows
 
         max_windows = crop_cfg.get(f"{split_name}_deterministic_max_windows_per_image", crop_cfg.get("deterministic_max_windows_per_image"))
         if max_windows is not None:
             windows = windows[: int(max_windows)]
+        if diagnostics is not None:
+            diagnostics.update({
+                "complete_grid_windows": int(complete_grid_count),
+                "positive_candidate_windows": int(positive_grid_count),
+                "ambiguous_partial_windows": int(sum(
+                    1
+                    for w, clean in clean_negative_by_window.items()
+                    if not clean
+                )),
+                "returned_candidate_windows": int(len(windows)),
+            })
         return [
             (
                 w,
@@ -1399,6 +1956,8 @@ def _windows_for_export_split(
                     "deterministic_target_positive_ratio": float(target_positive_ratio),
                     "source_image_has_finding": int(source_image_has_finding),
                     "is_positive_window": int(bool(positive_by_window.get(w, False))),
+                    "is_clean_negative_window": int(bool(clean_negative_by_window.get(w, False))),
+                    "require_clean_negative_windows": int(require_clean_negatives),
                     "foreground_filter_enabled": int(foreground_filter_enabled),
                     "min_foreground_fraction": float(min_foreground_fraction),
                     "foreground_fraction": foreground_fractions.get(w, None),
@@ -2634,27 +3193,15 @@ def _foreground_fraction_in_window(
     threshold: float | None,
     pad_value: float = 0.0,
 ) -> float:
-    """Return fraction of an n x n crop that appears to be breast foreground.
+    """Return a window fraction from one mask computed on the full image.
 
-    This is intentionally simple and fast: it builds the same padded square crop
-    that the exporter will save, makes a foreground mask, and returns mask.mean().
-    Use it to reject pure-background deterministic windows when breast cropping is
-    disabled.
+    ``pad_value`` is retained for API compatibility; out-of-image mask pixels
+    are always background. Crucially, threshold estimation never sees an
+    isolated tissue-filled patch.
     """
-    x0, y0, x1, y1 = [int(v) for v in window_xyxy]
-    h, w = image.shape
-    src_x0 = max(0, x0)
-    src_y0 = max(0, y0)
-    src_x1 = min(w, x1)
-    src_y1 = min(h, y1)
-    crop = np.full((int(crop_size), int(crop_size)), float(pad_value), dtype=np.float32)
-    patch = image[src_y0:src_y1, src_x0:src_x1]
-    if patch.size:
-        dst_x0 = max(0, -x0)
-        dst_y0 = max(0, -y0)
-        crop[dst_y0:dst_y0 + patch.shape[0], dst_x0:dst_x0 + patch.shape[1]] = patch
-    mask = _foreground_mask(crop, threshold=threshold)
-    return float(mask.mean()) if mask.size else 0.0
+    del pad_value
+    mask = _foreground_mask(np.asarray(image, dtype=np.float32), threshold=threshold)
+    return _foreground_fraction_from_mask(mask, window_xyxy, int(crop_size))
 
 
 def _foreground_mask(arr: np.ndarray, threshold: float | None = None) -> np.ndarray:
@@ -2946,6 +3493,149 @@ def _write_square_crop_debug_logs(
     return created
 
 
+def _validate_square_crop_contract(
+    *,
+    split_records: dict[str, list[dict[str, Any]]],
+    coco_by_split: dict[str, dict[str, Any]],
+    source_debug: dict[tuple[str, str], dict[str, Any]],
+    candidate_positive_window_keys: set[tuple[str, str, int, int, int, int]],
+    saved_positive_window_keys: set[tuple[str, str, int, int, int, int]],
+    crop_cfg: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate materialized patches before a completion marker can be written."""
+    contract = dict(config.get("replication_contract", {}) or {})
+    if not bool(contract.get("enabled", False)):
+        return {"enabled": False, "status": "not_requested"}
+
+    errors: list[str] = []
+    metrics: dict[str, Any] = {}
+    missing_positive = candidate_positive_window_keys - saved_positive_window_keys
+    unexpected_positive = saved_positive_window_keys - candidate_positive_window_keys
+    if missing_positive:
+        errors.append(f"{len(missing_positive)} candidate-positive windows were not written")
+    if unexpected_positive:
+        errors.append(f"{len(unexpected_positive)} written positive windows were not candidates")
+    metrics["candidate_positive_windows"] = len(candidate_positive_window_keys)
+    metrics["saved_positive_windows"] = len(saved_positive_window_keys)
+
+    source_metrics: dict[str, Any] = {}
+    for split_name in ["train", "val", "test"]:
+        rows = [row for (split, _image_id), row in source_debug.items() if split == split_name]
+        expected_source_rows = len(split_records.get(split_name, []))
+        if len(rows) != expected_source_rows:
+            errors.append(
+                f"{split_name}: debug provenance has {len(rows)}/{expected_source_rows} source images"
+            )
+        source_mass_count = sum(int(row.get("n_source_mass_boxes", 0)) for row in rows)
+        represented_ids = sum(len(row.get("_included_annotation_indices", set())) for row in rows)
+        positive_sources_without_positive_patch = sum(
+            1
+            for row in rows
+            if int(row.get("n_source_mass_boxes", 0)) > 0
+            and int(row.get("saved_positive_crops", 0)) == 0
+        )
+        complete_grid = sum(int(row.get("complete_grid_windows", 0)) for row in rows)
+        saved_crops = sum(int(row.get("saved_crops", 0)) for row in rows)
+        saved_negatives = sum(int(row.get("saved_negative_crops", 0)) for row in rows)
+        candidate_windows = sum(int(row.get("candidate_windows", 0)) for row in rows)
+        positive_candidates = sum(int(row.get("positive_candidate_windows", 0)) for row in rows)
+        eligible_negatives = max(0, candidate_windows - positive_candidates)
+        grid_fraction = float(saved_crops / complete_grid) if complete_grid else 0.0
+        source_metrics[split_name] = {
+            "source_images": len(rows),
+            "source_mass_annotations": source_mass_count,
+            "represented_source_annotation_ids": represented_ids,
+            "positive_sources_without_positive_patch": positive_sources_without_positive_patch,
+            "complete_grid_windows": complete_grid,
+            "saved_crops": saved_crops,
+            "saved_grid_fraction": grid_fraction,
+            "eligible_negative_candidates": eligible_negatives,
+            "saved_negative_crops": saved_negatives,
+        }
+        if bool(contract.get("require_all_source_annotations_represented", False)) and represented_ids != source_mass_count:
+            errors.append(
+                f"{split_name}: represented {represented_ids}/{source_mass_count} source annotations"
+            )
+        if positive_sources_without_positive_patch:
+            errors.append(
+                f"{split_name}: {positive_sources_without_positive_patch} positive source images have no positive patch"
+            )
+
+    metrics["splits"] = source_metrics
+    train_mode = _deterministic_selection_mode(crop_cfg, "train")
+    if train_mode != "negative_fraction":
+        errors.append(f"train: deterministic selection mode is {train_mode!r}, expected 'negative_fraction'")
+    for split_name in ["val", "test"]:
+        mode = _deterministic_selection_mode(crop_cfg, split_name)
+        if mode != "all":
+            errors.append(f"{split_name}: deterministic selection mode is {mode!r}, expected 'all'")
+
+    train_candidates = int(source_metrics["train"]["eligible_negative_candidates"])
+    keep_fraction = _deterministic_negative_keep_fraction(crop_cfg, "train")
+    expected_train_negatives = int(round(train_candidates * keep_fraction))
+    actual_train_negatives = int(source_metrics["train"]["saved_negative_crops"])
+    metrics["train_negative_selection"] = {
+        "candidate_count": train_candidates,
+        "keep_fraction": keep_fraction,
+        "expected_saved_count": expected_train_negatives,
+        "actual_saved_count": actual_train_negatives,
+    }
+    if actual_train_negatives != expected_train_negatives:
+        errors.append(
+            f"train: saved {actual_train_negatives}/{train_candidates} eligible negatives; "
+            f"expected rounded {keep_fraction:.3f} retention ({expected_train_negatives})"
+        )
+
+    min_inference_grid_fraction = float(contract.get("min_inference_grid_fraction", 0.0) or 0.0)
+    for split_name in ["val", "test"]:
+        fraction = float(source_metrics[split_name]["saved_grid_fraction"])
+        if fraction < min_inference_grid_fraction:
+            errors.append(
+                f"{split_name}: saved {fraction:.3%} of the complete grid; "
+                f"minimum is {min_inference_grid_fraction:.3%}"
+            )
+
+    crop_size = int(crop_cfg.get("crop_size", 0))
+    for split_name, coco in coco_by_split.items():
+        image_ids = {image.get("id") for image in coco.get("images", [])}
+        for image in coco.get("images", []):
+            if int(image.get("width", -1)) != crop_size or int(image.get("height", -1)) != crop_size:
+                errors.append(f"{split_name}: patch {image.get('file_name')} is not {crop_size}x{crop_size}")
+                break
+            window = image.get("crop_window_xyxy")
+            if not isinstance(window, (list, tuple)) or len(window) != 4 or int(window[2]) - int(window[0]) != crop_size or int(window[3]) - int(window[1]) != crop_size:
+                errors.append(f"{split_name}: patch {image.get('file_name')} has an invalid crop window")
+                break
+        for annotation in coco.get("annotations", []):
+            bbox = annotation.get("bbox", [])
+            valid = (
+                annotation.get("image_id") in image_ids
+                and isinstance(bbox, (list, tuple))
+                and len(bbox) == 4
+                and float(bbox[2]) > 0
+                and float(bbox[3]) > 0
+                and float(annotation.get("area", 0)) > 0
+            )
+            if not valid:
+                errors.append(f"{split_name}: invalid or dangling COCO annotation {annotation.get('id')}")
+                break
+            if bool(contract.get("require_source_annotation_ids", False)) and annotation.get("source_annotation_id") is None:
+                errors.append(f"{split_name}: COCO annotation {annotation.get('id')} lacks source_annotation_id")
+                break
+
+    report = {
+        "enabled": True,
+        "name": contract.get("name", "replication_contract"),
+        "status": "pass" if not errors else "fail",
+        "metrics": metrics,
+        "errors": errors,
+    }
+    if errors and bool(contract.get("strict", True)):
+        raise RuntimeError("Replication patch contract failed: " + "; ".join(errors))
+    return report
+
+
 def _write_shared_export_files(
     root: Path,
     coco_by_split: dict[str, dict[str, Any]],
@@ -3137,16 +3827,27 @@ def _coco_image_record(
     return out
 
 
-def _append_coco_annotations(coco: dict[str, Any], image_id: int, start_ann_id: int, boxes: torch.Tensor) -> int:
+def _append_coco_annotations(
+    coco: dict[str, Any],
+    image_id: int,
+    start_ann_id: int,
+    boxes: torch.Tensor,
+    *,
+    source_annotation_ids: list[Any] | None = None,
+    source_annotation_rows: list[Any] | None = None,
+    source_boxes: torch.Tensor | None = None,
+) -> int:
     count = 0
-    for box in _boxes_to_list(boxes):
+    source_annotation_ids = list(source_annotation_ids or [])
+    source_annotation_rows = list(source_annotation_rows or [])
+    source_box_list = _boxes_to_list(source_boxes)
+    for box_index, box in enumerate(_boxes_to_list(boxes)):
         x0, y0, x1, y1 = box
         w = max(0.0, x1 - x0)
         h = max(0.0, y1 - y0)
         if w <= 0 or h <= 0:
             continue
-        coco["annotations"].append(
-            {
+        annotation = {
                 "id": int(start_ann_id + count),
                 "image_id": int(image_id),
                 "category_id": 1,
@@ -3155,7 +3856,13 @@ def _append_coco_annotations(coco: dict[str, Any], image_id: int, start_ann_id: 
                 "iscrowd": 0,
                 "segmentation": [],
             }
-        )
+        if box_index < len(source_annotation_ids) and source_annotation_ids[box_index] is not None:
+            annotation["source_annotation_id"] = source_annotation_ids[box_index]
+        if box_index < len(source_annotation_rows) and source_annotation_rows[box_index] is not None:
+            annotation["source_annotation_row"] = source_annotation_rows[box_index]
+        if box_index < len(source_box_list):
+            annotation["source_bbox_xyxy"] = [float(value) for value in source_box_list[box_index]]
+        coco["annotations"].append(annotation)
         count += 1
     return count
 
@@ -3220,6 +3927,11 @@ def _sample_stats_row(
                 "source_index": crop_info.get("source_index", ""),
                 "crop_mode": crop_info.get("crop_mode"),
                 "deterministic_selection_mode": crop_info.get("deterministic_selection_mode", ""),
+                "negative_fraction_selection": crop_info.get("negative_fraction_selection", ""),
+                "negative_candidate_count": crop_info.get("negative_candidate_count", ""),
+                "negative_keep_fraction": crop_info.get("negative_keep_fraction", ""),
+                "negative_selected_count": crop_info.get("negative_selected_count", ""),
+                "negative_achieved_keep_fraction": crop_info.get("negative_achieved_keep_fraction", ""),
                 "source_image_has_finding": crop_info.get("source_image_has_finding", ""),
                 "is_positive_window": crop_info.get("is_positive_window", ""),
                 "requested_positive": crop_info.get("requested_positive"),
@@ -3365,6 +4077,8 @@ def _write_completion_files(
         "created_files_count": len(created_files),
         "created_files_tail": [_path_as_posix(p) for p in created_files[-50:]],
         "config_snapshot": config,
+        "source_file_provenance": _source_file_provenance(data_root),
+        "software_provenance": _software_provenance(),
     }
 
     manifest_path = output_root / "manifest.json"
@@ -3392,6 +4106,58 @@ def _write_completion_files(
     done_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     return manifest, [manifest_path, done_path]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_file_provenance(data_root: Path) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for name in ["metadata.csv", "breast-level_annotations.csv", "finding_annotations.csv"]:
+        path = data_root / name
+        out.append({
+            "name": name,
+            "path": _path_as_posix(path),
+            "exists": path.is_file(),
+            "size_bytes": path.stat().st_size if path.is_file() else 0,
+            "sha256": _sha256_file(path) if path.is_file() else None,
+        })
+    return out
+
+
+def _software_provenance() -> dict[str, Any]:
+    root = Path(__file__).resolve().parents[2]
+
+    def git_output(*args: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            return None
+        return result.stdout.strip() or None
+
+    status = git_output("status", "--porcelain")
+    return {
+        "python": sys.version,
+        "platform": platform.platform(),
+        "git_commit": git_output("rev-parse", "HEAD"),
+        "git_dirty": bool(status),
+        "git_status_porcelain": status,
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+        "torch": torch.__version__,
+        "pillow": getattr(Image, "__version__", None),
+    }
 
 
 def _expected_completion_files(output_root: Path, config: dict[str, Any]) -> list[Path]:

@@ -5,6 +5,7 @@ from pathlib import Path
 from pprint import pprint
 
 from .export import export_from_config, load_export_config
+from .presets import PAPER_22_PRESET_KEY, STUDY_PRESETS, apply_study_preset
 from .visualize import visualize_export_from_config
 
 
@@ -19,7 +20,7 @@ def _default_config_path() -> Path:
     return Path.cwd() / "config" / "export_config.yaml"
 
 
-def _build_parser(description: str) -> argparse.ArgumentParser:
+def _build_parser(description: str, *, include_preset: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--config",
@@ -27,24 +28,37 @@ def _build_parser(description: str) -> argparse.ArgumentParser:
         default=_default_config_path(),
         help="Path to export_config.yaml. Default: ./config/export_config.yaml",
     )
+    if include_preset:
+        parser.add_argument(
+            "--preset",
+            choices=["paper22", *STUDY_PRESETS.keys()],
+            default=None,
+            help="Apply a hermetic cross-section study preset after loading the YAML (paper22 is an alias).",
+        )
     return parser
 
 
-def run_export_from_config_path(config_path: str | Path):
+def run_export_from_config_path(config_path: str | Path, *, preset_key: str | None = None):
     """Run the full export pipeline from a YAML config path."""
     config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
     cfg = load_export_config(config_path)
+    if preset_key:
+        resolved_key = PAPER_22_PRESET_KEY if str(preset_key) == "paper22" else str(preset_key)
+        cfg = apply_study_preset(cfg, resolved_key)
     return export_from_config(cfg)
 
 
-def run_visualization_from_config_path(config_path: str | Path):
+def run_visualization_from_config_path(config_path: str | Path, *, preset_key: str | None = None):
     """Create fast visualizations from an already exported dataset."""
     config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
     cfg = load_export_config(config_path)
+    if preset_key:
+        resolved_key = PAPER_22_PRESET_KEY if str(preset_key) == "paper22" else str(preset_key)
+        cfg = apply_study_preset(cfg, resolved_key)
     return visualize_export_from_config(cfg)
 
 
@@ -52,7 +66,7 @@ def export_main(argv: list[str] | None = None) -> None:
     """Console entry point: ``vindr-mammo-export``."""
     parser = _build_parser("Export VinDr-Mammo mass-detection datasets.")
     args = parser.parse_args(argv)
-    result = run_export_from_config_path(args.config)
+    result = run_export_from_config_path(args.config, preset_key=args.preset)
     print("\nExport finished")
     print("Output root:", result.output_root)
     print("Created key metadata/config files:")
@@ -67,7 +81,7 @@ def visualize_main(argv: list[str] | None = None) -> None:
     """Console entry point: ``vindr-mammo-visualize``."""
     parser = _build_parser("Create visualizations from an exported VinDr-Mammo dataset.")
     args = parser.parse_args(argv)
-    result = run_visualization_from_config_path(args.config)
+    result = run_visualization_from_config_path(args.config, preset_key=args.preset)
     print("\nVisualization finished")
     print("Output directory:", result.output_dir)
     print("Created files:")
@@ -97,7 +111,7 @@ def streamlit_gui_main(argv: list[str] | None = None) -> None:
     import sys
     from streamlit.web import cli as stcli
 
-    parser = _build_parser("Open the legacy Streamlit preprocessing inspector GUI.")
+    parser = _build_parser("Open the legacy Streamlit preprocessing inspector GUI.", include_preset=False)
     args = parser.parse_args(argv)
     app_path = Path(__file__).resolve().parent / "gui_app.py"
     sys.argv = ["streamlit", "run", str(app_path), "--", "--config", str(args.config)]

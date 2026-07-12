@@ -29,6 +29,9 @@ DEFAULT_PREPROCESS_OPTIONS: dict[str, Any] = {
     "breast_mask_keep_largest_component": True,
     "min_component_area_fraction": 0.001,
     "min_box_visibility_after_crop": 0.30,
+    # Keep the already-computed full-source mask on the in-memory target so a
+    # patch exporter can reuse it. It is never written into metadata payloads.
+    "retain_breast_mask_for_export": False,
 }
 
 
@@ -40,6 +43,10 @@ class PreprocessGeometryResult:
     box_keep: torch.Tensor
     mass_box_keep: torch.Tensor
     info: dict[str, Any]
+    # Full-source breast mask in the same coordinate system as ``image``.
+    # Exporters can reuse it for every patch instead of estimating foreground
+    # independently from each patch border.
+    foreground_mask: np.ndarray | None = None
 
 
 def make_preprocess_options(options: dict[str, Any] | None) -> dict[str, Any]:
@@ -79,8 +86,10 @@ def apply_geometry_preprocessing(
         "original_shape": (int(image.shape[-2]), int(image.shape[-1])),
     }
 
+    foreground_mask: np.ndarray | None = None
     if opts.get("mask_outside_breast") and not opts["crop_breast"]:
-        mask = breast_mask(image, options=opts)
+        foreground_mask = breast_mask(image, options=opts)
+        mask = foreground_mask
         mask_t = torch.as_tensor(mask, dtype=image.dtype, device=image.device).unsqueeze(0)
         image = image * mask_t
         info["breast_mask_pixels"] = int(mask.sum())
@@ -104,10 +113,11 @@ def apply_geometry_preprocessing(
         mask = breast_mask(image, options=opts)
         x0, y0, x1, y1 = crop_box
         image = image[:, y0:y1, x0:x1].contiguous()
+        foreground_mask = np.asarray(mask[y0:y1, x0:x1], dtype=bool)
         boxes, box_keep = _crop_boxes(boxes, crop_box, min_visibility=float(opts.get("min_box_visibility_after_crop", 0.30)))
         mass_boxes, mass_box_keep = _crop_boxes(mass_boxes, crop_box, min_visibility=float(opts.get("min_box_visibility_after_crop", 0.30)))
         if opts.get("mask_outside_breast"):
-            crop_mask = mask[y0:y1, x0:x1]
+            crop_mask = foreground_mask
             mask_t = torch.as_tensor(crop_mask, dtype=image.dtype, device=image.device).unsqueeze(0)
             image = image * mask_t
             info["breast_mask_pixels"] = int(crop_mask.sum())
@@ -124,9 +134,11 @@ def apply_geometry_preprocessing(
             image = torch.flip(image, dims=[-1]).contiguous()
             boxes = _mirror_boxes(boxes, width)
             mass_boxes = _mirror_boxes(mass_boxes, width)
+            if foreground_mask is not None:
+                foreground_mask = np.ascontiguousarray(np.fliplr(foreground_mask))
 
     info["processed_shape"] = (int(image.shape[-2]), int(image.shape[-1]))
-    return PreprocessGeometryResult(image, boxes, mass_boxes, box_keep, mass_box_keep, info)
+    return PreprocessGeometryResult(image, boxes, mass_boxes, box_keep, mass_box_keep, info, foreground_mask)
 
 
 def breast_crop_box(

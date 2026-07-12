@@ -1,5 +1,6 @@
 from .export import export_from_config, load_export_config
 from .visualize import create_visualizations_from_export, visualize_export_from_config
+from .presets import PAPER_22_PRESET_KEY, STUDY_PRESETS, apply_study_preset
 
 from .cli import (
     export_main,
@@ -35,4 +36,7 @@ __all__ = [
     "run_visualization_from_config_path",
     "export_main",
     "visualize_main",
+    "PAPER_22_PRESET_KEY",
+    "STUDY_PRESETS",
+    "apply_study_preset",
 ]

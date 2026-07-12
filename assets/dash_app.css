@@ -97,6 +97,21 @@ body {
   overflow: hidden;
 }
 
+.study-preset-panel {
+  padding: 14px 15px 12px;
+  border-bottom: 1px solid #bfdbfe;
+  background: linear-gradient(180deg, #f8fbff, #eef5ff);
+}
+
+.study-preset-panel .field {
+  margin-bottom: 7px;
+}
+
+.study-preset-panel .status-line {
+  min-height: 0;
+  padding: 7px 0 0;
+}
+
 .viewer-pane {
   min-height: calc(100vh - 136px);
 }

@@ -1228,6 +1228,48 @@ or, from the repository root:
 python inspect_preprocessing_app.py
 ```
 
+### Cross-section study presets
+
+The Dash inspector places **Study preset** above all tabs because these presets intentionally update DICOM loading, fixed preprocessing, crop geometry, sampling, RGB export, and save settings together. The **Bulatović et al. — YOLOv8 patched inference (VinDr-Mammo)** preset applies the data recipe reported in *Refining YOLOv8 for Full Field Digital Mammograms*:
+
+- MONOCHROME1 correction to bright tissue on dark background;
+- DICOM VOI LUT/windowing for VinDr-Mammo and 8-bit replicated-grayscale PNG export;
+- artifact/background masking without an unreported breast bounding-box crop or left/right mirroring;
+- deterministic 640 × 640 patches with 512 px stride (20% overlap);
+- all positive training patches plus a seeded 20% sample of eligible negative candidates;
+- all eligible validation/test patches; and
+- a valid-Mass-positive source cohort only;
+- official VinDr test preservation with a deterministic, BI-RADS-stratified,
+  study-level train/validation split matching the published 398/758,
+  71/136, and 115/219 study/image counts; and
+- a versioned output folder named `preprocessed-vindr-paper22-v2` under the
+  currently configured output parent.
+
+The preset replaces inherited dataset-affecting settings rather than retaining
+stale vendor, split, foreground, or crop overrides. It also blocks completion
+unless the published cohort counts, source-study isolation, 237 official-test
+mass boxes, 100% source-annotation representation, exact rounded 20% training
+negative retention, and complete validation/test inference policy pass. Source
+CSV hashes, the Git revision, the resolved settings, and the disclosed versus
+assumed choices are recorded in the manifest.
+
+The paper does not publish its train/validation IDs or seed, foreground-mask
+algorithm, partial-box rule, or the granularity/rounding of negative sampling.
+The preset therefore labels its deterministic seed, 5% foreground rule, 30%
+box-visibility rule, global sampling, and edge-aligned final grid starts as
+replication assumptions. It does not claim that the count-matched split is
+author-identical. Model architecture, training augmentation, source-coordinate
+inference, and Maximum Box Fusion remain in the model repository.
+
+Run the same hermetic preset without the GUI with:
+
+```bash
+vindr-mammo-export --config config/export_config.yaml --preset paper22
+
+# Or without installing the console script:
+python main.py --config config/export_config.yaml --preset paper22
+```
+
 The GUI can filter by train/val/test, positive images only or all images, vendor/device, crop positivity threshold, and crop index. It displays the full grayscale image, the selected grayscale crop, and the processed RGB crop together with mass boxes, statistics, metadata, optional per-channel panels with mass boxes, and compare-mode statistical similarity metrics.
 
 For large DICOMs, change multiple parameters quickly, then click **Render / refresh** once to run the expensive DICOM read, breast crop, crop selection, RGB preprocessing, and rendering step.

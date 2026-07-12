@@ -15,5 +15,6 @@ CONFIG_PATH = PROJECT_ROOT / "config" / "export_config.yaml"
 
 
 if __name__ == "__main__":
-    # Equivalent to: vindr-mammo-export --config config/export_config.yaml
-    export_main(["--config", str(CONFIG_PATH)])
+    # The VSCode Run button still uses the default YAML. Command-line options
+    # such as ``--preset paper22`` are forwarded when supplied.
+    export_main(sys.argv[1:] or ["--config", str(CONFIG_PATH)])

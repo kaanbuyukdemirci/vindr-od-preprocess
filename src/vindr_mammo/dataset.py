@@ -80,6 +80,7 @@ class VindrMammoDataset(Dataset):
         normalize: NormalizeMode = "minmax",
         percentile_range: tuple[float, float] = (0.5, 99.5),
         use_voi_lut: bool = False,
+        strict_voi_lut: bool = False,
         output_size: tuple[int, int] | None = None,
         return_dicom_meta: bool = False,
         validate_paths: bool = False,
@@ -128,6 +129,8 @@ class VindrMammoDataset(Dataset):
             If ``True``, applies DICOM VOI LUT or windowing when present. For
             raw model training, the default ``False`` is usually safer because
             it avoids display-style windowing.
+        strict_voi_lut:
+            If ``True``, fail when requested VOI LUT/windowing cannot be applied.
         output_size:
             Optional resize as ``(height, width)``. Keep ``None`` to preserve
             the original DICOM size. When set, returned ``boxes`` are scaled to
@@ -169,6 +172,7 @@ class VindrMammoDataset(Dataset):
         self.normalize = normalize
         self.percentile_range = percentile_range
         self.use_voi_lut = use_voi_lut
+        self.strict_voi_lut = bool(strict_voi_lut)
         self.output_size = output_size
         self.return_dicom_meta = return_dicom_meta
         self.validate_paths = validate_paths
@@ -244,6 +248,16 @@ class VindrMammoDataset(Dataset):
             for col in ["study_id", "series_id", "image_id"]:
                 if col in df.columns:
                     df[col] = df[col].astype(str)
+
+        # Preserve a stable identity for every source annotation before any
+        # filtering/reset_index operation. Patch exports can then prove
+        # one-to-one source-GT coverage even when overlapping patches duplicate
+        # the same lesion.
+        if "source_annotation_id" not in self.finding_df.columns:
+            self.finding_df["source_annotation_id"] = self.finding_df.index.astype(int)
+        if "source_annotation_row" not in self.finding_df.columns:
+            # CSV row number including the header line (useful for audits).
+            self.finding_df["source_annotation_row"] = self.finding_df.index.astype(int) + 2
 
     def _filter_split(self) -> None:
         """Filter the annotation tables using the official split column."""
@@ -499,6 +513,7 @@ class VindrMammoDataset(Dataset):
             normalize=self.normalize,
             percentile_range=self.percentile_range,
             use_voi_lut=self.use_voi_lut,
+            strict_voi_lut=self.strict_voi_lut,
             output_size=self.output_size,
             add_channel_dim=True,
             return_dicom_meta=self.return_dicom_meta,
@@ -519,6 +534,7 @@ class VindrMammoDataset(Dataset):
             normalize=self.normalize,
             percentile_range=self.percentile_range,
             use_voi_lut=self.use_voi_lut,
+            strict_voi_lut=self.strict_voi_lut,
             output_size=self.output_size,
             add_channel_dim=True,
             return_dicom_meta=self.return_dicom_meta,
@@ -534,7 +550,11 @@ class VindrMammoDataset(Dataset):
             target["preprocessing"] = dict(self.preprocess_options)
             return image, target
 
-        if not (self.preprocess_options.get("crop_breast") or self.preprocess_options.get("mirror_right_to_left")):
+        if not (
+            self.preprocess_options.get("crop_breast")
+            or self.preprocess_options.get("mask_outside_breast")
+            or self.preprocess_options.get("mirror_right_to_left")
+        ):
             target["preprocessing"] = {
                 **self.preprocess_options,
                 "processed_shape": tuple(image.shape[-2:]),
@@ -554,6 +574,8 @@ class VindrMammoDataset(Dataset):
         target["output_shape"] = result.info["processed_shape"]
         target["height"], target["width"] = result.info["processed_shape"]
         target["preprocessing"] = {**self.preprocess_options, **result.info}
+        if bool(self.preprocess_options.get("retain_breast_mask_for_export", False)) and result.foreground_mask is not None:
+            target["_foreground_mask"] = result.foreground_mask
 
         mass = target["mass"]
         keep = result.mass_box_keep
@@ -740,8 +762,22 @@ class VindrMammoDataset(Dataset):
 
     @classmethod
     def _filter_mass_findings(cls, findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Keep only finding rows whose category list contains ``Mass``."""
-        return [finding for finding in findings if cls._is_mass_finding(finding)]
+        """Keep valid bounding-box rows whose category list contains ``Mass``."""
+        return [
+            finding
+            for finding in findings
+            if cls._is_mass_finding(finding) and cls._finding_has_valid_box(finding)
+        ]
+
+    @staticmethod
+    def _finding_has_valid_box(finding: dict[str, Any]) -> bool:
+        try:
+            xmin, ymin, xmax, ymax = [
+                float(finding.get(key)) for key in ("xmin", "ymin", "xmax", "ymax")
+            ]
+        except (TypeError, ValueError):
+            return False
+        return bool(np.isfinite([xmin, ymin, xmax, ymax]).all() and xmax > xmin and ymax > ymin)
 
     @staticmethod
     def _shape_from_record_or_dicom(record: dict[str, Any], dicom_shape: tuple[int, int] | None) -> tuple[int, int] | None:
@@ -1928,6 +1964,7 @@ class VindrMammoDataset(Dataset):
             normalize=self.normalize,
             percentile_range=self.percentile_range,
             use_voi_lut=self.use_voi_lut,
+            strict_voi_lut=self.strict_voi_lut,
             output_size=self.output_size,
             add_channel_dim=True,
             return_dicom_meta=False,
@@ -2030,6 +2067,7 @@ class VindrMammoDataset(Dataset):
             normalize=self.normalize,
             percentile_range=self.percentile_range,
             use_voi_lut=self.use_voi_lut,
+            strict_voi_lut=self.strict_voi_lut,
             output_size=self.output_size,
             add_channel_dim=True,
             return_dicom_meta=False,
