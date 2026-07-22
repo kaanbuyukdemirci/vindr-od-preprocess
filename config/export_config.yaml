@@ -1,6 +1,6 @@
 paths:
-  data_root: /mnt/t9/vindr
-  output_root: /mnt/t9/preprocessed-vindr-v19
+  data_root: /mnt/t9/vindr-data/vindr
+  output_root: /mnt/t9/vindr-data/preprocessed-vindr-v19
 runtime:
   show_progress: true
   simple_profiler_enabled: true
@@ -85,40 +85,48 @@ image_export:
       source: current_crop
       steps:
       - op: percentile_normalize
+        apply_before_crop: false
         params:
           percentiles:
           - 0.0
           - 100.0
       - op: mask_outside_breast
+        apply_before_crop: false
         params:
           outside_value: 0.0
     G:
       source: current_crop
       steps:
       - op: percentile_normalize
+        apply_before_crop: false
         params:
           percentiles:
           - 0.0
           - 100.0
       - op: mask_outside_breast
+        apply_before_crop: false
         params:
           outside_value: 0.0
       - op: clahe
+        apply_before_crop: false
         params:
           clip_limit: 4.0
           tile_grid_size: 8
       - op: mask_outside_breast
+        apply_before_crop: false
         params:
           outside_value: 0.0
     B:
       source: contralateral_same_view_crop
       steps:
       - op: percentile_normalize
+        apply_before_crop: false
         params:
           percentiles:
           - 50.0
           - 100.0
       - op: mask_outside_breast
+        apply_before_crop: false
         params:
           outside_value: 0.0
 histogram_equalization:
@@ -134,6 +142,7 @@ metadata:
   save_full_source_csvs: true
   include_dicom_meta: true
 splits:
+  strategy: random_study_fraction
   val_fraction_from_training: 0.15
   seed: 123
 export:
@@ -144,6 +153,7 @@ export:
 square_crops:
   crop_size: 1024
   stride: 512
+  edge_policy: edge_align
   train_crop_mode: bbox_safe_random
   val_crop_mode: bbox_safe_random
   test_crop_mode: bbox_safe_random
@@ -206,6 +216,14 @@ baseline_uncropped:
   target_height: 1024
   pad_value: 0.0
   pad_anchor: left_top
+paired_whole_images:
+  enabled: false
+  target_width: 1024
+  target_height: 1024
+  canvas_mode: per_image_square
+  pad_value: 0.0
+  pad_anchor: left_top
+  storage_mode: hardlink
 crop_annotation_policy:
   allow_partial_annotations: true
   min_box_visibility: 0.3
@@ -214,7 +232,7 @@ crop_annotation_policy:
 dataset:
   validate_paths: false
 visualizations:
-  output_dir: /mnt/t9/preprocessed-vindr-v19/visualizations
+  output_dir: /mnt/t9/vindr-data/preprocessed-vindr-v19/visualizations
   include_square_crops: true
   include_baseline_uncropped: true
   write_html_report: true

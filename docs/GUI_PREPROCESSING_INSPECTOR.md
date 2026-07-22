@@ -56,7 +56,11 @@ The image selector supports:
 - image positivity: positive images only or all images,
 - vendor filtering: all vendors or selected vendors.
 
-The split logic matches the export code: official VinDr `test` remains test, and official VinDr `training` is split into train/val by study ID according to `splits.val_fraction_from_training` and `splits.seed`.
+The split logic matches the export code: official VinDr `test` always remains
+test. Under **Save Data → Dataset train / validation / test assignment**, choose
+a seeded random study-level validation fraction, original VinDr train/test only
+(no validation), or an exact validation study count. Official VinDr `training`
+is divided by study ID, so views from one examination cannot cross train/val.
 
 ## Fixed preprocessing controls
 
@@ -199,7 +203,12 @@ The GUI crop controls now support two crop proposal modes:
 - **deterministic sliding**: normal sliding-window crops using `crop_size` and `stride`,
 - **stochastic random**: random crops, optionally biased toward masses through the positive-fraction setting.
 
-The **Foreground-ratio crop filter** can be enabled in the sidebar. It computes a simple foreground/breast mask inside each candidate crop and rejects the crop if the foreground fraction is below the selected threshold. This is useful when you turn off `preprocess.crop_breast` and want square crops to remove pure detector background windows instead.
+The **Foreground-ratio crop filter** provides separate train, validation, and
+test enable switches and minimum breast-fraction thresholds. Each enabled split
+uses the retained full-image breast mask and a strict `breast_fraction >
+threshold` comparison. This lets validation/test masking be changed without
+changing training, and removes pure background marker/label windows when
+`preprocess.crop_breast` is disabled.
 
 For example:
 
@@ -328,7 +337,7 @@ The GUI also has a **Dataset visualizations** mode. Use this when you already ex
 
 1. Open the GUI with `vindr-mammo-gui --config config/export_config.yaml`.
 2. Select **Dataset visualizations** from the mode selector.
-3. The app reads visualization outputs under the configured export root, for example `/mnt/t9/preprocessed-vindr-v3/visualizations`.
+3. The app reads visualization outputs under the configured export root, for example `/mnt/t9/vindr-data/preprocessed-vindr-v3/visualizations`.
 4. Regenerate visualization files with `vindr-mammo-visualize --config config/export_config.yaml` when needed.
 
 The GUI writes the usual visualization files under `<export_root>/visualizations` by default and displays the COCO small/medium/large box-size tables and plots directly in the app. The COCO bins follow the standard detection AP area ranges: small boxes have area less than `32^2`, medium boxes have area from `32^2` to less than `96^2`, and large boxes have area at least `96^2`.
@@ -359,6 +368,13 @@ square_crops:
 ```
 
 The older `train_deterministic_include_empty`, `val_deterministic_include_empty`, and `test_deterministic_include_empty` keys are still written for backward compatibility.
+
+`positive_ratio` normally supports the exact candidate-planning path. Setting
+`train_online_positive_ratio_selection_for_deterministic: true` switches the
+training split to streaming approximate balance: all positives are saved
+immediately and eligible negatives are saved only when the running counts need
+them. Simple Dataset v1 uses this online mode for train and uses `all` for
+validation/test, so those two grids are never balanced or foreground-filtered.
 
 ## Manifest comparison and settings loading
 

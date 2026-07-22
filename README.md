@@ -108,7 +108,13 @@ The interactive preprocessing inspector now runs as a Dash app:
 vindr-mammo-gui --config config/export_config.yaml
 ```
 
-It organizes the workflow into Preview, Preprocess, Crops, Pipeline, Export, Saved Data, Manifests, and Guide tabs. Each important parameter has an in-app `?` explanation with practical examples. The legacy Streamlit inspector is still available for comparison:
+It organizes the workflow into Preview, Preprocess, Crops, Pipeline, Export,
+Saved Data, Storage & Queue, Manifests, and Guide tabs. Pipeline operations have
+an `Apply before crop` switch, and Storage & Queue shows available output-disk
+space, conservative size estimates, and a FIFO list of frozen extraction
+pipelines. The queue can also be opened in a separate browser window. Each
+important parameter has an in-app `?` explanation with practical examples. The
+legacy Streamlit inspector is still available for comparison:
 
 ```bash
 vindr-mammo-streamlit-gui --config config/export_config.yaml
@@ -996,7 +1002,7 @@ The Ultralytics YAML files are now written without an absolute `path:` field. Th
 
 ```text
 G:/preprocessed-vindr/square_crops/vindr_mass.yaml
-/mnt/t9/preprocessed-vindr/square_crops/vindr_mass.yaml
+/mnt/t9/vindr-data/preprocessed-vindr/square_crops/vindr_mass.yaml
 ```
 
 Its content is:
@@ -1172,7 +1178,7 @@ Keep `max_rows_per_samples_csv: null` for exact plots. Set it to a number such a
 The default `config/export_config.yaml` now creates a new dataset under:
 
 ```text
-/mnt/t9/preprocessed-vindr-v3
+/mnt/t9/vindr-data/preprocessed-vindr-v3
 ```
 
 This v3 dataset is designed for the experiment where the training split is generated deterministically, but empty train crops are excluded. In other words, the exporter first slides a `1024 x 1024` window with stride `512`, then keeps a train crop only if the final crop contains at least one mass bounding box according to `crop_annotation_policy`. Validation and test still use deterministic sliding windows with empty crops included, so they remain realistic evaluation sets.
@@ -1203,13 +1209,13 @@ With `allow_partial_annotations: false`, a crop only counts as positive if the c
 The portable Ultralytics YAML is written at:
 
 ```text
-/mnt/t9/preprocessed-vindr-v3/square_crops/vindr_mass.yaml
+/mnt/t9/vindr-data/preprocessed-vindr-v3/square_crops/vindr_mass.yaml
 ```
 
 Use it with:
 
 ```bash
-yolo detect train model=yolo11n.pt data=/mnt/t9/preprocessed-vindr-v3/square_crops/vindr_mass.yaml imgsz=1024
+yolo detect train model=yolo11n.pt data=/mnt/t9/vindr-data/preprocessed-vindr-v3/square_crops/vindr_mass.yaml imgsz=1024
 ```
 
 
@@ -1230,7 +1236,7 @@ python inspect_preprocessing_app.py
 
 ### Cross-section study presets
 
-The Dash inspector places **Study preset** above all tabs because these presets intentionally update DICOM loading, fixed preprocessing, crop geometry, sampling, RGB export, and save settings together. The **Bulatović et al. — YOLOv8 patched inference (VinDr-Mammo)** preset applies the data recipe reported in *Refining YOLOv8 for Full Field Digital Mammograms*:
+The Dash inspector places **Study preset** above all tabs because these presets intentionally update DICOM loading, fixed preprocessing, crop geometry, sampling, RGB export, and save settings together. **Paper 22 — closest available reproduction (v2; not exact)** applies the data recipe reported in *Refining YOLOv8 for Full Field Digital Mammograms*:
 
 - MONOCHROME1 correction to bright tissue on dark background;
 - DICOM VOI LUT/windowing for VinDr-Mammo and 8-bit replicated-grayscale PNG export;
@@ -1261,6 +1267,29 @@ replication assumptions. It does not claim that the count-matched split is
 author-identical. Model architecture, training augmentation, source-coordinate
 inference, and Maximum Box Fusion remain in the model repository.
 
+A second adjacent preset, **Custom Paper 22 — improved breast-balanced
+foreground crops (v4)**, keeps the v2 validation image IDs and
+official test cohort unchanged but changes the training subset deliberately:
+
+- train/validation/test isolation remains at `study_id` (patient/exam) level;
+- training expands the 398 selected training patients to all 1,592 views;
+- a breast is defined as `(study_id, laterality)`, so the other view of a
+  mass-positive breast cannot be mislabeled as a negative breast;
+- every train, validation, and test crop must contain strictly more than 10% of the retained
+  fixed-preprocessing breast mask (the equality case is rejected);
+- the final training crop set is exactly 50% from negative breasts and 50% from
+  breasts with at least one valid Mass, while retaining all eligible
+  lesion-containing windows; and
+- validation and test keep every otherwise eligible `640/512` grid window only
+  when its retained breast-mask fraction is also strictly greater than 10%; this
+  removes background-only marker/label regions such as LCC without changing
+  source-image membership or source-coordinate ground truth.
+
+The improved dataset is written to
+`/mnt/t9/vindr-data/preprocessed-vindr-paper22-improved-v4`. It is a custom
+controlled experiment inspired by the paper, not a claim about an undisclosed
+author subset. Both Paper 22 choices are visible separately in the GUI.
+
 Run the same hermetic preset without the GUI with:
 
 ```bash
@@ -1268,7 +1297,46 @@ vindr-mammo-export --config config/export_config.yaml --preset paper22
 
 # Or without installing the console script:
 python main.py --config config/export_config.yaml --preset paper22
+
+# Custom patient/breast-balanced subset with >10% breast coverage in every split:
+python main.py --config config/export_config.yaml --preset custom-paper22
 ```
+
+Two additional presets are available:
+
+- **Paper 69 — closest available reproduction (v3; not exact)** (`paper69`)
+  preserves the official VinDr test cohort, crops only excess breast
+  background, retains native resolution, and exports full mammograms for
+  Exemplar Med-DETR. For practical early stopping, version 3 reserves 15% of
+  official training studies as a seeded, BI-RADS-stratified validation set; the
+  GUI can restore strict official train/test-only membership. Because Paper 69
+  publishes neither its validation policy nor exact crop code, both assumptions
+  are recorded and the preset does not claim byte-identical reproduction. See
+  [`docs/PAPER69_PRESET_AUDIT.md`](docs/PAPER69_PRESET_AUDIT.md) and the
+  [`Paper 69 model data handoff`](docs/PAPER69_MODEL_DATA_HANDOFF.md).
+- **Custom — balanced 1024 crops + paired whole breast (v1)** (`custom`; legacy
+  alias `simple`) performs common breast cleanup, then whole-image histogram
+  equalization and R/G/B percentile normalization at `0-100`, `50-100`, and
+  `75-100` before any square crop is extracted. Training keeps every positive
+  crop and admits clean negatives online toward 1:1 only when at least 80% of
+  the crop is breast according to the retained mask; positives bypass that rule.
+  Validation and test retain every stride-grid crop without balancing or the 80%
+  filter. It uses exact-grid zero-padded `1024` crops at stride `512` and writes
+  a pad-then-resize `1024` whole-image companion for every crop.
+
+```bash
+vindr-mammo-export --config config/export_config.yaml --preset paper69
+vindr-mammo-export --config config/export_config.yaml --preset simple
+```
+
+The paired model-input layout is specified in
+[`docs/PAIRED_CROP_DATA_CONTRACT.md`](docs/PAIRED_CROP_DATA_CONTRACT.md), including
+the authoritative manifest fields, label semantics, tensor shapes, and loader
+rules.
+
+The Paper 22 version status, distinct loader semantics, and source-coordinate
+evaluation contract are in the
+[`Paper 22 model data handoff`](docs/PAPER22_MODEL_DATA_HANDOFF.md).
 
 The GUI can filter by train/val/test, positive images only or all images, vendor/device, crop positivity threshold, and crop index. It displays the full grayscale image, the selected grayscale crop, and the processed RGB crop together with mass boxes, statistics, metadata, optional per-channel panels with mass boxes, and compare-mode statistical similarity metrics.
 
@@ -1355,11 +1423,16 @@ The report now includes COCO-style box-size statistics from the exported COCO/MM
 
 ### GUI visualization of an exported dataset
 
-The Dash GUI includes a **Dataset visualizations** mode for viewing visualization files under an exported dataset root such as `/mnt/t9/preprocessed-vindr-v3/visualizations`.
+The Dash GUI includes a **Dataset visualizations** mode for viewing visualization files under an exported dataset root such as `/mnt/t9/vindr-data/preprocessed-vindr-v3/visualizations`.
 
 ### v41 GUI export additions
 
 The GUI export panel now reports elapsed time and estimated remaining time during dataset export. It also supports split-specific deterministic crop selection modes: `mass_only`, `all`, `positive_ratio`, and `finding_images_all_windows`. In `positive_ratio` mode, all mass-positive deterministic windows are kept and non-mass windows are sampled to approach the requested positive crop ratio for train, validation, or test independently. In `finding_images_all_windows` mode, source images with no mass/finding are skipped, but every deterministic crop from source images with at least one mass/finding is kept, including crop windows that do not themselves contain the mass.
+
+Deterministic `positive_ratio` can also run as a streaming approximate sampler
+with `<split>_online_positive_ratio_selection_for_deterministic: true`. Simple
+Dataset v1 enables this only for train; validation/test use `all` and preserve
+their complete stride grids.
 
 
 ### v43 ETA fix

@@ -1,6 +1,13 @@
 from .export import export_from_config, load_export_config
 from .visualize import create_visualizations_from_export, visualize_export_from_config
-from .presets import PAPER_22_PRESET_KEY, STUDY_PRESETS, apply_study_preset
+from .presets import (
+    PAPER_22_IMPROVED_PRESET_KEY,
+    PAPER_22_PRESET_KEY,
+    PAPER_69_PRESET_KEY,
+    SIMPLE_PRESET_KEY,
+    STUDY_PRESETS,
+    apply_study_preset,
+)
 
 from .cli import (
     export_main,
@@ -18,7 +25,7 @@ from .dataset import (
     vindr_mammo_collate,
 )
 
-__version__ = "0.33.0"
+__version__ = "0.35.0"
 
 __all__ = [
     "VindrMammoDataset",
@@ -37,6 +44,9 @@ __all__ = [
     "export_main",
     "visualize_main",
     "PAPER_22_PRESET_KEY",
+    "PAPER_22_IMPROVED_PRESET_KEY",
+    "PAPER_69_PRESET_KEY",
+    "SIMPLE_PRESET_KEY",
     "STUDY_PRESETS",
     "apply_study_preset",
 ]

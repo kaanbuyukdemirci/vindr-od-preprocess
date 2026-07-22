@@ -19,6 +19,11 @@ DEFAULT_CROP_OPTIONS: dict[str, Any] = {
     "mode": "random",                 # "random" or "deterministic"
     "crop_size": 1024,                 # square crop size n x n
     "stride": 768,                     # deterministic sliding-window stride
+    # ``edge_align`` preserves the legacy behavior by moving the final window
+    # back so it ends exactly at the image edge. ``regular_stride_pad`` keeps
+    # every origin on the stride grid and lets the final window extend outside
+    # the image, where ``crop_image_and_boxes_to_window`` pads it.
+    "edge_policy": "edge_align",
     "random_crops_per_image": 1,       # only used by index_level="crop" in random mode
     "positive_fraction": 0.80,         # probability of sampling a mass-positive crop
     "center_on_mass": True,            # for positive random crops
@@ -74,6 +79,14 @@ def make_crop_options(options: dict[str, Any] | None) -> dict[str, Any]:
         raise ValueError("crop_options['mode'] must be 'random', 'deterministic', or 'bbox_safe_random'.")
     out["crop_size"] = int(out["crop_size"])
     out["stride"] = int(out["stride"])
+    edge_policy = str(out.get("edge_policy", "edge_align") or "edge_align").casefold().strip()
+    if edge_policy == "pad":
+        edge_policy = "regular_stride_pad"
+    if edge_policy not in {"edge_align", "regular_stride_pad"}:
+        raise ValueError(
+            "crop_options['edge_policy'] must be 'edge_align' or 'regular_stride_pad'."
+        )
+    out["edge_policy"] = edge_policy
     if out["crop_size"] <= 0:
         raise ValueError("crop_options['crop_size'] must be positive.")
     if out["stride"] <= 0:
@@ -81,26 +94,54 @@ def make_crop_options(options: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
-def sliding_square_windows(width: int, height: int, crop_size: int, stride: int) -> list[tuple[int, int, int, int]]:
-    """Return n x n sliding windows that cover an image, including edge-aligned windows."""
+def sliding_square_windows(
+    width: int,
+    height: int,
+    crop_size: int,
+    stride: int,
+    edge_policy: str = "edge_align",
+) -> list[tuple[int, int, int, int]]:
+    """Return square sliding windows under an explicit image-edge policy.
+
+    ``edge_align`` is the backward-compatible policy: if the normal stride grid
+    does not end at the far image edge, one final origin is shifted back to
+    ``length - crop_size``. ``regular_stride_pad`` never shortens the last step;
+    when another stride-grid origin still falls inside the image, it uses that
+    origin and lets the final window extend outside for later padding.
+    """
     n = int(crop_size)
     stride = int(stride)
     width = int(width)
     height = int(height)
 
-    if width <= n:
-        xs = [0]
-    else:
-        xs = list(range(0, width - n + 1, stride))
-        if xs[-1] != width - n:
-            xs.append(width - n)
+    if n <= 0:
+        raise ValueError("crop_size must be positive.")
+    if stride <= 0:
+        raise ValueError("stride must be positive.")
+    policy = str(edge_policy or "edge_align").casefold().strip()
+    if policy == "pad":
+        policy = "regular_stride_pad"
+    if policy not in {"edge_align", "regular_stride_pad"}:
+        raise ValueError("edge_policy must be 'edge_align' or 'regular_stride_pad'.")
 
-    if height <= n:
-        ys = [0]
-    else:
-        ys = list(range(0, height - n + 1, stride))
-        if ys[-1] != height - n:
-            ys.append(height - n)
+    def _axis_starts(length: int) -> list[int]:
+        if length <= n:
+            return [0]
+        starts = list(range(0, length - n + 1, stride))
+        if policy == "edge_align":
+            if starts[-1] != length - n:
+                starts.append(length - n)
+            return starts
+
+        # The in-bounds grid above always contains 0. Advance once more by the
+        # full stride when its last window does not yet cover the far edge.
+        next_start = starts[-1] + stride
+        if starts[-1] + n < length and next_start < length:
+            starts.append(next_start)
+        return starts
+
+    xs = _axis_starts(width)
+    ys = _axis_starts(height)
 
     return [(int(x), int(y), int(x + n), int(y + n)) for y in ys for x in xs]
 
@@ -193,6 +234,7 @@ def crop_image_and_boxes_to_window(
         "square_crop_enabled": True,
         "crop_mode": opts["mode"],
         "crop_size": n,
+        "edge_policy": opts["edge_policy"],
         "window_xyxy": (x0, y0, x1, y1),
         "source_image_shape": (height, width),
         "crop_shape": (int(cropped.shape[-2]), int(cropped.shape[-1])),

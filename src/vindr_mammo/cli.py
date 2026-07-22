@@ -5,7 +5,14 @@ from pathlib import Path
 from pprint import pprint
 
 from .export import export_from_config, load_export_config
-from .presets import PAPER_22_PRESET_KEY, STUDY_PRESETS, apply_study_preset
+from .presets import (
+    PAPER_22_IMPROVED_PRESET_KEY,
+    PAPER_22_PRESET_KEY,
+    PAPER_69_PRESET_KEY,
+    SIMPLE_PRESET_KEY,
+    STUDY_PRESETS,
+    apply_study_preset,
+)
 from .visualize import visualize_export_from_config
 
 
@@ -31,9 +38,21 @@ def _build_parser(description: str, *, include_preset: bool = True) -> argparse.
     if include_preset:
         parser.add_argument(
             "--preset",
-            choices=["paper22", *STUDY_PRESETS.keys()],
+            choices=[
+                "paper22",
+                "custom-paper22",
+                "paper22-improved",
+                "paper69",
+                "custom",
+                "simple",
+                *STUDY_PRESETS.keys(),
+            ],
             default=None,
-            help="Apply a hermetic cross-section study preset after loading the YAML (paper22 is an alias).",
+            help=(
+                "Apply a study preset after loading YAML. Clear aliases are paper22, "
+                "custom-paper22, paper69, and custom; paper22-improved and simple remain "
+                "supported for backward compatibility."
+            ),
         )
     return parser
 
@@ -45,7 +64,15 @@ def run_export_from_config_path(config_path: str | Path, *, preset_key: str | No
         raise FileNotFoundError(f"Config file not found: {config_path}")
     cfg = load_export_config(config_path)
     if preset_key:
-        resolved_key = PAPER_22_PRESET_KEY if str(preset_key) == "paper22" else str(preset_key)
+        aliases = {
+            "paper22": PAPER_22_PRESET_KEY,
+            "custom-paper22": PAPER_22_IMPROVED_PRESET_KEY,
+            "paper22-improved": PAPER_22_IMPROVED_PRESET_KEY,
+            "paper69": PAPER_69_PRESET_KEY,
+            "custom": SIMPLE_PRESET_KEY,
+            "simple": SIMPLE_PRESET_KEY,
+        }
+        resolved_key = aliases.get(str(preset_key), str(preset_key))
         cfg = apply_study_preset(cfg, resolved_key)
     return export_from_config(cfg)
 
@@ -57,7 +84,15 @@ def run_visualization_from_config_path(config_path: str | Path, *, preset_key: s
         raise FileNotFoundError(f"Config file not found: {config_path}")
     cfg = load_export_config(config_path)
     if preset_key:
-        resolved_key = PAPER_22_PRESET_KEY if str(preset_key) == "paper22" else str(preset_key)
+        aliases = {
+            "paper22": PAPER_22_PRESET_KEY,
+            "custom-paper22": PAPER_22_IMPROVED_PRESET_KEY,
+            "paper22-improved": PAPER_22_IMPROVED_PRESET_KEY,
+            "paper69": PAPER_69_PRESET_KEY,
+            "custom": SIMPLE_PRESET_KEY,
+            "simple": SIMPLE_PRESET_KEY,
+        }
+        resolved_key = aliases.get(str(preset_key), str(preset_key))
         cfg = apply_study_preset(cfg, resolved_key)
     return visualize_export_from_config(cfg)
 

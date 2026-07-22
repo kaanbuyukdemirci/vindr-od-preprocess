@@ -1,16 +1,61 @@
 from __future__ import annotations
 
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 
 from vindr_mammo.export import (
     _deterministic_selection_mode,
     _select_negative_fraction_candidates,
+    load_export_config,
     make_train_val_test_split,
 )
 from vindr_mammo.dash_app import _config_control_outputs, _config_control_values
-from vindr_mammo.presets import PAPER_22_PRESET_KEY, apply_study_preset
+from vindr_mammo.presets import (
+    PAPER_22_IMPROVED_PRESET_KEY,
+    PAPER_22_PRESET_KEY,
+    PAPER_69_PRESET_KEY,
+    SIMPLE_PRESET_KEY,
+    STUDY_PRESETS,
+    apply_study_preset,
+)
+
+
+def test_default_config_and_all_presets_use_vindr_data_parent() -> None:
+    config_path = Path(__file__).resolve().parents[1] / "config" / "export_config.yaml"
+    config = load_export_config(config_path)
+
+    assert config["paths"] == {
+        "data_root": "/mnt/t9/vindr-data/vindr",
+        "output_root": "/mnt/t9/vindr-data/preprocessed-vindr-v19",
+    }
+    expected_folders = {
+        PAPER_22_PRESET_KEY: "preprocessed-vindr-paper22-v2",
+        PAPER_22_IMPROVED_PRESET_KEY: "preprocessed-vindr-paper22-improved-v4",
+        PAPER_69_PRESET_KEY: "preprocessed-vindr-paper69-em-detr-v3",
+        SIMPLE_PRESET_KEY: "preprocessed-vindr-simple-preset-v1",
+    }
+    for preset_key, folder in expected_folders.items():
+        preset = apply_study_preset(config, preset_key)
+        assert preset["paths"]["data_root"] == "/mnt/t9/vindr-data/vindr"
+        assert preset["paths"]["output_root"] == f"/mnt/t9/vindr-data/{folder}"
+        assert preset["visualizations"]["output_dir"] == f"/mnt/t9/vindr-data/{folder}/visualizations"
+
+
+def test_user_facing_preset_names_identify_paper_or_custom_status() -> None:
+    assert STUDY_PRESETS[PAPER_22_PRESET_KEY]["label"] == (
+        "Paper 22 — closest available reproduction (v2; not exact)"
+    )
+    assert STUDY_PRESETS[PAPER_22_IMPROVED_PRESET_KEY]["label"] == (
+        "Custom Paper 22 — improved breast-balanced foreground crops (v4)"
+    )
+    assert STUDY_PRESETS[PAPER_69_PRESET_KEY]["label"] == (
+        "Paper 69 — closest available reproduction (v3; not exact)"
+    )
+    assert STUDY_PRESETS[SIMPLE_PRESET_KEY]["label"] == (
+        "Custom — balanced 1024 crops + paired whole breast (v1)"
+    )
 
 
 def test_paper_22_preset_preserves_data_parent_and_sets_reported_patch_recipe() -> None:

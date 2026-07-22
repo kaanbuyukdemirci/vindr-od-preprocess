@@ -1,5 +1,16 @@
 # Paper 22 VinDr-Mammo preset audit
 
+> This audit applies to the original paper-like preset alias `paper22` and its
+> `preprocessed-vindr-paper22-v2` output. A second GUI/CLI preset,
+> `Custom Paper 22 — improved breast-balanced foreground crops (v4)` (CLI alias
+> `custom-paper22`) is a deliberately custom subset: patient-safe breast
+> expansion, strict `>10%` breast-mask coverage for train/validation/test crops,
+> and exact 50/50 training-crop balance by `(study_id, laterality)` breast
+> status. Validation/test retain every grid candidate that passes the same mask
+> rule. See
+> [`PAPER22_MODEL_DATA_HANDOFF.md`](PAPER22_MODEL_DATA_HANDOFF.md) before choosing
+> a dataset; the two versions must not be mixed or described as equivalent.
+
 Paper: Bulatović et al., *Refining YOLOv8 for Full Field Digital
 Mammograms: Improving Small Object Detection through Resolution-Preserving
 Patched Inference* (RCAR 2025), DOI
@@ -93,6 +104,27 @@ strict gates and the model repository's strict Paper 22 dataset audit at 100%
 source-annotation coverage. All 65 generated PNGs were 640×640 replicated RGB,
 and every generated COCO annotation was source-traceable.
 
+## Materialized v2 acceptance audit (2026-07-21)
+
+The completed export at `/mnt/t9/vindr-data/preprocessed-vindr-paper22-v2` passed the
+internal strict contract and the model repository's independent strict audit
+with zero errors/warnings and 100% source-annotation coverage in every split.
+A separate file-level audit checked all 11,823 PNGs and found:
+
+- exact COCO/image/YOLO/metadata filename sets and 11,823 empty-or-populated
+  label files;
+- 4,355/2,948/4,520 train/validation/test tiles and 1,862/319/514 tile boxes;
+- 640×640 uint8 RGB rasters with identical R/G/B channels for every tile;
+- valid in-bounds COCO boxes, matching YOLO boxes, matching metadata boxes, and
+  matching independently reconstructed source-to-tile transforms;
+- disjoint study and source-image IDs across all splits; and
+- no missing or extra metadata row.
+
+The materialized v2 dataset is accepted for model use. The model project's
+committed Paper 22 experiment is pinned to
+`/mnt/t9/vindr-data/preprocessed-vindr-paper22-v2/square_crops`. See
+[Paper 22 model-project data handoff](PAPER22_MODEL_DATA_HANDOFF.md).
+
 ## Usage
 
 From the repository root:
@@ -111,7 +143,7 @@ After the full export, run the model-project gate:
 
 ```bash
 python /home/kaan/Desktop/vindr-od-many/scripts/audit_paper22.py \
-  /mnt/t9/preprocessed-vindr-paper22-v2/square_crops \
+  /mnt/t9/vindr-data/preprocessed-vindr-paper22-v2/square_crops \
   --strict --min-coverage 1.0 \
   --json-output /tmp/paper22-v2-audit.json
 ```

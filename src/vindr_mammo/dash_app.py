@@ -7,22 +7,33 @@ import io
 import json
 import logging
 import re
-import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-import torch
 import yaml
 from dash import ALL, Dash, Input, Output, State, callback_context, dcc, html, no_update
 from dash.exceptions import PreventUpdate
 from PIL import Image
 
 from .dataset import VindrMammoDataset
-from .export import export_from_config, load_export_config
-from .presets import STUDY_PRESETS, apply_study_preset
+from .export import load_export_config, make_train_val_test_split, normalize_split_strategy_kwargs
+from .export_queue import (
+    DuplicateOutputRootError,
+    ExportQueueManager,
+    InvalidJobStateError,
+    QueueJobNotFoundError,
+)
+from .presets import (
+    PAPER_22_IMPROVED_PRESET_KEY,
+    PAPER_69_PRESET_KEY,
+    SIMPLE_PRESET_KEY,
+    STUDY_PRESETS,
+    apply_study_preset,
+)
+from .storage import estimate_export_space, format_bytes, get_disk_space
 
 logging.getLogger("streamlit").setLevel(logging.ERROR)
 logging.getLogger("streamlit.runtime").setLevel(logging.ERROR)
@@ -61,6 +72,7 @@ from .gui_app import (
     _prepare_sample,
     _saved_viewer_caption,
     _source_crops_from_result,
+    _source_full_images_from_result,
     _stats_table,
     _streamlit_json_safe,
     _to_uint8_percentile,
@@ -367,7 +379,7 @@ PARAM_HELP: dict[str, dict[str, str]] = {
     "export_path": {
         "title": "Export Output Path",
         "body": "Parent folder plus dataset folder name becomes paths.output_root in the generated export config.",
-        "example": "/mnt/t9 plus preprocessed-vindr-v4 writes to /mnt/t9/preprocessed-vindr-v4.",
+        "example": "/mnt/t9/vindr-data plus preprocessed-vindr-v4 writes to /mnt/t9/vindr-data/preprocessed-vindr-v4.",
     },
     "clean_output": {
         "title": "Delete Output Folder",
@@ -650,7 +662,7 @@ DEFAULT_VISUAL_OPS: dict[str, dict[int, str]] = {}
 DATASET_OBJECT_CACHE: dict[str, VindrMammoDataset] = {}
 
 
-EXPORT_JOBS: dict[str, dict[str, Any]] = {}
+EXPORT_QUEUE = ExportQueueManager()
 DATASET_METADATA_CACHE: dict[str, dict[str, Any]] = {}
 PREVIEW_SAMPLE_CACHE: dict[str, dict[str, Any]] = {}
 
@@ -731,7 +743,13 @@ def _layout(config_path: Path, cfg: dict[str, Any]) -> html.Div:
             dcc.Store(id="pipeline-store", data=_initial_pipeline(cfg)),
             dcc.Store(id="pipeline-mode", data="yaml"),
             dcc.Store(id="selected-help-store", data="config_path"),
+            dcc.Store(id="space-estimate-store", data={}),
+            dcc.Store(id="active-export-job-store", data=None),
             dcc.Interval(id="job-poll", interval=1200, disabled=True),
+            # Keep queue/disk monitoring live in a separately opened browser
+            # window even though that client did not click a queue action.
+            dcc.Interval(id="queue-poll", interval=1200, disabled=False),
+            dcc.Location(id="page-location", refresh=False),
             _style_block(),
             html.A(id="download-link", download="current_preprocessing.yaml", href="", style={"display": "none"}),
             html.Header(
@@ -800,6 +818,7 @@ def _layout(config_path: Path, cfg: dict[str, Any]) -> html.Div:
                                     ),
                                     dcc.Tab(label="Final View", value="crops", children=html.Div(_crop_controls_dash(cfg), className="controls-body")),
                                     dcc.Tab(label="Save Data", value="export", children=html.Div(_export_controls_dash(cfg), className="controls-body")),
+                                    dcc.Tab(label="Storage & Queue", value="queue", children=html.Div(_queue_controls_dash(cfg), className="controls-body")),
                                     dcc.Tab(label="Saved Viewer", value="saved", children=html.Div(_saved_controls_dash(cfg), className="controls-body")),
                                     dcc.Tab(label="Manifest", value="manifests", children=html.Div(_manifest_controls_dash(), className="controls-body")),
                                     dcc.Tab(label="Guide", value="guide", children=html.Div(_guide_controls_dash(), className="controls-body")),
@@ -842,6 +861,7 @@ def _layout(config_path: Path, cfg: dict[str, Any]) -> html.Div:
                                             {"label": "Dataset visualizations", "value": "visualizations"},
                                             {"label": "Saved dataset viewer", "value": "saved"},
                                             {"label": "Manifest tools", "value": "manifest"},
+                                            {"label": "Storage & queue", "value": "queue"},
                                         ],
                                         value="single",
                                         inline=True,
@@ -1177,6 +1197,100 @@ def _register_callbacks(app: Dash) -> None:
         return "Export will save square_crops data because Final View is set to square crop."
 
     @app.callback(
+        Output("split-val-fraction", "disabled"),
+        Output("split-validation-study-count", "disabled"),
+        Output("split-validation-image-count", "disabled"),
+        Output("split-stratify-birads", "options"),
+        Input("split-strategy", "value"),
+        prevent_initial_call=False,
+    )
+    def _split_control_mode(strategy: str) -> tuple[bool, bool, bool, list[dict[str, Any]]]:
+        strategy = str(strategy or "random_study_fraction")
+        official_only = strategy == "official_only"
+        random_fraction = strategy == "random_study_fraction"
+        return (
+            not random_fraction,
+            strategy != "exact_study_count",
+            strategy != "exact_study_count",
+            [{
+                "label": "Enabled",
+                "value": "on",
+                "disabled": official_only,
+            }],
+        )
+
+    @app.callback(
+        Output("split-assignment-summary", "children"),
+        Input("dataset-store", "data"),
+        Input("config-store", "data"),
+        Input("split-strategy", "value"),
+        Input("split-val-fraction", "value"),
+        Input("split-validation-study-count", "value"),
+        Input("split-validation-image-count", "value"),
+        Input("split-seed", "value"),
+        Input("split-stratify-birads", "value"),
+        prevent_initial_call=False,
+    )
+    def _preview_split_assignment(
+        dataset_store: dict[str, Any],
+        cfg: dict[str, Any],
+        strategy: str,
+        val_fraction: float,
+        validation_study_count: int,
+        validation_image_count: int,
+        seed: int,
+        stratify: list[str],
+    ) -> Any:
+        params = {
+            "split_strategy": strategy,
+            "split_val_fraction": val_fraction,
+            "split_validation_study_count": validation_study_count,
+            "split_validation_image_count": validation_image_count,
+            "split_seed": seed,
+            "split_stratify_birads": stratify,
+        }
+        split_cfg = _split_config_from_params(params)
+        records = list((dataset_store or {}).get("records", []) or [])
+        if not records:
+            if split_cfg["strategy"] == "official_only":
+                return html.Div("Original VinDr membership selected: validation will be empty.", className="warning note")
+            return html.Div("Load dataset metadata with Render / refresh to see projected split counts.", className="note")
+        try:
+            cohort_cfg = dict((cfg or {}).get("source_cohort", {}) or {})
+            split_input_records = records
+            if bool(cohort_cfg.get("positive_images_only", False)):
+                split_input_records = [
+                    record for record in records if bool(record.get("has_mass", False))
+                ]
+            split_records, _ = make_train_val_test_split(
+                split_input_records,
+                **normalize_split_strategy_kwargs(split_cfg),
+            )
+            if bool(cohort_cfg.get("train_expand_to_all_patient_breast_views", False)):
+                train_studies = {
+                    str(record.get("study_id", ""))
+                    for record in split_records.get("train", [])
+                }
+                split_records["train"] = [
+                    record
+                    for record in records
+                    if str(record.get("split", "training")).casefold().strip() != "test"
+                    and str(record.get("study_id", "")) in train_studies
+                ]
+        except Exception as exc:
+            return html.Div(f"Split settings are invalid: {exc}", className="error note")
+        metrics = []
+        for split_name in ["train", "val", "test"]:
+            rows = split_records.get(split_name, [])
+            studies = {str(row.get("study_id", "")) for row in rows}
+            metrics.append(_metric(split_name.capitalize(), f"{len(rows):,} images / {len(studies):,} studies"))
+        note = (
+            "Counts include the configured source cohort and patient-level training expansion, before vendor filters. "
+            "The official test membership is unchanged."
+        )
+        return html.Div([html.Div(metrics, className="metric-row"), html.Div(note, className="note")])
+
+    @app.callback(
         Output("dataset-store", "data"),
         Output("dataset-summary", "children"),
         Output("render-status", "children"),
@@ -1269,6 +1383,15 @@ def _register_callbacks(app: Dash) -> None:
             return _render_visualizations(cfg)
         if mode == "manifest":
             return _render_manifest_tools(params, cfg)
+        if mode == "queue":
+            return html.Div([
+                html.H2("Storage and extraction queue"),
+                html.P("Use the Storage & Queue control tab to estimate, add, start, remove, or retry pipelines."),
+                html.Div(
+                    id="queue-window-table",
+                    children=_queue_table_children(EXPORT_QUEUE.snapshot()),
+                ),
+            ])
         if not dataset_store or not dataset_store.get("ok"):
             return html.Div("Load a valid config and click Render / refresh to load dataset metadata.", className="note")
         try:
@@ -1313,54 +1436,243 @@ def _register_callbacks(app: Dash) -> None:
     @app.callback(
         Output("export-status", "children"),
         Output("job-poll", "disabled"),
+        Output("active-export-job-store", "data"),
         Input("export-start-button", "n_clicks"),
         State("config-store", "data"),
         State("dataset-store", "data"),
         *_all_preview_states(),
         prevent_initial_call=True,
     )
-    def _start_export(_n: int, cfg: dict[str, Any], dataset_store: dict[str, Any], *state: Any) -> tuple[Any, bool]:
+    def _start_export(
+        _n: int,
+        cfg: dict[str, Any],
+        dataset_store: dict[str, Any],
+        *state: Any,
+    ) -> tuple[Any, bool, Any]:
         params = _state_to_params(state)
         if not params.get("export_confirm"):
-            return html.Div("Check the confirmation box before starting export.", className="warning note"), True
+            return (
+                html.Div(
+                    "Check the confirmation box before starting export.",
+                    className="warning note",
+                ),
+                True,
+                no_update,
+            )
         records = pd.DataFrame((dataset_store or {}).get("records", []))
         try:
             export_cfg = _build_export_cfg_from_params(cfg or {}, records, params)
         except Exception as exc:
-            return html.Div(f"Could not build export config: {exc}", className="error note"), True
-        job_id = str(int(time.time() * 1000))
-        EXPORT_JOBS[job_id] = {"status": "running", "started": time.time(), "result": None, "error": ""}
-
-        def _worker() -> None:
-            try:
-                result = export_from_config(export_cfg)
-                EXPORT_JOBS[job_id].update({"status": "complete", "result": _jsonable({"output_root": str(result.output_root), "summary": result.summary})})
-            except Exception as exc:  # pragma: no cover - depends on local data
-                EXPORT_JOBS[job_id].update({"status": "failed", "error": str(exc)})
-
-        threading.Thread(target=_worker, daemon=True).start()
-        return html.Div([html.Div(f"Export started. Job id: {job_id}", className="note"), dcc.Store(id="active-job", data=job_id)]), False
+            return (
+                html.Div(f"Could not build export config: {exc}", className="error note"),
+                True,
+                no_update,
+            )
+        try:
+            estimate = estimate_export_space(export_cfg, (dataset_store or {}).get("records", []))
+            job_id = EXPORT_QUEUE.enqueue(
+                export_cfg,
+                name=str(params.get("export_name") or "export"),
+                estimated_bytes=estimate.estimated_bytes,
+                metadata={"estimate": estimate.as_dict(), "started_from": "Save Data"},
+            )
+            EXPORT_QUEUE.start()
+        except Exception as exc:
+            return (
+                html.Div(f"Could not start queued export: {exc}", className="error note"),
+                True,
+                no_update,
+            )
+        return (
+            html.Div(f"Export queued and started. Job id: {job_id}", className="note"),
+            False,
+            job_id,
+        )
 
     @app.callback(
         Output("export-status", "children", allow_duplicate=True),
         Output("job-poll", "disabled", allow_duplicate=True),
         Input("job-poll", "n_intervals"),
         State("export-status", "children"),
+        State("active-export-job-store", "data"),
         prevent_initial_call=True,
     )
-    def _poll_export(_ticks: int, current: Any) -> tuple[Any, bool]:
-        running = [(k, v) for k, v in EXPORT_JOBS.items() if v.get("status") == "running"]
-        if running:
-            job_id, job = running[-1]
-            elapsed = time.time() - float(job.get("started", time.time()))
-            return html.Div(f"Export running. Job id: {job_id}. Elapsed: {elapsed:.1f}s", className="note"), False
-        if EXPORT_JOBS:
-            job_id, job = list(EXPORT_JOBS.items())[-1]
-            if job.get("status") == "complete":
-                return html.Div([html.Div(f"Export complete. Job id: {job_id}", className="note"), html.Pre(json.dumps(job.get("result"), indent=2))]), True
-            if job.get("status") == "failed":
-                return html.Div(f"Export failed: {job.get('error')}", className="error note"), True
+    def _poll_export(
+        _ticks: int,
+        current: Any,
+        active_job_id: str | None,
+    ) -> tuple[Any, bool]:
+        if not active_job_id:
+            return current, True
+        try:
+            job = EXPORT_QUEUE.get_job(str(active_job_id))
+        except QueueJobNotFoundError:
+            return (
+                html.Div(
+                    f"Export queue item {active_job_id} is no longer retained.",
+                    className="warning note",
+                ),
+                True,
+            )
+        job_id = job.get("job_id")
+        status = str(job.get("status"))
+        if status in {"queued", "running"}:
+            detail = _queue_progress_text(job)
+            return html.Div(f"Export {status}. Job id: {job_id}. {detail}", className="note"), False
+        if status == "completed":
+            return html.Div([html.Div(f"Export complete. Job id: {job_id}", className="note"), html.Pre(json.dumps(job.get("result"), indent=2))]), True
+        if status == "failed":
+            return html.Div(f"Export failed: {job.get('error')}", className="error note"), True
         return current, True
+
+    @app.callback(
+        Output("mode", "value"),
+        Output("control-tabs", "value"),
+        Input("page-location", "search"),
+        prevent_initial_call=False,
+    )
+    def _open_queue_window(search: str | None) -> tuple[Any, Any]:
+        if "queue=1" in str(search or ""):
+            return "queue", "queue"
+        return no_update, no_update
+
+    @app.callback(
+        Output("disk-space-status", "children"),
+        Input("export-parent", "value"),
+        Input("export-name", "value"),
+        Input("queue-poll", "n_intervals"),
+        prevent_initial_call=False,
+    )
+    def _refresh_disk_space(parent: str, name: str, _tick: int) -> Any:
+        output_root = Path(str(parent or ".")) / str(name or "")
+        try:
+            disk = get_disk_space(output_root)
+            snapshot = EXPORT_QUEUE.snapshot()
+            reserved = sum(
+                int(job.get("estimated_bytes") or 0)
+                for job in snapshot.get("jobs", [])
+                if job.get("status") in {"queued", "running"}
+                and _same_disk_for_queue_path(job.get("output_root"), disk.device_id)
+            )
+            after = int(disk.free_bytes) - int(reserved)
+            cls = "warning note" if after < 0 else "note"
+            return html.Div(
+                className=cls,
+                children=[
+                    html.Div([html.Strong("Selected filesystem: "), str(disk.probe_path)]),
+                    html.Div(f"Free {format_bytes(disk.free_bytes)} of {format_bytes(disk.total_bytes)} ({disk.free_fraction:.1%})."),
+                    html.Div(f"Queued/running conservative reservations: {format_bytes(reserved)}. Predicted free after queue: {format_bytes(after)}."),
+                ],
+            )
+        except Exception as exc:
+            return html.Div(f"Could not read disk capacity for {output_root}: {exc}", className="error note")
+
+    @app.callback(
+        Output("space-estimate-store", "data"),
+        Output("space-estimate-status", "children"),
+        Input("estimate-space-button", "n_clicks"),
+        State("config-store", "data"),
+        State("dataset-store", "data"),
+        *_all_preview_states(),
+        prevent_initial_call=True,
+    )
+    def _estimate_current_pipeline(
+        _n: int,
+        cfg: dict[str, Any],
+        dataset_store: dict[str, Any],
+        *state: Any,
+    ) -> tuple[dict[str, Any], Any]:
+        params = _state_to_params(state)
+        records = pd.DataFrame((dataset_store or {}).get("records", []))
+        try:
+            effective = _build_export_cfg_from_params(cfg or {}, records, params)
+            estimate = estimate_export_space(effective, records)
+            payload = estimate.as_dict()
+            payload["output_root"] = str(effective.get("paths", {}).get("output_root", ""))
+            return payload, _estimate_summary_children(payload)
+        except Exception as exc:
+            return {}, html.Div(f"Space estimate failed: {exc}", className="error note")
+
+    @app.callback(
+        Output("queue-action-status", "children"),
+        Output("queue-poll", "disabled"),
+        Input("enqueue-pipeline-button", "n_clicks"),
+        Input("queue-start-button", "n_clicks"),
+        Input("queue-remove-button", "n_clicks"),
+        Input("queue-retry-button", "n_clicks"),
+        State("space-estimate-store", "data"),
+        State("queue-selected-job", "value"),
+        State("queue-job-name", "value"),
+        State("config-store", "data"),
+        State("dataset-store", "data"),
+        *_all_preview_states(),
+        prevent_initial_call=True,
+    )
+    def _queue_action(
+        _enqueue: int,
+        _start: int,
+        _remove: int,
+        _retry: int,
+        estimate_payload: dict[str, Any],
+        selected_job: str | None,
+        job_name: str,
+        cfg: dict[str, Any],
+        dataset_store: dict[str, Any],
+        *state: Any,
+    ) -> tuple[Any, bool]:
+        trigger = callback_context.triggered_id
+        try:
+            if trigger == "enqueue-pipeline-button":
+                params = _state_to_params(state)
+                records = pd.DataFrame((dataset_store or {}).get("records", []))
+                effective = _build_export_cfg_from_params(cfg or {}, records, params)
+                estimate = estimate_export_space(effective, records)
+                job_id = EXPORT_QUEUE.enqueue(
+                    effective,
+                    name=str(job_name or params.get("export_name") or "pipeline"),
+                    estimated_bytes=estimate.estimated_bytes,
+                    metadata={"estimate": estimate.as_dict(), "estimate_preview": estimate_payload or {}},
+                )
+                return html.Div(f"Added pipeline {job_id} to the queue. Its config is now frozen.", className="note"), False
+            if trigger == "queue-start-button":
+                EXPORT_QUEUE.start()
+                return html.Div("Queue worker started. Jobs run one at a time in FIFO order.", className="note"), False
+            if not selected_job:
+                return html.Div("Select a queue item first.", className="warning note"), False
+            if trigger == "queue-remove-button":
+                EXPORT_QUEUE.remove(str(selected_job))
+                return html.Div(f"Removed queue item {selected_job}.", className="note"), False
+            if trigger == "queue-retry-button":
+                EXPORT_QUEUE.retry(str(selected_job))
+                EXPORT_QUEUE.start()
+                return html.Div(f"Requeued failed item {selected_job}.", className="note"), False
+        except Exception as exc:
+            return html.Div(str(exc), className="error note"), False
+        raise PreventUpdate
+
+    @app.callback(
+        Output("queue-table", "children"),
+        Output("queue-selected-job", "options"),
+        Output("queue-selected-job", "value"),
+        Output("queue-window-table", "children"),
+        Input("queue-poll", "n_intervals"),
+        State("queue-selected-job", "value"),
+        prevent_initial_call=False,
+    )
+    def _poll_queue_view(
+        _tick: int,
+        selected: str | None,
+    ) -> tuple[Any, list[dict[str, str]], str | None, Any]:
+        snapshot = EXPORT_QUEUE.snapshot()
+        jobs = snapshot.get("jobs", [])
+        options = [
+            {"label": f"{job.get('name')} — {job.get('status')} — {str(job.get('job_id'))[:8]}", "value": str(job.get("job_id"))}
+            for job in jobs
+        ]
+        ids = {item["value"] for item in options}
+        value = selected if selected in ids else (options[-1]["value"] if options else None)
+        table = _queue_table_children(snapshot)
+        return table, options, value, table
 
 
 def _preview_controls_dash(cfg: dict[str, Any]) -> Any:
@@ -1425,7 +1737,7 @@ def _preprocess_controls(cfg: dict[str, Any]) -> Any:
                 open=True,
                 children=[
                     html.Summary("Mask operation parameters"),
-                    _field("Mask method", dcc.Dropdown(id="pp-mask-method", options=["largest_connected_tissue", "percentile_threshold_largest_component", "otsu_largest_connected_component"], value=str(pp.get("breast_mask_method", "largest_connected_tissue")), clearable=False), "breast_mask_method"),
+                    _field("Mask method", dcc.Dropdown(id="pp-mask-method", options=["largest_connected_tissue", "percentile_threshold_largest_component", "otsu_largest_connected_component", "mammo_clip_contiguous_variance"], value=str(pp.get("breast_mask_method", "largest_connected_tissue")), clearable=False), "breast_mask_method"),
                     _field("Open kernel", dcc.Dropdown(id="pp-open-kernel", options=[0, 3, 5, 7, 9, 11, 15], value=int(pp.get("breast_mask_open_kernel", 7) or 7), clearable=False), "breast_mask_open_kernel"),
                     _field("Close kernel", dcc.Dropdown(id="pp-close-kernel", options=[0, 7, 11, 15, 21, 31, 41], value=int(pp.get("breast_mask_close_kernel", 21) or 21), clearable=False), "breast_mask_close_kernel"),
                     _check("pp-fill-holes", "Fill breast-mask holes", bool(pp.get("breast_mask_fill_holes", True)), "breast_mask_fill_holes"),
@@ -1482,6 +1794,18 @@ def _crop_controls_dash(cfg: dict[str, Any]) -> Any:
                                 _field("Final crop resize", _number("final-crop-resize", int(crop.get("crop_size", 1024)), min_=128, max_=4096, step=128), "crop_size"),
                                 _field("Deterministic stride", _number("crop-stride", int(crop.get("stride", 512)), min_=64, max_=4096, step=64), "stride"),
                             ]),
+                            _field(
+                                "Sliding-window edge behavior",
+                                dcc.RadioItems(
+                                    id="crop-edge-policy",
+                                    options=[
+                                        {"label": "Move final window back to align with image edge (legacy)", "value": "edge_align"},
+                                        {"label": "Keep the exact stride and zero-pad pixels outside the image", "value": "regular_stride_pad"},
+                                    ],
+                                    value="regular_stride_pad" if str(crop.get("edge_policy", "edge_align")) in {"regular_stride_pad", "pad"} else "edge_align",
+                                ),
+                                "stride",
+                            ),
                             _field("Preview crop proposal mode", dcc.RadioItems(id="preview-mode", options=[{"label": "deterministic sliding", "value": "deterministic"}, {"label": "stochastic random", "value": "random"}, {"label": "bbox-safe breast-biased random", "value": "bbox_safe_random"}], value=str(crop.get("train_crop_mode", "deterministic")), inline=False), "preview_mode"),
                             _check("only-mass-crops", "Preview only: show only crops with visible mass", False, "only_mass_crops"),
                             _field("Preview positive crop threshold", _number("positivity-threshold", float(policy.get("min_box_visibility", 0.30)), min_=0, max_=1, step=0.05), "positivity_threshold"),
@@ -1515,8 +1839,93 @@ def _crop_controls_dash(cfg: dict[str, Any]) -> Any:
                 id="foreground-crop-options-panel",
                 children=[
                     html.Summary("Foreground-ratio crop filter"),
-                    _check("require-foreground", "Require crop to contain breast foreground", bool(crop.get("deterministic_require_foreground", False)), "require_foreground"),
-                    _field("Minimum foreground fraction in crop", _number("min-foreground-fraction", float(crop.get("deterministic_min_foreground_fraction", 0.05)), min_=0, max_=1, step=0.01), "min_foreground_fraction"),
+                    html.Div(
+                        className="grid-3",
+                        children=[
+                            html.Div([
+                                html.H4("Train"),
+                                _check(
+                                    "require-foreground",
+                                    "Filter by breast coverage",
+                                    bool(crop.get(
+                                        "train_require_min_breast_fraction_for_all_crops",
+                                        crop.get("deterministic_require_foreground", False),
+                                    )),
+                                    "require_foreground",
+                                ),
+                                _field(
+                                    "Minimum breast fraction",
+                                    _number(
+                                        "min-foreground-fraction",
+                                        float(crop.get(
+                                            "train_min_breast_fraction_for_all_crops",
+                                            crop.get("deterministic_min_foreground_fraction", 0.05),
+                                        )),
+                                        min_=0,
+                                        max_=1,
+                                        step=0.01,
+                                    ),
+                                    "min_foreground_fraction",
+                                ),
+                            ]),
+                            html.Div([
+                                html.H4("Validation"),
+                                _check(
+                                    "val-require-foreground",
+                                    "Filter by breast coverage",
+                                    bool(crop.get(
+                                        "val_require_min_breast_fraction_for_all_crops",
+                                        crop.get("deterministic_require_foreground", False),
+                                    )),
+                                    "require_foreground",
+                                ),
+                                _field(
+                                    "Minimum breast fraction",
+                                    _number(
+                                        "val-min-foreground-fraction",
+                                        float(crop.get(
+                                            "val_min_breast_fraction_for_all_crops",
+                                            crop.get("deterministic_min_foreground_fraction", 0.05),
+                                        )),
+                                        min_=0,
+                                        max_=1,
+                                        step=0.01,
+                                    ),
+                                    "min_foreground_fraction",
+                                ),
+                            ]),
+                            html.Div([
+                                html.H4("Test"),
+                                _check(
+                                    "test-require-foreground",
+                                    "Filter by breast coverage",
+                                    bool(crop.get(
+                                        "test_require_min_breast_fraction_for_all_crops",
+                                        crop.get("deterministic_require_foreground", False),
+                                    )),
+                                    "require_foreground",
+                                ),
+                                _field(
+                                    "Minimum breast fraction",
+                                    _number(
+                                        "test-min-foreground-fraction",
+                                        float(crop.get(
+                                            "test_min_breast_fraction_for_all_crops",
+                                            crop.get("deterministic_min_foreground_fraction", 0.05),
+                                        )),
+                                        min_=0,
+                                        max_=1,
+                                        step=0.01,
+                                    ),
+                                    "min_foreground_fraction",
+                                ),
+                            ]),
+                        ],
+                    ),
+                    html.Div(
+                        "Each split is independent. A threshold of 0.10 with strict comparison keeps only crops with more than 10% retained breast-mask coverage.",
+                        className="note",
+                    ),
                     _field("Foreground threshold mode", dcc.RadioItems(id="fg-threshold-mode", options=["auto", "manual"], value="auto" if crop.get("deterministic_foreground_threshold", None) is None else "manual", inline=True), "foreground_threshold"),
                     _field("Manual foreground threshold", _number("fg-threshold", float(crop.get("deterministic_foreground_threshold", 0.0) or 0.0), step=0.01), "foreground_threshold"),
                     _check("show-foreground-mask", "Show foreground mask preview for selected crop", False, "show_foreground_mask"),
@@ -1670,6 +2079,19 @@ def _pipeline_step_row(stage: str, idx: int) -> html.Div:
                     clearable=False,
                 ),
                 "channel_steps",
+            ),
+            _field(
+                "Processing extent",
+                dcc.Checklist(
+                    id={"type": "stage-before-crop", "stage": stage, "idx": idx},
+                    options=[{
+                        "label": "Apply to whole fixed-preprocessed image before square cropping",
+                        "value": "on",
+                    }],
+                    value=[],
+                ),
+                "channel_steps",
+                "Unchecked keeps this method crop-local. Checked computes it on the whole breast, then extracts the crop.",
             ),
             _operation_settings(stage, idx),
         ],
@@ -1992,10 +2414,86 @@ def _pipeline_summary(pipeline: dict[str, Any]) -> Any:
     return html.Div(className="grid-3", children=children)
 
 
+def _split_strategy_from_config(split_cfg: dict[str, Any] | None) -> str:
+    split_cfg = dict(split_cfg or {})
+    explicit = str(split_cfg.get("strategy", "") or "").casefold().strip()
+    aliases = {
+        "official_only": "official_only",
+        "original": "official_only",
+        "original_official": "official_only",
+        "random_study_fraction": "random_study_fraction",
+        "study_fraction": "random_study_fraction",
+        "exact_study_count": "exact_study_count",
+        "count_matched": "exact_study_count",
+    }
+    if explicit in aliases:
+        return aliases[explicit]
+    study_count = split_cfg.get("validation_study_count")
+    if study_count is not None:
+        return "official_only" if int(study_count) == 0 else "exact_study_count"
+    return (
+        "random_study_fraction"
+        if float(split_cfg.get("val_fraction_from_training", 0.0) or 0.0) > 0.0
+        else "official_only"
+    )
+
+
+def _split_config_from_params(params: dict[str, Any]) -> dict[str, Any]:
+    strategy = str(params.get("split_strategy") or "random_study_fraction")
+    if strategy not in {"official_only", "random_study_fraction", "exact_study_count"}:
+        strategy = "random_study_fraction"
+    try:
+        fraction = min(max(float(params.get("split_val_fraction") or 0.0), 0.0), 0.50)
+    except Exception:
+        fraction = 0.15
+    try:
+        study_count = max(0, int(params.get("split_validation_study_count") or 0))
+    except Exception:
+        study_count = 0
+    try:
+        image_count_raw = int(params.get("split_validation_image_count") or 0)
+    except Exception:
+        image_count_raw = 0
+    out = {
+        "strategy": strategy,
+        "val_fraction_from_training": fraction,
+        "validation_study_count": None,
+        "validation_image_count": None,
+        "seed": int(params.get("split_seed") or 123),
+        "stratify_by_birads": _is_on(params.get("split_stratify_birads")),
+    }
+    if strategy == "official_only":
+        out.update({
+            "val_fraction_from_training": 0.0,
+            "validation_study_count": 0,
+            "validation_image_count": 0,
+            "stratify_by_birads": False,
+        })
+    elif strategy == "exact_study_count":
+        out["validation_study_count"] = study_count
+        out["validation_image_count"] = image_count_raw if image_count_raw > 0 else None
+    return out
+
+
+def _split_signature(split_cfg: dict[str, Any] | None) -> tuple[Any, ...]:
+    split_cfg = dict(split_cfg or {})
+    return (
+        _split_strategy_from_config(split_cfg),
+        float(split_cfg.get("val_fraction_from_training", 0.0) or 0.0),
+        split_cfg.get("validation_study_count"),
+        split_cfg.get("validation_image_count"),
+        int(split_cfg.get("seed", 123) or 123),
+        bool(split_cfg.get("stratify_by_birads", False)),
+    )
+
+
 def _export_controls_dash(cfg: dict[str, Any]) -> Any:
     export_cfg = cfg.get("export", {}) or {}
-    current_output = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/preprocessed-vindr-gui")))
+    current_output = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/vindr-data/preprocessed-vindr-gui")))
     crop_cfg = cfg.get("square_crops", {}) or {}
+    paired_cfg = cfg.get("paired_whole_images", {}) or {}
+    split_cfg = cfg.get("splits", {}) or {}
+    split_strategy = _split_strategy_from_config(split_cfg)
     return html.Div(
         [
             html.Details(open=True, children=[
@@ -2011,6 +2509,102 @@ def _export_controls_dash(cfg: dict[str, Any]) -> Any:
                     style={"display": "none"},
                 ),
                 html.Div(id="export-mode-summary", className="note"),
+            ]),
+            html.Details(open=bool(paired_cfg.get("enabled", False)), children=[
+                html.Summary("Paired whole image for every crop"),
+                _check(
+                    "paired-whole-enabled",
+                    "Save a corresponding pad-first whole-breast image with every crop basename",
+                    bool(paired_cfg.get("enabled", False)),
+                ),
+                _field(
+                    "Paired whole target size",
+                    _number("paired-whole-size", int(paired_cfg.get("target_width", paired_cfg.get("size", 1024)) or 1024), min_=128, max_=4096, step=128),
+                    "crop_size",
+                ),
+                _check(
+                    "paired-whole-hardlink",
+                    "Deduplicate repeated whole images with hard links when supported",
+                    str(paired_cfg.get("storage_mode", "hardlink")).casefold() in {"hardlink", "link", "deduplicate"},
+                ),
+                html.Div("The breast is padded to a square first and only then resized. Every companion is written under square_crops/whole_images/<split>/ using the crop's filename.", className="note"),
+            ]),
+            html.Details(open=True, children=[
+                html.Summary("Dataset train / validation / test assignment"),
+                _field(
+                    "Split policy",
+                    dcc.Dropdown(
+                        id="split-strategy",
+                        options=[
+                            {
+                                "label": "Random validation studies from official training (recommended)",
+                                "value": "random_study_fraction",
+                            },
+                            {
+                                "label": "Original VinDr train/test only (no validation)",
+                                "value": "official_only",
+                            },
+                            {
+                                "label": "Exact validation study count",
+                                "value": "exact_study_count",
+                            },
+                        ],
+                        value=split_strategy,
+                        clearable=False,
+                    ),
+                    None,
+                ),
+                html.Div(className="grid-3", children=[
+                    _field(
+                        "Validation fraction of official training studies",
+                        _number(
+                            "split-val-fraction",
+                            float(split_cfg.get("val_fraction_from_training", 0.15) or 0.0),
+                            min_=0.0,
+                            max_=0.50,
+                            step=0.01,
+                        ),
+                        None,
+                    ),
+                    _field(
+                        "Validation study count",
+                        _number(
+                            "split-validation-study-count",
+                            int(split_cfg.get("validation_study_count", 0) or 0),
+                            min_=0,
+                            step=1,
+                        ),
+                        None,
+                    ),
+                    _field(
+                        "Exact validation image count (0 = unconstrained)",
+                        _number(
+                            "split-validation-image-count",
+                            int(split_cfg.get("validation_image_count", 0) or 0),
+                            min_=0,
+                            step=1,
+                        ),
+                        None,
+                    ),
+                    _field(
+                        "Split seed",
+                        _number("split-seed", int(split_cfg.get("seed", 123) or 123), min_=0, step=1),
+                        None,
+                    ),
+                    _check(
+                        "split-stratify-birads",
+                        "Stratify validation studies by BI-RADS",
+                        bool(split_cfg.get("stratify_by_birads", True)),
+                    ),
+                ]),
+                html.Div(
+                    "VinDr provides official training and test cohorts, but no official validation cohort. "
+                    "The recommended mode samples complete studies from official training, so all views stay together, "
+                    "and leaves the official test set untouched. Original-only mode is the strict published membership "
+                    "and cannot support validation-based early stopping.",
+                    className="warning note",
+                ),
+                html.Div(id="split-assignment-summary", className="summary-box"),
             ]),
             html.Details(open=True, children=[
                 html.Summary("Split crop modes"),
@@ -2029,6 +2623,7 @@ def _export_controls_dash(cfg: dict[str, Any]) -> Any:
                         options=[
                             {"label": "All mass + sampled empty", "value": "positive_ratio"},
                             {"label": "All positive + fraction of negative candidates (training)", "value": "negative_fraction"},
+                            {"label": "50/50 crops by source breast status (training)", "value": "source_breast_ratio"},
                             {"label": "Mass only", "value": "mass_only"},
                             {"label": "All windows/candidates", "value": "all"},
                         ],
@@ -2052,7 +2647,9 @@ def _export_controls_dash(cfg: dict[str, Any]) -> Any:
                 html.Div(
                     "Target-ratio mode keeps all positive crops and samples empty crops toward the requested final ratio. "
                     "Negative-fraction mode instead keeps all positive training patches plus the requested fraction of "
-                    "eligible negative candidates; validation and test keep all eligible windows.",
+                    "eligible negative candidates. Source-breast mode defines a breast as patient/study + laterality, "
+                    "expands only selected training patients to all views, applies the visible breast-mask threshold "
+                    "strictly to train, validation, and test crops, excluding background-only marker regions.",
                     className="note",
                 ),
                 html.Div(
@@ -2078,8 +2675,53 @@ def _export_controls_dash(cfg: dict[str, Any]) -> Any:
     )
 
 
+def _queue_controls_dash(cfg: dict[str, Any]) -> Any:
+    output_root = Path(str(cfg.get("paths", {}).get("output_root", ".")))
+    return html.Div(
+        [
+            html.Details(open=True, children=[
+                html.Summary("Selected disk and estimate"),
+                html.Div(
+                    "Capacity follows the Export parent/folder selected in Save Data. "
+                    "The estimate is conservative because breast-crop dimensions and PNG compression vary.",
+                    className="note",
+                ),
+                html.Div(id="disk-space-status", className="summary-box"),
+                _field(
+                    "Queue item name",
+                    dcc.Input(id="queue-job-name", value=output_root.name or "extraction-pipeline", type="text", debounce=True),
+                    None,
+                ),
+                html.Div(className="config-actions", children=[
+                    html.Button("Estimate current pipeline", id="estimate-space-button", n_clicks=0),
+                    html.Button("Add current pipeline to queue", id="enqueue-pipeline-button", n_clicks=0, className="primary"),
+                ]),
+                html.Div(id="space-estimate-status"),
+            ]),
+            html.Details(open=True, children=[
+                html.Summary("Extraction queue"),
+                html.Div(
+                    "Queued configurations are frozen when added and run sequentially. A failed item does not stop the next one.",
+                    className="note",
+                ),
+                html.Div(className="config-actions", children=[
+                    html.Button("Start / continue queue", id="queue-start-button", n_clicks=0, className="primary"),
+                    html.A("Open queue in another window", href="/?queue=1", target="_blank", className="button-link"),
+                ]),
+                _field("Selected queue item", dcc.Dropdown(id="queue-selected-job", options=[], value=None, clearable=True), None),
+                html.Div(className="config-actions", children=[
+                    html.Button("Remove selected", id="queue-remove-button", n_clicks=0),
+                    html.Button("Retry selected failure", id="queue-retry-button", n_clicks=0),
+                ]),
+                html.Div(id="queue-action-status"),
+                html.Div(id="queue-table"),
+            ]),
+        ]
+    )
+
+
 def _saved_controls_dash(cfg: dict[str, Any]) -> Any:
-    default_root = str(cfg.get("paths", {}).get("output_root", "/mnt/t9/preprocessed-vindr-gui"))
+    default_root = str(cfg.get("paths", {}).get("output_root", "/mnt/t9/vindr-data/preprocessed-vindr-gui"))
     return html.Div(
         [
             _field("Exported dataset root or square_crops folder", dcc.Input(id="saved-root", value=default_root, type="text", debounce=True), None),
@@ -2119,16 +2761,18 @@ def _all_preview_states() -> list[State]:
         State("pp-padding-fraction", "value"), State("pp-padding-fixed", "value"), State("pp-min-padding", "value"), State("pp-max-padding", "value"), State("pp-threshold-mode", "value"),
         State("pp-threshold", "value"), State("pp-min-component", "value"), State("pp-mask-method", "value"), State("pp-open-kernel", "value"), State("pp-close-kernel", "value"),
         State("pp-fill-holes", "value"), State("pp-largest-component", "value"), State("pp-min-box-after-crop", "value"),
-        State("crop-size", "value"), State("crop-stride", "value"), State("preview-mode", "value"), State("only-mass-crops", "value"), State("positivity-threshold", "value"),
+        State("crop-size", "value"), State("crop-stride", "value"), State("crop-edge-policy", "value"), State("preview-mode", "value"), State("only-mass-crops", "value"), State("positivity-threshold", "value"),
         State("allow-partial", "value"), State("min-box-visibility", "value"), State("random-preview-count", "value"), State("random-seed", "value"), State("random-positive-fraction", "value"),
         State("center-shift-fraction", "value"), State("bbox-boundary-margin", "value"), State("bbox-random-shift", "value"), State("bbox-candidate-count", "value"), State("bbox-top-k", "value"),
         State("bbox-breast-bias", "value"), State("bbox-left-bias", "value"), State("bbox-projection-bias", "value"), State("require-foreground", "value"), State("min-foreground-fraction", "value"),
+        State("val-require-foreground", "value"), State("val-min-foreground-fraction", "value"), State("test-require-foreground", "value"), State("test-min-foreground-fraction", "value"),
         State("fg-threshold-mode", "value"), State("fg-threshold", "value"), State("show-foreground-mask", "value"),
         State("alignment-enabled", "value"), State("alignment-method", "value"), State("alignment-fallback", "value"), State("alignment-max-shift", "value"), State("alignment-min-overlap", "value"),
         State("alignment-min-score", "value"), State("alignment-score-margin", "value"), State("alignment-projection-smooth", "value"), State("alignment-boundary-smooth", "value"),
         State("pipeline-store", "data"), State("pipeline-yaml", "value"), State("pipeline-mode", "data"), State("common-steps-yaml", "value"),
         State({"type": "stage-source", "stage": ALL}, "value"),
         State({"type": "stage-op", "stage": ALL, "idx": ALL}, "value"),
+        State({"type": "stage-before-crop", "stage": ALL, "idx": ALL}, "value"),
         State({"type": "stage-lo", "stage": ALL, "idx": ALL}, "value"),
         State({"type": "stage-hi", "stage": ALL, "idx": ALL}, "value"),
         State({"type": "stage-kernel", "stage": ALL, "idx": ALL}, "value"),
@@ -2169,6 +2813,8 @@ def _all_preview_states() -> list[State]:
         State({"type": "stage-pectoral-fill", "stage": ALL, "idx": ALL}, "value"),
         State("whole-resize-mode", "value"), State("whole-resize-width", "value"), State("whole-resize-height", "value"), State("whole-pad-value", "value"), State("whole-pad-anchor", "value"),
         State("export-parent", "value"), State("export-name", "value"), State("clean-output", "value"), State("save-square-crops", "value"), State("save-baseline", "value"),
+        State("paired-whole-enabled", "value"), State("paired-whole-size", "value"), State("paired-whole-hardlink", "value"),
+        State("split-strategy", "value"), State("split-val-fraction", "value"), State("split-validation-study-count", "value"), State("split-validation-image-count", "value"), State("split-seed", "value"), State("split-stratify-birads", "value"),
         State("train-crop-mode", "value"), State("val-crop-mode", "value"), State("test-crop-mode", "value"), State("export-balance-mode", "value"), State("export-target-positive-ratio", "value"), State("export-negative-keep-fraction", "value"), State("export-vendor-mode", "value"), State("export-vendors", "value"), State("export-confirm", "value"),
         State("saved-root", "value"), State("saved-split", "value"), State("saved-positive", "value"), State("saved-search", "value"), State("saved-existing-only", "value"), State("saved-show-boxes", "value"), State("saved-index", "value"),
         State("manifest-paths", "value"),
@@ -2182,12 +2828,14 @@ def _config_control_outputs() -> list[Output]:
         "pp-padding-fraction", "pp-padding-fixed", "pp-min-padding", "pp-max-padding",
         "pp-threshold-mode", "pp-threshold", "pp-min-component", "pp-mask-method",
         "pp-open-kernel", "pp-close-kernel", "pp-fill-holes", "pp-largest-component",
-        "pp-min-box-after-crop", "crop-size", "final-crop-resize", "crop-stride", "preview-mode",
+        "pp-min-box-after-crop", "crop-size", "final-crop-resize", "crop-stride", "crop-edge-policy", "preview-mode",
         "only-mass-crops", "positivity-threshold", "allow-partial", "min-box-visibility",
         "random-preview-count", "random-seed", "random-positive-fraction",
         "center-shift-fraction", "bbox-boundary-margin", "bbox-random-shift",
         "bbox-candidate-count", "bbox-top-k", "bbox-breast-bias", "bbox-left-bias",
         "bbox-projection-bias", "require-foreground", "min-foreground-fraction",
+        "val-require-foreground", "val-min-foreground-fraction",
+        "test-require-foreground", "test-min-foreground-fraction",
         "fg-threshold-mode", "fg-threshold", "show-foreground-mask",
         "alignment-enabled", "alignment-method", "alignment-fallback",
         "alignment-max-shift", "alignment-min-overlap", "alignment-min-score",
@@ -2195,7 +2843,8 @@ def _config_control_outputs() -> list[Output]:
         "alignment-boundary-smooth", "whole-resize-mode", "whole-resize-width",
         "whole-resize-height", "whole-pad-value", "whole-pad-anchor",
         "export-parent", "export-name", "clean-output",
-        "save-square-crops", "save-baseline", "train-crop-mode", "val-crop-mode",
+        "save-square-crops", "save-baseline", "paired-whole-enabled", "paired-whole-size", "paired-whole-hardlink",
+        "split-strategy", "split-val-fraction", "split-validation-study-count", "split-validation-image-count", "split-seed", "split-stratify-birads", "train-crop-mode", "val-crop-mode",
         "test-crop-mode", "export-balance-mode", "export-target-positive-ratio", "export-negative-keep-fraction",
         "export-vendor-mode", "saved-root",
     ]
@@ -2213,8 +2862,10 @@ def _config_control_values(cfg: dict[str, Any]) -> tuple[Any, ...]:
     policy = cfg.get("crop_annotation_policy", {}) or {}
     export_cfg = cfg.get("export", {}) or {}
     baseline_cfg = cfg.get("baseline_uncropped", {}) or {}
+    paired_cfg = cfg.get("paired_whole_images", {}) or {}
+    split_cfg = cfg.get("splits", {}) or {}
     align = ((cfg.get("image_export", {}) or {}).get("contralateral_source_alignment", {}) or {})
-    current_output = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/preprocessed-vindr-gui")))
+    current_output = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/vindr-data/preprocessed-vindr-gui")))
     vendor_cfg = cfg.get("vendor_filter", {}) or {}
     padding_mode = "fractional" if pp.get("crop_padding", None) is None else "fixed"
     threshold_mode = "auto" if pp.get("crop_threshold", None) is None else "manual"
@@ -2248,6 +2899,7 @@ def _config_control_values(cfg: dict[str, Any]) -> tuple[Any, ...]:
         int(crop.get("crop_size", 1024)),
         int(crop.get("crop_size", 1024)),
         int(crop.get("stride", 512)),
+        "regular_stride_pad" if str(crop.get("edge_policy", "edge_align")) in {"regular_stride_pad", "pad"} else "edge_align",
         preview_mode,
         [],
         float(policy.get("min_box_visibility", 0.30)),
@@ -2264,8 +2916,30 @@ def _config_control_values(cfg: dict[str, Any]) -> tuple[Any, ...]:
         float(crop.get("bbox_safe_breast_bias_strength", 1.0)),
         float(crop.get("bbox_safe_left_bias_strength", 0.25)),
         float(crop.get("bbox_safe_projection_bias_strength", 0.25)),
-        _on_value(crop.get("deterministic_require_foreground", False)),
-        float(crop.get("deterministic_min_foreground_fraction", 0.05)),
+        _on_value(crop.get(
+            "train_require_min_breast_fraction_for_all_crops",
+            crop.get("deterministic_require_foreground", False),
+        )),
+        float(crop.get(
+            "train_min_breast_fraction_for_all_crops",
+            crop.get("deterministic_min_foreground_fraction", 0.05),
+        )),
+        _on_value(crop.get(
+            "val_require_min_breast_fraction_for_all_crops",
+            crop.get("deterministic_require_foreground", False),
+        )),
+        float(crop.get(
+            "val_min_breast_fraction_for_all_crops",
+            crop.get("deterministic_min_foreground_fraction", 0.05),
+        )),
+        _on_value(crop.get(
+            "test_require_min_breast_fraction_for_all_crops",
+            crop.get("deterministic_require_foreground", False),
+        )),
+        float(crop.get(
+            "test_min_breast_fraction_for_all_crops",
+            crop.get("deterministic_min_foreground_fraction", 0.05),
+        )),
         fg_threshold_mode,
         float(crop.get("deterministic_foreground_threshold", 0.0) or 0.0),
         [],
@@ -2288,6 +2962,15 @@ def _config_control_values(cfg: dict[str, Any]) -> tuple[Any, ...]:
         _on_value(export_cfg.get("clean_output_root", False)),
         _on_value(export_cfg.get("save_square_crops", True)),
         _on_value(export_cfg.get("save_baseline_uncropped", False)),
+        _on_value(paired_cfg.get("enabled", False)),
+        int(paired_cfg.get("target_width", paired_cfg.get("size", 1024)) or 1024),
+        _on_value(str(paired_cfg.get("storage_mode", "hardlink")).casefold() in {"hardlink", "link", "deduplicate"}),
+        _split_strategy_from_config(split_cfg),
+        float(split_cfg.get("val_fraction_from_training", 0.15) or 0.0),
+        int(split_cfg.get("validation_study_count", 0) or 0),
+        int(split_cfg.get("validation_image_count", 0) or 0),
+        int(split_cfg.get("seed", 123) or 123),
+        _on_value(split_cfg.get("stratify_by_birads", False)),
         str(crop.get("train_crop_mode", "deterministic")),
         str(crop.get("val_crop_mode", "deterministic")),
         str(crop.get("test_crop_mode", "deterministic")),
@@ -2295,7 +2978,7 @@ def _config_control_values(cfg: dict[str, Any]) -> tuple[Any, ...]:
         float(crop.get("train_deterministic_target_positive_ratio", crop.get("deterministic_target_positive_ratio", crop.get("positive_fraction", 0.50)))),
         float(crop.get("train_deterministic_negative_keep_fraction", crop.get("deterministic_negative_keep_fraction", 0.20))),
         "selected vendors only" if bool(vendor_cfg.get("enabled", False)) else "all vendors",
-        str(cfg.get("paths", {}).get("output_root", "/mnt/t9/preprocessed-vindr-gui")),
+        str(cfg.get("paths", {}).get("output_root", "/mnt/t9/vindr-data/preprocessed-vindr-gui")),
     )
 
 
@@ -2306,12 +2989,15 @@ def _state_to_params(values: tuple[Any, ...]) -> dict[str, Any]:
         "show_annotations", "display_low", "display_high", "visible_channels", "show_channel_panels",
         "pp_invert", "pp_crop_breast", "pp_mask_outside", "pp_mirror", "pp_padding_mode", "pp_padding_fraction", "pp_padding_fixed", "pp_min_padding", "pp_max_padding",
         "pp_threshold_mode", "pp_threshold", "pp_min_component", "pp_mask_method", "pp_open_kernel", "pp_close_kernel", "pp_fill_holes", "pp_largest_component", "pp_min_box_after_crop",
-        "crop_size", "crop_stride", "preview_mode", "only_mass_crops", "positivity_threshold", "allow_partial", "min_box_visibility", "random_preview_count", "random_seed",
+        "crop_size", "crop_stride", "crop_edge_policy", "preview_mode", "only_mass_crops", "positivity_threshold", "allow_partial", "min_box_visibility", "random_preview_count", "random_seed",
         "random_positive_fraction", "center_shift_fraction", "bbox_boundary_margin", "bbox_random_shift", "bbox_candidate_count", "bbox_top_k", "bbox_breast_bias", "bbox_left_bias",
-        "bbox_projection_bias", "require_foreground", "min_foreground_fraction", "fg_threshold_mode", "fg_threshold", "show_foreground_mask",
+        "bbox_projection_bias", "require_foreground", "min_foreground_fraction",
+        "val_require_foreground", "val_min_foreground_fraction",
+        "test_require_foreground", "test_min_foreground_fraction",
+        "fg_threshold_mode", "fg_threshold", "show_foreground_mask",
         "alignment_enabled", "alignment_method", "alignment_fallback", "alignment_max_shift", "alignment_min_overlap", "alignment_min_score", "alignment_score_margin",
         "alignment_projection_smooth", "alignment_boundary_smooth", "pipeline", "pipeline_yaml", "pipeline_mode", "common_steps_yaml",
-        "stage_sources", "stage_ops", "stage_los", "stage_his", "stage_kernels", "stage_sigmas", "stage_amounts", "stage_clips",
+        "stage_sources", "stage_ops", "stage_before_crop", "stage_los", "stage_his", "stage_kernels", "stage_sigmas", "stage_amounts", "stage_clips",
         "stage_tiles", "stage_histeq_excludes", "stage_histeq_los", "stage_histeq_his", "stage_outside_values", "stage_median_kernels", "stage_bilateral_diameters", "stage_sigma_colors", "stage_sigma_spaces",
         "stage_local_los", "stage_local_his", "stage_detail_sigmas", "stage_unsharp_sigmas", "stage_edge_los", "stage_edge_his",
         "stage_edge_kernels", "stage_kernel_shapes", "stage_morph_kernels", "stage_gammas", "stage_gains",
@@ -2319,7 +3005,9 @@ def _state_to_params(values: tuple[Any, ...]) -> dict[str, Any]:
         "stage_wiener_kernels", "stage_wiener_noises", "stage_sharpen_amounts", "stage_pectoral_sides",
         "stage_pectoral_widths", "stage_pectoral_heights", "stage_pectoral_fills",
         "whole_resize_mode", "whole_resize_width", "whole_resize_height", "whole_pad_value", "whole_pad_anchor",
-        "export_parent", "export_name", "clean_output", "save_square_crops", "save_baseline", "train_crop_mode", "val_crop_mode", "test_crop_mode", "export_balance_mode", "export_target_positive_ratio", "export_negative_keep_fraction", "export_vendor_mode", "export_vendors", "export_confirm",
+        "export_parent", "export_name", "clean_output", "save_square_crops", "save_baseline", "paired_whole_enabled", "paired_whole_size", "paired_whole_hardlink",
+        "split_strategy", "split_val_fraction", "split_validation_study_count", "split_validation_image_count", "split_seed", "split_stratify_birads",
+        "train_crop_mode", "val_crop_mode", "test_crop_mode", "export_balance_mode", "export_target_positive_ratio", "export_negative_keep_fraction", "export_vendor_mode", "export_vendors", "export_confirm",
         "saved_root", "saved_split", "saved_positive", "saved_search", "saved_existing_only", "saved_show_boxes", "saved_index", "manifest_paths",
     ]
     return dict(zip(keys, values, strict=False))
@@ -2472,6 +3160,7 @@ def _visual_pipeline_from_params(params: dict[str, Any]) -> dict[str, Any] | Non
     pectoral_heights = params.get("stage_pectoral_heights") or []
     pectoral_fills = params.get("stage_pectoral_fills") or []
     sources = params.get("stage_sources") or ["current_crop", "current_crop", "current_crop"]
+    before_crop_values = params.get("stage_before_crop") or []
     cursors: dict[str, int] = {}
 
     def _take_float(name: str, values: list[Any], default: float) -> float:
@@ -2604,7 +3293,11 @@ def _visual_pipeline_from_params(params: dict[str, Any]) -> dict[str, Any] | Non
             pectoral_height=pectoral_height, pectoral_fill=pectoral_fill,
             histeq_exclude=histeq_exclude, histeq_lo=histeq_lo, histeq_hi=histeq_hi,
         )
-        stage_steps[stage].append({"op": op, "params": params_for_op})
+        stage_steps[stage].append({
+            "op": op,
+            "params": params_for_op,
+            "apply_before_crop": _is_on(before_crop_values[flat_idx]) if flat_idx < len(before_crop_values) else False,
+        })
 
     source_by_channel = {
         "R": str(sources[0] if len(sources) > 0 else "current_crop"),
@@ -2831,6 +3524,7 @@ def _crop_controls_from_params(params: dict[str, Any]) -> dict[str, Any]:
         "mode": str(params.get("preview_mode") or "deterministic"),
         "crop_size": int(params.get("crop_size") or 1024),
         "stride": int(params.get("crop_stride") or 512),
+        "edge_policy": str(params.get("crop_edge_policy") or "edge_align"),
         "allow_partial_annotations": _is_on(params.get("allow_partial")),
         "min_box_visibility": float(params.get("min_box_visibility") or 0.30),
         "reject_partial_windows": not _is_on(params.get("allow_partial")),
@@ -2851,6 +3545,7 @@ def _crop_controls_from_params(params: dict[str, Any]) -> dict[str, Any]:
     return {
         "crop_size": int(params.get("crop_size") or 1024),
         "stride": int(params.get("crop_stride") or 512),
+        "edge_policy": str(params.get("crop_edge_policy") or "edge_align"),
         "mode": str(params.get("preview_mode") or "deterministic"),
         "random_preview_count": int(params.get("random_preview_count") or 20),
         "random_seed": int(params.get("random_seed") or 123),
@@ -2858,6 +3553,20 @@ def _crop_controls_from_params(params: dict[str, Any]) -> dict[str, Any]:
         "positivity_threshold": float(params.get("positivity_threshold") or 0.30),
         "require_foreground": _is_on(params.get("require_foreground")),
         "min_foreground_fraction": float(params.get("min_foreground_fraction") or 0.05),
+        "split_breast_filters": {
+            "train": {
+                "enabled": _is_on(params.get("require_foreground")),
+                "minimum": float(params.get("min_foreground_fraction") or 0.05),
+            },
+            "val": {
+                "enabled": _is_on(params.get("val_require_foreground")),
+                "minimum": float(params.get("val_min_foreground_fraction") or 0.05),
+            },
+            "test": {
+                "enabled": _is_on(params.get("test_require_foreground")),
+                "minimum": float(params.get("test_min_foreground_fraction") or 0.05),
+            },
+        },
         "foreground_threshold": None if params.get("fg_threshold_mode") == "auto" else float(params.get("fg_threshold") or 0.0),
         "foreground_mask_preview": _is_on(params.get("show_foreground_mask")),
         "bbox_safe_boundary_margin_fraction": crop_options["bbox_safe_boundary_margin_fraction"],
@@ -2917,6 +3626,24 @@ def _filter_records(records: pd.DataFrame, params: dict[str, Any]) -> pd.DataFra
     if records.empty:
         return records
     df = records.copy()
+    try:
+        split_cfg = _split_config_from_params(params)
+        _split_records, split_table = make_train_val_test_split(
+            df.to_dict("records"),
+            **normalize_split_strategy_kwargs(split_cfg),
+        )
+        assignment = dict(
+            zip(
+                split_table["image_id"].astype(str),
+                split_table["export_split"].astype(str),
+                strict=False,
+            )
+        )
+        df["export_split"] = df["image_id"].astype(str).map(assignment).fillna(df.get("export_split", "train"))
+    except Exception:
+        # Invalid exact-count settings are displayed in the split summary. Keep
+        # the last loaded assignment so image preview remains usable meanwhile.
+        pass
     split = str(params.get("filter_split") or "all")
     if split != "all" and "export_split" in df:
         df = df[df["export_split"] == split]
@@ -3079,7 +3806,14 @@ def _sample_view(result: dict[str, Any], pipeline: dict[str, Any], params: dict[
     full_boxes = result["mass_boxes"] if show_annotations else None
     selected = result.get("selected_crop") or {}
     window = selected.get("window")
-    processed_rgb, processing_meta = apply_channel_pipeline(crop, pipeline, source_crops=_source_crops_from_result(result))
+    processed_rgb, processing_meta = apply_channel_pipeline(
+        crop,
+        pipeline,
+        source_crops=_source_crops_from_result(result),
+        source_full_images=_source_full_images_from_result(result),
+        crop_window=window,
+        cache_namespace=f"preview:{result.get('record_index', 0)}",
+    )
     visible = params.get("visible_channels") or CHANNELS
     processed_display = _mask_rgb_channels(processed_rgb, visible)
     full_gray = _to_uint8_percentile(full, _display_window(params))
@@ -3200,6 +3934,7 @@ def _render_manifest_tools(params: dict[str, Any], cfg: dict[str, Any]) -> Any:
 
 def _build_export_cfg_from_params(cfg: dict[str, Any], records: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any]:
     crop_controls = _crop_controls_from_params(params)
+    preset_key = str(((cfg.get("study_preset_provenance", {}) or {}).get("preset_key", "")))
     selected_vendors = params.get("export_vendors") or []
     split_modes = {
         "train": str(params.get("train_crop_mode") or "deterministic"),
@@ -3207,8 +3942,13 @@ def _build_export_cfg_from_params(cfg: dict[str, Any], records: pd.DataFrame, pa
         "test": str(params.get("test_crop_mode") or "deterministic"),
     }
     balance_mode = str(params.get("export_balance_mode") or "positive_ratio")
-    if balance_mode not in {"positive_ratio", "negative_fraction", "mass_only", "all"}:
+    if balance_mode not in {
+        "positive_ratio", "negative_fraction", "source_breast_ratio", "mass_only", "all"
+    }:
         balance_mode = "positive_ratio"
+    if balance_mode == "source_breast_ratio":
+        # This policy is defined on a complete deterministic candidate grid.
+        split_modes = {split: "deterministic" for split in ["train", "val", "test"]}
     try:
         target_ratio = min(max(float(params.get("export_target_positive_ratio") or 0.50), 0.01), 1.0)
     except Exception:
@@ -3219,7 +3959,15 @@ def _build_export_cfg_from_params(cfg: dict[str, Any], records: pd.DataFrame, pa
         negative_keep_fraction = 0.20
     deterministic_selection = {
         split: {
-            "mode": ("negative_fraction" if split == "train" else "all") if balance_mode == "negative_fraction" else balance_mode,
+            "mode": (
+                "all"
+                if preset_key == SIMPLE_PRESET_KEY and split in {"val", "test"}
+                else (
+                    (balance_mode if split == "train" else "all")
+                    if balance_mode in {"negative_fraction", "source_breast_ratio"}
+                    else balance_mode
+                )
+            ),
             "target_positive_ratio": target_ratio,
             "negative_keep_fraction": negative_keep_fraction,
         }
@@ -3239,12 +3987,60 @@ def _build_export_cfg_from_params(cfg: dict[str, Any], records: pd.DataFrame, pa
         simple_profiler_enabled=True,
         simple_profiler_emit_every=10,
     )
+    configured_scheme = str(((cfg.get("image_export", {}) or {}).get("rgb_scheme", ""))).casefold().strip()
+    selected_splits = _split_config_from_params(params)
+    original_splits = dict(cfg.get("splits", {}) or {})
+    split_changed = _split_signature(selected_splits) != _split_signature(original_splits)
+    out["splits"] = selected_splits
+    if split_changed:
+        provenance = out.setdefault("study_preset_provenance", {})
+        assumptions = provenance.setdefault("assumptions", {})
+        assumptions["split_override"] = {
+            "reason": "user-selected GUI training/validation policy",
+            "paper_disclosed": False,
+            **copy.deepcopy(selected_splits),
+        }
+        contract = out.setdefault("replication_contract", {})
+        if preset_key == PAPER_69_PRESET_KEY and selected_splits["strategy"] == "official_only":
+            contract.update({
+                "enabled": True,
+                "strict": True,
+                "name": "paper69_vindr_official_full_image_mass_v1",
+                "preserve_official_test": True,
+                "require_positive_source_images": False,
+                "expected_source_images": {"train": 16000, "val": 0, "test": 4000},
+                "expected_source_studies": {"train": 4000, "val": 0, "test": 1000},
+                "expected_source_annotations": {"test": 237},
+            })
+        elif bool(contract.get("enabled", False)):
+            contract["enabled"] = False
+            contract["disabled_reason"] = (
+                "GUI split assignment differs from the preset's count-validated replication contract."
+            )
+    if (
+        preset_key == PAPER_69_PRESET_KEY
+        and configured_scheme in {"paper69_mammoclip_uint8", "mammoclip_uint8_replicated"}
+        and str(params.get("pipeline_mode") or "yaml") != "visual"
+    ):
+        # Paper 69's exact replicated-uint8 encoding is not a custom operation
+        # pipeline. Preserve it unless the user explicitly activates the visual
+        # pipeline builder.
+        out["image_export"] = copy.deepcopy(cfg.get("image_export", {}) or {})
     baseline = out.setdefault("baseline_uncropped", {})
     baseline["resize_mode"] = str(params.get("whole_resize_mode") or "none")
     baseline["target_width"] = int(params.get("whole_resize_width") or 1024)
     baseline["target_height"] = int(params.get("whole_resize_height") or 1024)
     baseline["pad_value"] = float(params.get("whole_pad_value") or 0.0)
     baseline["pad_anchor"] = str(params.get("whole_pad_anchor") or "left_top")
+    paired = out.setdefault("paired_whole_images", {})
+    paired_size = max(1, int(params.get("paired_whole_size") or 1024))
+    paired["enabled"] = _is_on(params.get("paired_whole_enabled"))
+    paired["target_width"] = paired_size
+    paired["target_height"] = paired_size
+    paired["canvas_mode"] = "per_image_square"
+    paired["pad_value"] = 0.0
+    paired["pad_anchor"] = "left_top"
+    paired["storage_mode"] = "hardlink" if _is_on(params.get("paired_whole_hardlink")) else "copy"
     square = out.setdefault("square_crops", {})
     square["positive_fraction"] = float(target_ratio)
     square["deterministic_target_positive_ratio"] = float(target_ratio)
@@ -3255,12 +4051,72 @@ def _build_export_cfg_from_params(cfg: dict[str, Any], records: pd.DataFrame, pa
         square[f"{split}_positive_fraction"] = float(target_ratio)
         square[f"{split}_deterministic_target_positive_ratio"] = float(target_ratio)
         square[f"{split}_deterministic_selection_mode"] = (
-            ("negative_fraction" if split == "train" else "all")
-            if balance_mode == "negative_fraction"
-            else balance_mode
+            "all"
+            if preset_key == SIMPLE_PRESET_KEY and split in {"val", "test"}
+            else (
+                (balance_mode if split == "train" else "all")
+                if balance_mode in {"negative_fraction", "source_breast_ratio"}
+                else balance_mode
+            )
         )
         square[f"{split}_deterministic_negative_keep_fraction"] = float(negative_keep_fraction)
         square[f"{split}_online_positive_ratio_selection_for_random"] = True
+    split_filter_params = {
+        "train": ("require_foreground", "min_foreground_fraction"),
+        "val": ("val_require_foreground", "val_min_foreground_fraction"),
+        "test": ("test_require_foreground", "test_min_foreground_fraction"),
+    }
+    split_breast_filters: dict[str, tuple[bool, float]] = {}
+    for split, (enabled_key, minimum_key) in split_filter_params.items():
+        enabled_raw = params.get(enabled_key)
+        enabled = (
+            bool(square.get(f"{split}_require_min_breast_fraction_for_all_crops", False))
+            if enabled_raw is None
+            else _is_on(enabled_raw)
+        )
+        minimum_raw = params.get(minimum_key)
+        minimum = float(
+            square.get(f"{split}_min_breast_fraction_for_all_crops", 0.05)
+            if minimum_raw is None
+            else minimum_raw
+        )
+        split_breast_filters[split] = (enabled, minimum)
+        square[f"{split}_require_min_breast_fraction_for_all_crops"] = enabled
+        square[f"{split}_min_breast_fraction_for_all_crops"] = minimum
+        square[f"{split}_breast_fraction_comparison_for_all_crops"] = (
+            "strictly_greater_than"
+        )
+        square[f"{split}_require_retained_breast_mask_for_all_crops"] = enabled
+    if balance_mode == "source_breast_ratio":
+        out["source_cohort"] = {
+            "finding_category": "Mass",
+            "positive_images_only": True,
+            "train_expand_to_all_patient_breast_views": True,
+            "train_breast_status_unit": "study_laterality",
+        }
+        square["train_deterministic_target_source_breast_mass_ratio"] = float(target_ratio)
+        square["train_deterministic_require_foreground"] = False
+        square["train_negative_require_foreground"] = False
+        for split in ["val", "test"]:
+            square[f"{split}_deterministic_require_foreground"] = False
+            square[f"{split}_negative_require_foreground"] = False
+            square[f"{split}_require_clean_negative_windows"] = False
+        contract = out.setdefault("replication_contract", {})
+        if bool(contract.get("enabled", False)):
+            contract["min_breast_fraction_strictly_greater_than_by_split"] = {
+                split: minimum
+                for split, (enabled, minimum) in split_breast_filters.items()
+                if enabled
+            }
+        if preset_key != PAPER_22_IMPROVED_PRESET_KEY:
+            out.setdefault("replication_contract", {})["enabled"] = False
+            out["replication_contract"]["disabled_reason"] = (
+                "Source-breast GUI mode was enabled outside the audited improved Paper 22 preset."
+            )
+    if preset_key == SIMPLE_PRESET_KEY:
+        square["train_online_positive_ratio_selection_for_deterministic"] = True
+        square["val_online_positive_ratio_selection_for_deterministic"] = False
+        square["test_online_positive_ratio_selection_for_deterministic"] = False
     return out
 
 
@@ -3318,6 +4174,90 @@ def _metric(label: str, value: Any) -> html.Div:
 
 def _summary_children(summary: dict[str, Any]) -> Any:
     return html.Div([html.Div(f"{k}: {v}") for k, v in summary.items()])
+
+
+def _same_disk_for_queue_path(path: Any, device_id: int | None) -> bool:
+    if not path:
+        return False
+    try:
+        other = get_disk_space(str(path))
+    except Exception:
+        return False
+    if device_id is None or other.device_id is None:
+        return str(other.probe_path.anchor) == str(Path(str(path)).anchor)
+    return int(other.device_id) == int(device_id)
+
+
+def _estimate_summary_children(payload: dict[str, Any]) -> Any:
+    if not payload:
+        return html.Div("No estimate available.", className="note")
+    assumptions = payload.get("assumptions", []) or []
+    breakdown = payload.get("breakdown", {}) or {}
+    return html.Div(
+        className="summary-box",
+        children=[
+            html.H3(f"Conservative estimate: {payload.get('conservative', format_bytes(payload.get('estimated_bytes', 0)))}"),
+            html.Div(
+                f"Sources: {payload.get('source_image_count', 0):,} | crops: {payload.get('crop_image_count', 0):,} | "
+                f"paired whole images: {payload.get('paired_whole_image_count', 0):,} | baseline: {payload.get('baseline_image_count', 0):,}"
+            ),
+            html.Ul([html.Li(f"{key.replace('_', ' ')}: {value}") for key, value in breakdown.items()]),
+            html.Details(children=[html.Summary("Estimate assumptions"), html.Ul([html.Li(str(item)) for item in assumptions])]),
+        ],
+    )
+
+
+def _queue_progress_text(job: dict[str, Any]) -> str:
+    progress = job.get("progress", {}) or {}
+    stage = str(progress.get("stage") or "")
+    processed = progress.get("processed")
+    total = progress.get("total")
+    fraction = job.get("progress_fraction")
+    parts = []
+    if stage:
+        parts.append(stage)
+    if processed is not None and total is not None:
+        parts.append(f"{processed}/{total}")
+    if fraction is not None:
+        parts.append(f"{float(fraction):.1%}")
+    return " · ".join(parts) or "Waiting for progress details"
+
+
+def _queue_table_children(snapshot: dict[str, Any]) -> Any:
+    jobs = list(snapshot.get("jobs", []) or [])
+    if not jobs:
+        return html.Div("The extraction queue is empty.", className="note")
+    rows = []
+    for job in jobs:
+        status = str(job.get("status", ""))
+        error = str(job.get("error") or "")
+        rows.append(html.Tr([
+            html.Td(str(job.get("queue_position") or "—")),
+            html.Td(str(job.get("name") or "")),
+            html.Td(status),
+            html.Td(format_bytes(int(job.get("estimated_bytes") or 0))),
+            html.Td(str(job.get("output_root") or "")),
+            html.Td(error if status == "failed" else _queue_progress_text(job)),
+        ]))
+    reserved = sum(
+        int(job.get("estimated_bytes") or 0)
+        for job in jobs
+        if job.get("status") in {"queued", "running"}
+    )
+    return html.Div([
+        html.Div(
+            f"{len(jobs)} retained item(s); queued/running conservative total {format_bytes(reserved)}. "
+            f"Worker {'running' if snapshot.get('started') else 'not started'}.",
+            className="note",
+        ),
+        html.Table(
+            className="queue-table",
+            children=[
+                html.Thead(html.Tr([html.Th("#"), html.Th("Pipeline"), html.Th("Status"), html.Th("Estimate"), html.Th("Output"), html.Th("Progress / error")])),
+                html.Tbody(rows),
+            ],
+        ),
+    ])
 
 
 def _initial_pipeline(cfg: dict[str, Any]) -> dict[str, Any]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import os
 import platform
 import shutil
 import subprocess
@@ -56,6 +57,7 @@ from .crops import (
     window_has_positive_mass,
 )
 from .dataset import VindrMammoDataset
+from .pipeline_scope import apply_scoped_steps
 from .preprocessing import _breast_chest_wall_side, _robust_tissue_threshold, align_contralateral_image_to_reference, estimate_contralateral_alignment_info
 
 CLASS_NAMES = ["mass"]
@@ -236,14 +238,19 @@ def export_from_config(config: dict[str, Any], progress_callback: Callable[[dict
 
     def make_splits():
         cohort_records_, cohort_summary_ = _records_for_source_cohort(dataset, config)
+        split_kwargs = normalize_split_strategy_kwargs(config.get("splits", {}))
         split_records_, split_table_ = make_train_val_test_split(
             cohort_records_,
-            val_fraction=float(config.get("splits", {}).get("val_fraction_from_training", 0.15)),
-            seed=int(config.get("splits", {}).get("seed", 123)),
-            stratify_by_birads=bool(config.get("splits", {}).get("stratify_by_birads", False)),
-            validation_study_count=config.get("splits", {}).get("validation_study_count"),
-            validation_image_count=config.get("splits", {}).get("validation_image_count"),
+            **split_kwargs,
         )
+        split_records_, expansion_summary_ = _expand_training_to_patient_breast_views(
+            dataset,
+            split_records_,
+            config,
+        )
+        if expansion_summary_.get("enabled", False):
+            cohort_summary_["train_patient_breast_expansion"] = expansion_summary_
+            split_table_ = _split_assignment_table(split_records_)
         split_records_, split_table_, vendor_summary_ = _apply_vendor_filter_to_splits(dataset, split_records_, split_table_, config)
         contract_report_ = _validate_source_split_contract(dataset, split_records_, config)
         split_path = output_root / "split_assignments.csv"
@@ -287,6 +294,12 @@ def export_from_config(config: dict[str, Any], progress_callback: Callable[[dict
         },
         "deterministic_target_positive_ratio": {
             split: _deterministic_target_positive_ratio(crop_cfg_for_summary, split)
+            for split in ["train", "val", "test"]
+        },
+        "deterministic_target_source_breast_mass_ratio": {
+            split: _deterministic_target_source_breast_mass_ratio(
+                crop_cfg_for_summary, split
+            )
             for split in ["train", "val", "test"]
         },
         "deterministic_negative_keep_fraction": {
@@ -465,6 +478,69 @@ _METADATA_IMAGE_ID_KEYS_EXPORT = [
 ]
 
 
+def normalize_split_strategy_kwargs(split_cfg: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize the configured source split strategy for the split builder.
+
+    Configurations written before ``splits.strategy`` existed are inferred from
+    their count overrides first, then from their validation fraction. This keeps
+    old presets and saved manifests reproducible while making the three current
+    strategies mutually exclusive.
+    """
+    cfg = dict(split_cfg or {})
+    strategy_value = cfg.get("strategy")
+    if strategy_value is None or not str(strategy_value).strip():
+        has_count_override = any(
+            key in cfg and cfg.get(key) is not None
+            for key in ("validation_study_count", "validation_image_count")
+        )
+        if has_count_override:
+            strategy = "exact_study_count"
+        elif float(cfg.get("val_fraction_from_training", 0.15)) > 0:
+            strategy = "random_study_fraction"
+        else:
+            strategy = "official_only"
+    else:
+        strategy = str(strategy_value).strip().casefold()
+
+    allowed = {"official_only", "random_study_fraction", "exact_study_count"}
+    if strategy not in allowed:
+        raise ValueError(
+            f"Unknown splits.strategy={strategy!r}; expected one of {sorted(allowed)}."
+        )
+
+    kwargs: dict[str, Any] = {
+        "seed": int(cfg.get("seed", 123)),
+        "stratify_by_birads": bool(cfg.get("stratify_by_birads", False)),
+    }
+    if strategy == "official_only":
+        kwargs.update(
+            val_fraction=0.0,
+            validation_study_count=0,
+            validation_image_count=0,
+        )
+    elif strategy == "random_study_fraction":
+        kwargs.update(
+            val_fraction=float(cfg.get("val_fraction_from_training", 0.15)),
+            validation_study_count=None,
+            validation_image_count=None,
+        )
+    else:
+        validation_study_count = cfg.get("validation_study_count")
+        if validation_study_count is None:
+            raise ValueError(
+                "splits.strategy='exact_study_count' requires validation_study_count."
+            )
+        validation_image_count = cfg.get("validation_image_count")
+        kwargs.update(
+            val_fraction=0.0,
+            validation_study_count=int(validation_study_count),
+            validation_image_count=(
+                None if validation_image_count is None else int(validation_image_count)
+            ),
+        )
+    return kwargs
+
+
 def make_train_val_test_split(
     image_records: list[dict[str, Any]],
     *,
@@ -484,7 +560,6 @@ def make_train_val_test_split(
     leaking across train and validation.
     """
     rng = np.random.default_rng(seed)
-    rows = []
     training_records = []
     test_records = []
 
@@ -537,19 +612,126 @@ def make_train_val_test_split(
             f"expected {target_val_images}."
         )
 
-    for split_name, records in out.items():
-        for r in records:
-            rows.append(
-                {
-                    "export_split": split_name,
-                    "official_split": r.get("split"),
-                    "study_id": str(r.get("study_id")),
-                    "image_id": str(r.get("image_id")),
-                    "laterality": r.get("laterality"),
-                    "view_position": r.get("view_position"),
-                }
-            )
-    return out, pd.DataFrame(rows)
+    return out, _split_assignment_table(out)
+
+
+def _split_assignment_table(
+    split_records: dict[str, list[dict[str, Any]]],
+) -> pd.DataFrame:
+    """Build the persisted image assignment table from final split records."""
+    rows: list[dict[str, Any]] = []
+    for split_name in ["train", "val", "test"]:
+        for record in split_records.get(split_name, []):
+            rows.append({
+                "export_split": split_name,
+                "official_split": record.get("split"),
+                "study_id": str(record.get("study_id")),
+                "image_id": str(record.get("image_id")),
+                "laterality": record.get("laterality"),
+                "view_position": record.get("view_position"),
+                "source_breast_key": record.get("_source_breast_key", ""),
+                "source_breast_has_mass": record.get("_source_breast_has_mass", ""),
+            })
+    return pd.DataFrame(rows)
+
+
+def _breast_key(record: dict[str, Any]) -> tuple[str, str]:
+    """Return VinDr's patient/exam plus laterality breast identity."""
+    study_id = str(record.get("study_id", "")).strip()
+    laterality = str(record.get("laterality", "")).strip().upper()[:1]
+    if not study_id or laterality not in {"L", "R"}:
+        raise ValueError(
+            "Breast-aware selection requires non-empty study_id and L/R laterality; "
+            f"got study_id={study_id!r}, laterality={record.get('laterality')!r}."
+        )
+    return study_id, laterality
+
+
+def _mass_positive_breast_keys(dataset: VindrMammoDataset) -> set[tuple[str, str]]:
+    positive: set[tuple[str, str]] = set()
+    for record in dataset.image_records:
+        image_id = str(record.get("image_id", ""))
+        if dataset._filter_mass_findings(dataset.findings_by_image_id.get(image_id, [])):
+            positive.add(_breast_key(record))
+    return positive
+
+
+def _expand_training_to_patient_breast_views(
+    dataset: VindrMammoDataset,
+    split_records: dict[str, list[dict[str, Any]]],
+    config: dict[str, Any],
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    """Expand only selected training patients and label views by breast status.
+
+    The validation and test lists are deliberately copied without changing their
+    image membership.  Training is expanded to every official-training view of
+    the already selected training studies.  A breast is ``(study_id,
+    laterality)`` and is mass-positive when any of its views has a valid Mass.
+    """
+    cohort_cfg = dict(config.get("source_cohort", {}) or {})
+    enabled = bool(cohort_cfg.get("train_expand_to_all_patient_breast_views", False))
+    if not enabled:
+        return split_records, {"enabled": False}
+    unit = str(cohort_cfg.get("train_breast_status_unit", "study_laterality") or "").strip().casefold()
+    if unit not in {"study_laterality", "study+laterality", "patient_laterality"}:
+        raise ValueError(
+            "source_cohort.train_breast_status_unit must be 'study_laterality'."
+        )
+
+    train_studies = {
+        str(record.get("study_id", ""))
+        for record in split_records.get("train", [])
+    }
+    val_studies = {
+        str(record.get("study_id", ""))
+        for record in split_records.get("val", [])
+    }
+    test_studies = {
+        str(record.get("study_id", ""))
+        for record in split_records.get("test", [])
+    }
+    if train_studies & val_studies or train_studies & test_studies or val_studies & test_studies:
+        raise ValueError("Cannot expand training breasts because study IDs overlap across splits.")
+
+    positive_breasts = _mass_positive_breast_keys(dataset)
+
+    def annotated(record: dict[str, Any]) -> dict[str, Any]:
+        key = _breast_key(record)
+        return {
+            **record,
+            "_source_breast_key": f"{key[0]}:{key[1]}",
+            "_source_breast_has_mass": int(key in positive_breasts),
+        }
+
+    expanded_train = [
+        annotated(record)
+        for record in dataset.image_records
+        if str(record.get("split", "training")).casefold().strip() != "test"
+        and str(record.get("study_id", "")) in train_studies
+    ]
+    out = {
+        "train": expanded_train,
+        "val": [annotated(record) for record in split_records.get("val", [])],
+        "test": [annotated(record) for record in split_records.get("test", [])],
+    }
+    train_breast_keys = {_breast_key(record) for record in expanded_train}
+    mass_breasts = train_breast_keys & positive_breasts
+    negative_breasts = train_breast_keys - positive_breasts
+    mass_views = sum(int(record["_source_breast_has_mass"]) for record in expanded_train)
+    negative_views = len(expanded_train) - mass_views
+    return out, {
+        "enabled": True,
+        "unit": "study_id+laterality",
+        "train_studies": len(train_studies),
+        "selected_positive_images_before_expansion": len(split_records.get("train", [])),
+        "expanded_train_views": len(expanded_train),
+        "mass_positive_breasts": len(mass_breasts),
+        "negative_breasts": len(negative_breasts),
+        "mass_positive_breast_views": mass_views,
+        "negative_breast_views": negative_views,
+        "validation_membership_changed": False,
+        "test_membership_changed": False,
+    }
 
 
 def _stratified_study_sample(
@@ -651,10 +833,18 @@ def _validate_source_split_contract(
     expected_studies = dict(contract.get("expected_source_studies", {}) or {})
     expected_annotations = dict(contract.get("expected_source_annotations", {}) or {})
     require_positive = bool(contract.get("require_positive_source_images", False))
+    require_positive_by_split = dict(
+        contract.get("require_positive_source_images_by_split", {}) or {}
+    )
+    expected_train_breasts = dict(contract.get("expected_train_breasts", {}) or {})
+    expected_train_views = dict(
+        contract.get("expected_train_source_views_by_breast_status", {}) or {}
+    )
     errors: list[str] = []
     observed: dict[str, Any] = {}
     images_seen: dict[str, set[str]] = {}
     studies_seen: dict[str, set[str]] = {}
+    positive_breast_keys = _mass_positive_breast_keys(dataset)
 
     for split_name in ["train", "val", "test"]:
         records = list(split_records.get(split_name, []))
@@ -664,6 +854,10 @@ def _validate_source_split_contract(
         studies_seen[split_name] = study_ids
         annotation_count = 0
         nonpositive: list[str] = []
+        mass_breast_views = 0
+        negative_breast_views = 0
+        mass_breasts: set[tuple[str, str]] = set()
+        negative_breasts: set[tuple[str, str]] = set()
         records_by_study: dict[str, list[dict[str, Any]]] = {}
         for record in records:
             records_by_study.setdefault(str(record.get("study_id", "")), []).append(record)
@@ -677,11 +871,23 @@ def _validate_source_split_contract(
             annotation_count += count
             if count == 0:
                 nonpositive.append(image_id)
+        for record in records:
+            key = _breast_key(record)
+            if key in positive_breast_keys:
+                mass_breast_views += 1
+                mass_breasts.add(key)
+            else:
+                negative_breast_views += 1
+                negative_breasts.add(key)
         observed[split_name] = {
             "source_images": len(image_ids),
             "source_studies": len(study_ids),
             "source_annotations": int(annotation_count),
             "nonpositive_source_images": len(nonpositive),
+            "mass_positive_breasts": len(mass_breasts),
+            "negative_breasts": len(negative_breasts),
+            "mass_positive_breast_views": mass_breast_views,
+            "negative_breast_views": negative_breast_views,
             "study_birads_strata": dict(sorted(stratum_counts.items())),
         }
         if split_name in expected_images and len(image_ids) != int(expected_images[split_name]):
@@ -696,10 +902,34 @@ def _validate_source_split_contract(
             errors.append(
                 f"{split_name}: expected {int(expected_annotations[split_name])} source annotations, got {annotation_count}"
             )
-        if require_positive and nonpositive:
+        split_requires_positive = bool(
+            require_positive_by_split.get(split_name, require_positive)
+        )
+        if split_requires_positive and nonpositive:
             errors.append(
                 f"{split_name}: {len(nonpositive)} source images have no valid Mass annotation"
             )
+        if split_name == "train":
+            expected_mass_breasts = expected_train_breasts.get("mass")
+            expected_negative_breasts = expected_train_breasts.get("negative")
+            expected_mass_views = expected_train_views.get("mass")
+            expected_negative_views = expected_train_views.get("negative")
+            if expected_mass_breasts is not None and len(mass_breasts) != int(expected_mass_breasts):
+                errors.append(
+                    f"train: expected {int(expected_mass_breasts)} mass-positive breasts, got {len(mass_breasts)}"
+                )
+            if expected_negative_breasts is not None and len(negative_breasts) != int(expected_negative_breasts):
+                errors.append(
+                    f"train: expected {int(expected_negative_breasts)} negative breasts, got {len(negative_breasts)}"
+                )
+            if expected_mass_views is not None and mass_breast_views != int(expected_mass_views):
+                errors.append(
+                    f"train: expected {int(expected_mass_views)} mass-breast views, got {mass_breast_views}"
+                )
+            if expected_negative_views is not None and negative_breast_views != int(expected_negative_views):
+                errors.append(
+                    f"train: expected {int(expected_negative_views)} negative-breast views, got {negative_breast_views}"
+                )
 
     split_names = ["train", "val", "test"]
     for index, left in enumerate(split_names):
@@ -712,12 +942,16 @@ def _validate_source_split_contract(
                 errors.append(f"{left}/{right}: {len(study_overlap)} source study IDs overlap")
 
     if bool(contract.get("preserve_official_test", False)):
-        official_positive_test_ids = {
+        test_requires_positive = bool(require_positive_by_split.get("test", require_positive))
+        official_test_ids = {
             str(record.get("image_id", ""))
             for record in dataset.image_records
             if str(record.get("split", "")).casefold().strip() == "test"
-            and dataset._filter_mass_findings(
-                dataset.findings_by_image_id.get(str(record.get("image_id", "")), [])
+            and (
+                not test_requires_positive
+                or dataset._filter_mass_findings(
+                    dataset.findings_by_image_id.get(str(record.get("image_id", "")), [])
+                )
             )
         }
         observed_test_ids = images_seen.get("test", set())
@@ -731,7 +965,7 @@ def _validate_source_split_contract(
             for record in split_records.get(split_name, [])
             if str(record.get("split", "")).casefold().strip() == "test"
         ]
-        if wrong_test or displaced_test or observed_test_ids != official_positive_test_ids:
+        if wrong_test or displaced_test or observed_test_ids != official_test_ids:
             errors.append("official VinDr test membership was not preserved")
 
     report = {
@@ -903,6 +1137,7 @@ def export_square_crop_datasets(
             "enabled": True,
             "crop_size": crop_size,
             "stride": stride,
+            "edge_policy": str(crop_cfg.get("edge_policy", "edge_align")),
             "pad_if_needed": bool(crop_cfg.get("pad_if_needed", True)),
             "pad_value": float(crop_cfg.get("pad_value", 0.0)),
             "allow_partial_annotations": bool(common_crop_options.get("allow_partial_annotations", False)),
@@ -935,6 +1170,10 @@ def export_square_crop_datasets(
     max_preprocessed_cache_items = int(crop_cfg.get("contralateral_preprocessed_cache_items", 16))
     aligned_contralateral_cache: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
     max_aligned_contralateral_cache_items = int(crop_cfg.get("contralateral_alignment_cache_items", 2))
+    whole_stage_cache: OrderedDict[str, tuple[np.ndarray, np.ndarray | None]] = OrderedDict()
+    max_whole_stage_cache_items = int(crop_cfg.get("whole_stage_cache_items", 12))
+    paired_whole_cfg = dict(config.get("paired_whole_images", {}) or {})
+    paired_whole_source_paths: dict[tuple[str, str], Path] = {}
     contralateral_lookup = _build_contralateral_record_lookup(dataset.image_records)
     needs_contralateral = _config_uses_contralateral_source(config)
     total_records_for_progress = sum(len(split_records.get(split, [])) for split in ["train", "val", "test"])
@@ -957,6 +1196,8 @@ def export_square_crop_datasets(
                 "laterality": _record.get("laterality", ""),
                 "view_position": _record.get("view_position", ""),
                 "official_split": _record.get("split", ""),
+                "source_breast_key": _record.get("_source_breast_key", ""),
+                "source_breast_has_mass": _record.get("_source_breast_has_mass", ""),
                 "processed_source_image": 0,
                 "n_source_mass_boxes": 0,
                 "has_source_mass": 0,
@@ -974,6 +1215,7 @@ def export_square_crop_datasets(
                 "skip_bbox_safe_failed": 0,
                 "skip_duplicate_window": 0,
                 "skip_empty_disallowed": 0,
+                "skip_blank_output": 0,
                 "_included_annotation_indices": set(),
             }
 
@@ -989,6 +1231,8 @@ def export_square_crop_datasets(
                 "laterality": record_.get("laterality", ""),
                 "view_position": record_.get("view_position", ""),
                 "official_split": record_.get("split", ""),
+                "source_breast_key": record_.get("_source_breast_key", ""),
+                "source_breast_has_mass": record_.get("_source_breast_has_mass", ""),
                 "processed_source_image": 0,
                 "n_source_mass_boxes": 0,
                 "has_source_mass": 0,
@@ -1006,6 +1250,7 @@ def export_square_crop_datasets(
                 "skip_bbox_safe_failed": 0,
                 "skip_duplicate_window": 0,
                 "skip_empty_disallowed": 0,
+                "skip_blank_output": 0,
                 "_included_annotation_indices": set(),
             }
         return source_debug[key_]
@@ -1071,6 +1316,15 @@ def export_square_crop_datasets(
             preprocessed_cache.popitem(last=False)
         return value
 
+    def with_source_breast_status(
+        record_: dict[str, Any], extra_info_: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            **dict(extra_info_),
+            "source_breast_key": record_.get("_source_breast_key", ""),
+            "source_breast_has_mass": record_.get("_source_breast_has_mass", ""),
+        }
+
     def save_window(
         *,
         record: dict[str, Any],
@@ -1080,6 +1334,7 @@ def export_square_crop_datasets(
         extra_info: dict[str, Any],
     ) -> bool:
         nonlocal image_id_counter, ann_id_counter
+        extra_info = with_source_breast_status(record, extra_info)
         image, target = get_preprocessed(record)
         source_row = note_source_target(split_name, record, target)
         source_row["attempted_save_windows"] = int(source_row.get("attempted_save_windows", 0)) + 1
@@ -1148,6 +1403,89 @@ def export_square_crop_datasets(
             mark_source_skip(split_name, record, "empty_disallowed")
             return False
 
+        # Optional hard breast-occupancy contract for *every* saved crop. This
+        # is intentionally independent from the historical negative-only filter
+        # below and therefore also applies to annotated/positive crops. Recheck
+        # immediately before writing so random modes and future planners cannot
+        # bypass the dataset contract.
+        all_crop_breast_filter_enabled = bool(_split_crop_cfg(
+            crop_cfg,
+            split_name,
+            "require_min_breast_fraction_for_all_crops",
+            False,
+        ))
+        if all_crop_breast_filter_enabled:
+            min_all_crop_breast_fraction = float(_split_crop_cfg(
+                crop_cfg,
+                split_name,
+                "min_breast_fraction_for_all_crops",
+                0.30,
+            ))
+            breast_fraction_comparison = str(_split_crop_cfg(
+                crop_cfg,
+                split_name,
+                "breast_fraction_comparison_for_all_crops",
+                "greater_than_or_equal",
+            ))
+            require_retained_mask = bool(_split_crop_cfg(
+                crop_cfg,
+                split_name,
+                "require_retained_breast_mask_for_all_crops",
+                False,
+            ))
+            full_mask = target.get("_foreground_mask")
+            if full_mask is None:
+                if require_retained_mask:
+                    raise RuntimeError(
+                        "The all-crop breast-occupancy policy requires the retained "
+                        "fixed-preprocessing breast mask, but the preprocessed target "
+                        f"for image {record.get('image_id')} has no _foreground_mask. "
+                        "Set preprocess.retain_breast_mask_for_export=true."
+                    )
+                fg_threshold = _split_crop_cfg(
+                    crop_cfg,
+                    split_name,
+                    "foreground_threshold",
+                    crop_cfg.get("deterministic_foreground_threshold", None),
+                )
+                full_mask = _foreground_mask(
+                    _tensor_to_float2d(image), threshold=fg_threshold
+                )
+                mask_source = "derived_from_preprocessed_image"
+            else:
+                mask_source = "retained_preprocessing_mask"
+            full_mask = np.asarray(full_mask, dtype=bool)
+            expected_mask_shape = (int(image.shape[-2]), int(image.shape[-1]))
+            if tuple(full_mask.shape[:2]) != expected_mask_shape:
+                raise ValueError(
+                    "Breast foreground mask shape does not match the fixed-preprocessed "
+                    f"image for {record.get('image_id')}: mask={tuple(full_mask.shape)}, "
+                    f"image={expected_mask_shape}."
+                )
+            all_crop_breast_fraction = float(_foreground_fraction_from_mask(
+                full_mask,
+                window,
+                crop_size,
+            ))
+            extra_info = {
+                **extra_info,
+                "foreground_filter_enabled": 1,
+                "all_crop_breast_fraction_filter_enabled": 1,
+                "require_retained_breast_mask_for_all_crops": int(require_retained_mask),
+                "breast_fraction_mask_source": mask_source,
+                "min_foreground_fraction": min_all_crop_breast_fraction,
+                "min_breast_fraction_for_all_crops": min_all_crop_breast_fraction,
+                "breast_fraction_comparison_for_all_crops": breast_fraction_comparison,
+                "foreground_fraction": all_crop_breast_fraction,
+            }
+            if not _breast_fraction_passes(
+                all_crop_breast_fraction,
+                min_all_crop_breast_fraction,
+                breast_fraction_comparison,
+            ):
+                mark_source_skip(split_name, record, "foreground_too_low")
+                return False
+
         # Optional hard foreground filter for empty crops. This prevents low-level
         # background noise from creating apparently valid empty/background crops.
         # Reuse the fraction planned from the complete source mask; never estimate
@@ -1172,6 +1510,32 @@ def export_square_crop_datasets(
         filename = _make_crop_filename(record, split_name, crop_number, window)
         rel_img_path = Path("images") / split_name / filename
         source_arrays = None
+        full_source_arrays: dict[str, np.ndarray] = {
+            "current_crop": _tensor_to_float2d(image),
+        }
+        retained_foreground_mask = target.get("_foreground_mask")
+        full_source_masks: dict[str, np.ndarray] = {}
+        if (
+            retained_foreground_mask is None
+            and bool(config.get("preprocess", {}).get("retain_breast_mask_for_export", False))
+        ):
+            raise RuntimeError(
+                "Fixed preprocessing was configured to retain its breast mask, "
+                f"but image {record.get('image_id')} has no _foreground_mask."
+            )
+        if retained_foreground_mask is not None:
+            retained_foreground_mask = np.asarray(retained_foreground_mask, dtype=bool)
+            expected_shape = (int(image.shape[-2]), int(image.shape[-1]))
+            if tuple(retained_foreground_mask.shape) != expected_shape:
+                raise ValueError(
+                    "Retained breast mask shape does not match the fixed-preprocessed "
+                    f"image for {record.get('image_id')}: "
+                    f"mask={tuple(retained_foreground_mask.shape)}, image={expected_shape}."
+                )
+            full_source_masks["current_crop"] = retained_foreground_mask
+        source_windows: dict[str, tuple[int, int, int, int]] = {
+            "current_crop": window,
+        }
         if needs_contralateral:
             source_arrays, alignment_info = _profiled_call(
                 profiler,
@@ -1191,11 +1555,71 @@ def export_square_crop_datasets(
             )
             if alignment_info:
                 extra_info = {**extra_info, **alignment_info}
+            if source_arrays and source_arrays.get("contralateral_same_view_full") is not None:
+                full_source_arrays["contralateral_same_view_crop"] = source_arrays.pop(
+                    "contralateral_same_view_full"
+                )
+                adjusted = alignment_info.get("contralateral_fast_adjusted_window_xyxy") if alignment_info else None
+                if adjusted is not None:
+                    source_windows["contralateral_same_view_crop"] = tuple(int(v) for v in adjusted)
         save_info = _profiled_call(
             profiler,
             "save RGB and preserved PNG",
-            lambda: _save_export_images(crop_result.image, crop_root, rel_img_path, config, source_arrays=source_arrays),
+            lambda: _save_export_images(
+                crop_result.image,
+                crop_root,
+                rel_img_path,
+                config,
+                source_arrays=source_arrays,
+                full_source_arrays=full_source_arrays,
+                full_source_masks=full_source_masks,
+                source_windows=source_windows,
+                crop_window=window,
+                crop_pad_value=float(common_crop_options.get("pad_value", 0.0)),
+                whole_stage_cache=whole_stage_cache,
+                cache_namespace=f"{split_name}:{record.get('image_id', '')}",
+                reject_blank_output=(
+                    boxes.shape[0] == 0
+                    and not planned_positive
+                    and bool(_split_crop_cfg(
+                        crop_cfg,
+                        split_name,
+                        "negative_reject_blank_output",
+                        False,
+                    ))
+                ),
+                min_output_signal_fraction=float(_split_crop_cfg(
+                    crop_cfg,
+                    split_name,
+                    "negative_min_output_signal_fraction",
+                    0.01,
+                )),
+            ),
         )
+        if bool(save_info.get("output_rejected_blank", False)):
+            mark_source_skip(split_name, record, "blank_output")
+            return False
+        if bool(paired_whole_cfg.get("enabled", False)):
+            paired_info = _profiled_call(
+                profiler,
+                "save paired whole image",
+                lambda: _save_paired_whole_image_for_crop(
+                    source_image=image,
+                    crop_root=crop_root,
+                    split_name=split_name,
+                    filename=filename,
+                    source_image_id=str(record.get("image_id", "")),
+                    source_foreground_mask=retained_foreground_mask,
+                    config=config,
+                    paired_cfg=paired_whole_cfg,
+                    source_path_cache=paired_whole_source_paths,
+                    whole_stage_cache=whole_stage_cache,
+                    cache_namespace=f"{split_name}:{record.get('image_id', '')}",
+                ),
+            )
+            save_info.update(paired_info)
+        while len(whole_stage_cache) > max(1, max_whole_stage_cache_items):
+            whole_stage_cache.popitem(last=False)
 
         labels_path = crop_root / "labels" / split_name / f"{Path(filename).stem}.txt"
         profiler.start("write labels and metadata rows")
@@ -1291,7 +1715,7 @@ def export_square_crop_datasets(
         split_mode = str(crop_cfg.get(f"{split_name}_crop_mode", "random" if split_name == "train" else "deterministic")).casefold().strip()
         selection_mode = _deterministic_selection_mode(crop_cfg, split_name) if split_mode == "deterministic" else ""
 
-        if split_mode in {"random", "bbox_safe_random"} and _online_positive_ratio_selection_enabled(crop_cfg, split_name, split_mode):
+        if _online_positive_ratio_selection_enabled(crop_cfg, split_name, split_mode):
             # Single-pass approximate balancing. This avoids the slow planning pass used by
             # exact global selection and starts writing crops immediately. Empty candidates
             # may come from any source image, including no-mass images.
@@ -1313,7 +1737,7 @@ def export_square_crop_datasets(
                 height, width = int(image.shape[-2]), int(image.shape[-1])
                 windows = _profiled_call(
                     profiler,
-                    "plan crop windows",
+                    "generate current-image crop windows",
                     lambda: _windows_for_export_split(
                         split_name=split_name,
                         image_width=width,
@@ -1328,6 +1752,14 @@ def export_square_crop_datasets(
                     ),
                 )
                 note_candidate_windows(split_name, record, windows)
+                if bool(_split_crop_cfg(
+                    crop_cfg,
+                    split_name,
+                    "online_balance_shuffle_windows",
+                    True,
+                )) and len(windows) > 1:
+                    window_order = rng.permutation(len(windows))
+                    windows = [windows[int(i)] for i in window_order]
                 for window, extra_info in windows:
                     is_positive_window = int(extra_info.get("is_positive_window", 0)) == 1
                     if not is_positive_window and not _online_should_save_negative(positive_saved, negative_saved, target_ratio):
@@ -1342,6 +1774,7 @@ def export_square_crop_datasets(
                         target_ratio=target_ratio,
                         positive_count=proposed_positive,
                         negative_count=proposed_negative,
+                        split_mode=split_mode,
                     )
                     saved_ok = save_window(
                         record=record,
@@ -1398,7 +1831,10 @@ def export_square_crop_datasets(
                     ),
                 )
                 note_candidate_windows(split_name, record, windows)
-                candidates.extend((record, window, extra_info) for window, extra_info in windows)
+                candidates.extend(
+                    (record, window, with_source_breast_status(record, extra_info))
+                    for window, extra_info in windows
+                )
                 processed_records_for_progress += 1
                 maybe_emit_profiler_progress({
                     "event": "image_progress",
@@ -1434,7 +1870,9 @@ def export_square_crop_datasets(
                 })
             continue
 
-        if split_mode == "deterministic" and selection_mode in {"positive_ratio", "negative_fraction"}:
+        if split_mode == "deterministic" and selection_mode in {
+            "positive_ratio", "negative_fraction", "source_breast_ratio"
+        }:
             candidates: list[tuple[dict[str, Any], tuple[int, int, int, int], dict[str, Any]]] = []
             iterator = _progress(records, show_progress, f"Plan square crops {split_name}", unit="img")
             for record in iterator:
@@ -1459,7 +1897,10 @@ def export_square_crop_datasets(
                     ),
                 )
                 note_candidate_windows(split_name, record, windows)
-                candidates.extend((record, window, extra_info) for window, extra_info in windows)
+                candidates.extend(
+                    (record, window, with_source_breast_status(record, extra_info))
+                    for window, extra_info in windows
+                )
                 processed_records_for_progress += 1
                 maybe_emit_profiler_progress({
                     "event": "image_progress",
@@ -1472,6 +1913,10 @@ def export_square_crop_datasets(
 
             if selection_mode == "negative_fraction":
                 selected = _select_negative_fraction_candidates(candidates, crop_cfg, split_name, rng)
+            elif selection_mode == "source_breast_ratio":
+                selected = _select_source_breast_ratio_candidates(
+                    candidates, crop_cfg, split_name, rng
+                )
             else:
                 selected = _select_positive_ratio_candidates(candidates, crop_cfg, split_name, rng)
             save_iter = _progress(selected, show_progress, f"Save square crops {split_name}", unit="crop")
@@ -1569,6 +2014,24 @@ def _split_crop_cfg(crop_cfg: dict[str, Any], split_name: str, key: str, default
     return default
 
 
+def _breast_fraction_passes(
+    fraction: float,
+    threshold: float,
+    comparison: str = "greater_than_or_equal",
+) -> bool:
+    mode = str(comparison or "greater_than_or_equal").strip().casefold()
+    if mode in {"strictly_greater_than", "greater_than", ">", "strict"}:
+        return float(fraction) > float(threshold)
+    if mode in {
+        "greater_than_or_equal", "greater_than_or_equal_to", ">=", "inclusive"
+    }:
+        return float(fraction) >= float(threshold)
+    raise ValueError(
+        "breast_fraction_comparison_for_all_crops must be "
+        "'strictly_greater_than' or 'greater_than_or_equal'."
+    )
+
+
 def _deterministic_selection_mode(crop_cfg: dict[str, Any], split_name: str) -> str:
     mode = str(_split_crop_cfg(crop_cfg, split_name, "deterministic_selection_mode", "") or "").strip().casefold()
     aliases = {
@@ -1584,6 +2047,10 @@ def _deterministic_selection_mode(crop_cfg: dict[str, Any], split_name: str) -> 
         "negative fraction": "negative_fraction",
         "all_positive_plus_negative_fraction": "negative_fraction",
         "all positive + fraction of negatives": "negative_fraction",
+        "source_breast_ratio": "source_breast_ratio",
+        "source breast ratio": "source_breast_ratio",
+        "breast_status_ratio": "source_breast_ratio",
+        "mass/negative breasts": "source_breast_ratio",
         "finding_images_all_windows": "finding_images_all_windows",
         "finding_images_only_all_windows": "finding_images_all_windows",
         "findings_images_all_windows": "finding_images_all_windows",
@@ -1609,6 +2076,22 @@ def _deterministic_target_positive_ratio(crop_cfg: dict[str, Any], split_name: s
         split_name,
         "deterministic_target_positive_ratio",
         crop_cfg.get("deterministic_target_positive_ratio", crop_cfg.get("positive_fraction", 0.50)),
+    )
+    try:
+        ratio = float(value)
+    except Exception:
+        ratio = 0.50
+    return min(max(ratio, 0.01), 1.0)
+
+
+def _deterministic_target_source_breast_mass_ratio(
+    crop_cfg: dict[str, Any], split_name: str
+) -> float:
+    value = _split_crop_cfg(
+        crop_cfg,
+        split_name,
+        "deterministic_target_source_breast_mass_ratio",
+        _deterministic_target_positive_ratio(crop_cfg, split_name),
     )
     try:
         ratio = float(value)
@@ -1670,13 +2153,23 @@ def _global_positive_ratio_selection_enabled(crop_cfg: dict[str, Any], split_nam
 
 
 def _online_positive_ratio_selection_enabled(crop_cfg: dict[str, Any], split_name: str, split_mode: str) -> bool:
-    """Use a single-pass approximate target ratio for random crop modes.
+    """Use a single-pass approximate target ratio for supported crop modes.
 
     Unlike global positive-ratio selection, this does not collect all candidates first.
     It writes positive crops immediately and accepts empty candidates only when the
     running saved counts need more empty crops. This is intentionally approximate,
     but it avoids the long planning stage and lets PNGs appear during export.
     """
+    split_mode = str(split_mode or "").casefold().strip()
+    if split_mode == "deterministic":
+        if _deterministic_selection_mode(crop_cfg, split_name) != "positive_ratio":
+            return False
+        split_key = f"{split_name}_online_positive_ratio_selection_for_deterministic"
+        if split_key in crop_cfg and crop_cfg.get(split_key) is not None:
+            return bool(crop_cfg.get(split_key))
+        if "online_positive_ratio_selection_for_deterministic" in crop_cfg:
+            return bool(crop_cfg.get("online_positive_ratio_selection_for_deterministic"))
+        return False
     if split_mode not in {"random", "bbox_safe_random"}:
         return False
     split_key = f"{split_name}_online_positive_ratio_selection_for_random"
@@ -1708,12 +2201,15 @@ def _online_balance_extra_info(
     target_ratio: float,
     positive_count: int,
     negative_count: int,
+    split_mode: str = "random",
 ) -> dict[str, Any]:
     total = int(positive_count) + int(negative_count)
     achieved = float(positive_count / total) if total > 0 else 0.0
     return {
         **dict(extra_info),
-        "online_positive_ratio_selection": f"online_{split_name}_random_positive_ratio",
+        "online_positive_ratio_selection": (
+            f"online_{split_name}_{str(split_mode or 'random').casefold()}_positive_ratio"
+        ),
         "online_target_positive_ratio": float(target_ratio),
         "online_running_positive_windows": int(positive_count),
         "online_running_negative_windows": int(negative_count),
@@ -1833,6 +2329,116 @@ def _select_negative_fraction_candidates(
     return out
 
 
+def _select_source_breast_ratio_candidates(
+    candidates: list[tuple[dict[str, Any], tuple[int, int, int, int], dict[str, Any]]],
+    crop_cfg: dict[str, Any],
+    split_name: str,
+    rng: np.random.Generator,
+) -> list[tuple[dict[str, Any], tuple[int, int, int, int], dict[str, Any]]]:
+    """Balance crops by the status of their source breast, not tile labels.
+
+    A mass-breast crop can itself be empty; its group is determined by whether
+    any view from the same ``(study_id, laterality)`` breast has a valid Mass.
+    All lesion-containing candidate windows are mandatory. Remaining windows
+    are sampled without replacement to reach the largest feasible requested
+    mixture. For the improved Paper 22 preset this is an exact 50/50 split.
+    """
+    target = _deterministic_target_source_breast_mass_ratio(
+        crop_cfg, split_name
+    )
+    mass_pool = [
+        candidate
+        for candidate in candidates
+        if int(candidate[2].get("source_breast_has_mass", 0)) == 1
+    ]
+    negative_pool = [
+        candidate
+        for candidate in candidates
+        if int(candidate[2].get("source_breast_has_mass", 0)) == 0
+    ]
+    mandatory_mass = [
+        candidate
+        for candidate in mass_pool
+        if int(candidate[2].get("is_positive_window", 0)) == 1
+    ]
+    if not mass_pool or (target < 1.0 and not negative_pool):
+        raise RuntimeError(
+            f"{split_name}: source-breast balancing needs both mass-positive and "
+            f"negative breast candidates; got {len(mass_pool)} and {len(negative_pool)}."
+        )
+
+    if target >= 1.0:
+        mass_count = len(mass_pool)
+        negative_count = 0
+    else:
+        # Largest feasible integer mixture.  For 0.50 this is exactly the
+        # smaller pool size from each group.
+        max_total = min(
+            int(math.floor(len(mass_pool) / target)),
+            int(math.floor(len(negative_pool) / (1.0 - target))),
+        )
+        mass_count = min(len(mass_pool), int(round(max_total * target)))
+        negative_count = min(len(negative_pool), max_total - mass_count)
+        # Correct rounding toward the requested ratio without exceeding pools.
+        if mass_count + negative_count > 0:
+            candidates_nearby: list[tuple[float, int, int, int]] = []
+            for dm in [-1, 0, 1]:
+                for dn in [-1, 0, 1]:
+                    m = mass_count + dm
+                    n = negative_count + dn
+                    if 0 <= m <= len(mass_pool) and 0 <= n <= len(negative_pool) and m + n > 0:
+                        candidates_nearby.append((abs(m / (m + n) - target), -(m + n), m, n))
+            if candidates_nearby:
+                _error, _negative_total, mass_count, negative_count = min(candidates_nearby)
+
+    if len(mandatory_mass) > mass_count:
+        raise RuntimeError(
+            f"{split_name}: exact source-breast ratio would keep only {mass_count} "
+            f"mass-breast crops, fewer than the {len(mandatory_mass)} lesion-containing "
+            "windows. Add more negative-breast sources or raise the target mass-breast ratio."
+        )
+
+    mandatory_ids = {id(candidate) for candidate in mandatory_mass}
+    optional_mass = [candidate for candidate in mass_pool if id(candidate) not in mandatory_ids]
+    optional_mass_count = mass_count - len(mandatory_mass)
+
+    def sample(pool, count):
+        if count >= len(pool):
+            return list(pool)
+        if count <= 0:
+            return []
+        indices = rng.choice(len(pool), size=count, replace=False)
+        return [pool[int(index)] for index in indices]
+
+    selected_mass = mandatory_mass + sample(optional_mass, optional_mass_count)
+    selected_negative = sample(negative_pool, negative_count)
+    selected = selected_mass + selected_negative
+    selected.sort(
+        key=lambda candidate: (
+            str(candidate[0].get("image_id", "")),
+            int(candidate[1][1]),
+            int(candidate[1][0]),
+            int(candidate[1][3]),
+            int(candidate[1][2]),
+        )
+    )
+    achieved = float(len(selected_mass) / len(selected)) if selected else 0.0
+    out = []
+    for record, window, extra in selected:
+        out.append((record, window, {
+            **dict(extra),
+            "source_breast_ratio_selection": f"global_{split_name}_source_breast_ratio",
+            "source_breast_mass_candidate_count": len(mass_pool),
+            "source_breast_negative_candidate_count": len(negative_pool),
+            "source_breast_mandatory_positive_window_count": len(mandatory_mass),
+            "source_breast_selected_mass_count": len(selected_mass),
+            "source_breast_selected_negative_count": len(selected_negative),
+            "source_breast_target_mass_ratio": float(target),
+            "source_breast_achieved_mass_ratio": float(achieved),
+        }))
+    return out
+
+
 def _windows_for_export_split(
     *,
     split_name: str,
@@ -1859,6 +2465,7 @@ def _windows_for_export_split(
             height=image_height,
             crop_size=int(crop_cfg.get("crop_size", 1024)),
             stride=int(crop_cfg.get("stride", 512)),
+            edge_policy=str(crop_cfg.get("edge_policy", "edge_align")),
         )
 
         selection_mode = _deterministic_selection_mode(crop_cfg, split_name)
@@ -1897,26 +2504,68 @@ def _windows_for_export_split(
                 if positive_by_window.get(w, False) or clean_negative_by_window.get(w, False)
             ]
 
-        foreground_filter_enabled = bool(_split_crop_cfg(
+        all_crop_breast_filter_enabled = bool(_split_crop_cfg(
+            crop_cfg,
+            split_name,
+            "require_min_breast_fraction_for_all_crops",
+            False,
+        ))
+        require_retained_breast_mask = bool(_split_crop_cfg(
+            crop_cfg,
+            split_name,
+            "require_retained_breast_mask_for_all_crops",
+            False,
+        ))
+        foreground_filter_enabled = all_crop_breast_filter_enabled or bool(_split_crop_cfg(
             crop_cfg,
             split_name,
             "deterministic_require_foreground",
             False,
         ))
-        min_foreground_fraction = float(_split_crop_cfg(
-            crop_cfg,
-            split_name,
-            "deterministic_min_foreground_fraction",
-            0.05,
-        ))
+        if all_crop_breast_filter_enabled:
+            min_foreground_fraction = float(_split_crop_cfg(
+                crop_cfg,
+                split_name,
+                "min_breast_fraction_for_all_crops",
+                0.30,
+            ))
+            breast_fraction_comparison = str(_split_crop_cfg(
+                crop_cfg,
+                split_name,
+                "breast_fraction_comparison_for_all_crops",
+                "greater_than_or_equal",
+            ))
+        else:
+            min_foreground_fraction = float(_split_crop_cfg(
+                crop_cfg,
+                split_name,
+                "deterministic_min_foreground_fraction",
+                0.05,
+            ))
+            breast_fraction_comparison = "greater_than_or_equal"
         foreground_threshold = crop_cfg.get("deterministic_foreground_threshold", None)
         foreground_fractions: dict[tuple[int, int, int, int], float] = {}
+        foreground_mask_source = ""
         if foreground_filter_enabled:
             if foreground_mask is None:
+                if all_crop_breast_filter_enabled and require_retained_breast_mask:
+                    raise RuntimeError(
+                        "The all-crop breast-occupancy policy requires the retained "
+                        "fixed-preprocessing breast mask, but no mask was supplied. "
+                        "Set preprocess.retain_breast_mask_for_export=true."
+                    )
                 image_np = image_tensor.detach().cpu().squeeze(0).numpy().astype(np.float32, copy=False)
                 foreground_mask = _foreground_mask(image_np, threshold=foreground_threshold)
+                foreground_mask_source = "derived_from_preprocessed_image"
             else:
                 foreground_mask = np.asarray(foreground_mask, dtype=bool)
+                foreground_mask_source = "retained_preprocessing_mask"
+            if tuple(foreground_mask.shape[:2]) != (int(image_height), int(image_width)):
+                raise ValueError(
+                    "Breast foreground mask shape does not match the fixed-preprocessed "
+                    f"image: mask={tuple(foreground_mask.shape)}, "
+                    f"image={(int(image_height), int(image_width))}."
+                )
             kept_windows = []
             for w in windows:
                 frac = _foreground_fraction_from_mask(
@@ -1925,9 +2574,17 @@ def _windows_for_export_split(
                     int(crop_cfg.get("crop_size", 1024)),
                 )
                 foreground_fractions[w] = frac
-                # Paper-positive windows are unconditional. Foreground rejection
-                # is only an optimization for non-annotation windows.
-                if positive_by_window.get(w, False) or frac >= min_foreground_fraction:
+                # Legacy paper presets keep positive windows unconditionally.
+                # The explicit all-crop policy is stricter and applies the breast
+                # occupancy threshold to positive and negative windows alike.
+                if (
+                    (not all_crop_breast_filter_enabled and positive_by_window.get(w, False))
+                    or _breast_fraction_passes(
+                        frac,
+                        min_foreground_fraction,
+                        breast_fraction_comparison,
+                    )
+                ):
                     kept_windows.append(w)
             windows = kept_windows
 
@@ -1959,7 +2616,14 @@ def _windows_for_export_split(
                     "is_clean_negative_window": int(bool(clean_negative_by_window.get(w, False))),
                     "require_clean_negative_windows": int(require_clean_negatives),
                     "foreground_filter_enabled": int(foreground_filter_enabled),
+                    "all_crop_breast_fraction_filter_enabled": int(all_crop_breast_filter_enabled),
+                    "require_retained_breast_mask_for_all_crops": int(require_retained_breast_mask),
+                    "breast_fraction_mask_source": foreground_mask_source,
                     "min_foreground_fraction": float(min_foreground_fraction),
+                    "min_breast_fraction_for_all_crops": (
+                        float(min_foreground_fraction) if all_crop_breast_filter_enabled else None
+                    ),
+                    "breast_fraction_comparison_for_all_crops": breast_fraction_comparison,
                     "foreground_fraction": foreground_fractions.get(w, None),
                 },
             )
@@ -2188,7 +2852,10 @@ def _contralateral_source_arrays_for_window(
     paired_crop = crop_image_and_boxes_to_window(paired_image, boxes=empty_boxes, mass_boxes=empty_boxes, window_xyxy=adjusted_window, options=crop_options)
     if profiler is not None:
         profiler.stop("crop aligned contralateral image")
-    return {"contralateral_same_view_crop": _tensor_to_float2d(paired_crop.image)}, alignment_info
+    return {
+        "contralateral_same_view_crop": _tensor_to_float2d(paired_crop.image),
+        "contralateral_same_view_full": _tensor_to_float2d(paired_image),
+    }, alignment_info
 
 
 def export_baseline_dataset(
@@ -2480,6 +3147,169 @@ def _clip_boxes_xyxy(boxes: torch.Tensor, *, width: int, height: int) -> torch.T
 # -----------------------------------------------------------------------------
 
 
+def _save_paired_whole_image_for_crop(
+    *,
+    source_image: torch.Tensor,
+    crop_root: Path,
+    split_name: str,
+    filename: str,
+    source_image_id: str,
+    config: dict[str, Any],
+    paired_cfg: dict[str, Any],
+    source_path_cache: dict[tuple[str, str], Path],
+    source_foreground_mask: np.ndarray | None = None,
+    whole_stage_cache: dict[str, tuple[np.ndarray, np.ndarray | None]] | None = None,
+    cache_namespace: str = "export",
+) -> dict[str, Any]:
+    """Write one 1024-style whole-breast companion using the crop basename.
+
+    Every crop receives a path under ``whole_images/<split>``. Repeated crops
+    from the same source are hard-linked by default, so paired loaders see a
+    normal one-file-per-crop layout without multiplying disk usage. Filesystems
+    that do not support hard links transparently fall back to a byte copy.
+    """
+    rel_path = Path("whole_images") / split_name / filename
+    out_path = crop_root / rel_path
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    source_key = (str(split_name), str(source_image_id))
+    cached_path = source_path_cache.get(source_key)
+    link_mode = str(paired_cfg.get("storage_mode", "hardlink") or "hardlink").casefold().strip()
+    storage_used = "encoded"
+    # Geometry belongs to every crop/whole pair, not only the first crop that
+    # happens to encode the shared whole image.  Derive it independently of the
+    # hard-link cache so every JSONL row contains the same coordinate-mapping
+    # metadata for a given source image.
+    source_h, source_w = int(source_image.shape[-2]), int(source_image.shape[-1])
+    resize_meta = _paired_whole_geometry_metadata(source_h, source_w, paired_cfg)
+
+    if cached_path is not None and cached_path.exists() and cached_path != out_path:
+        if out_path.exists():
+            out_path.unlink()
+        if link_mode in {"hardlink", "link", "deduplicate"}:
+            try:
+                os.link(cached_path, out_path)
+                storage_used = "hardlink"
+            except OSError:
+                shutil.copy2(cached_path, out_path)
+                storage_used = "copy_fallback"
+        else:
+            shutil.copy2(cached_path, out_path)
+            storage_used = "copy"
+    else:
+        full_arr = _tensor_to_float2d(source_image)
+        src_h, src_w = full_arr.shape
+        whole_rgb, _encoding_meta = _make_rgb_image(
+            full_arr,
+            config,
+            source_arrays={"current_crop": full_arr},
+            full_source_arrays={"current_crop": full_arr},
+            full_source_masks=(
+                {"current_crop": np.asarray(source_foreground_mask, dtype=bool)}
+                if source_foreground_mask is not None
+                else None
+            ),
+            crop_window=(0, 0, int(src_w), int(src_h)),
+            crop_pad_value=float(paired_cfg.get("pad_value", 0.0)),
+            whole_stage_cache=whole_stage_cache,
+            cache_namespace=cache_namespace,
+        )
+        resized_rgb, resize_meta = _pad_then_resize_rgb(whole_rgb, paired_cfg)
+        Image.fromarray(resized_rgb, mode="RGB").save(out_path)
+        source_path_cache[source_key] = out_path
+
+    target_w = max(1, int(paired_cfg.get("target_width", paired_cfg.get("size", 1024)) or 1024))
+    target_h = max(1, int(paired_cfg.get("target_height", paired_cfg.get("size", 1024)) or 1024))
+    return {
+        "paired_whole_image_path": _path_as_posix(rel_path),
+        "paired_whole_source_image_id": str(source_image_id),
+        "paired_whole_width": int(target_w),
+        "paired_whole_height": int(target_h),
+        "paired_whole_storage": storage_used,
+        "paired_whole_pad_then_resize": True,
+        **resize_meta,
+    }
+
+
+def _paired_whole_geometry_metadata(
+    source_height: int,
+    source_width: int,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve the deterministic pad geometry used before whole-image resize."""
+    src_h = max(1, int(source_height))
+    src_w = max(1, int(source_width))
+    canvas_mode = str(cfg.get("canvas_mode", "per_image_square") or "per_image_square").casefold().strip()
+    if canvas_mode in {"fixed", "fixed_canvas", "dataset_fixed"}:
+        canvas_mode = "fixed"
+        canvas_w = max(src_w, int(cfg.get("canvas_width", src_w) or src_w))
+        canvas_h = max(src_h, int(cfg.get("canvas_height", src_h) or src_h))
+    else:
+        canvas_mode = "per_image_square"
+        side = max(src_h, src_w)
+        canvas_w = canvas_h = side
+
+    anchor = str(cfg.get("pad_anchor", "left_top") or "left_top").casefold().strip()
+    extra_x = max(0, canvas_w - src_w)
+    extra_y = max(0, canvas_h - src_h)
+    if anchor in {"center", "centre"}:
+        anchor = "center"
+        left, top = extra_x // 2, extra_y // 2
+    elif anchor in {"left_center", "left-centre", "left_centered"}:
+        anchor = "left_center"
+        left, top = 0, extra_y // 2
+    elif anchor in {"right_center", "right-centre", "right_centered"}:
+        anchor = "right_center"
+        left, top = extra_x, extra_y // 2
+    else:
+        anchor = "left_top"
+        left, top = 0, 0
+
+    target_w = max(1, int(cfg.get("target_width", cfg.get("size", 1024)) or 1024))
+    target_h = max(1, int(cfg.get("target_height", cfg.get("size", 1024)) or 1024))
+    return {
+        "paired_whole_canvas_mode": canvas_mode,
+        "paired_whole_canvas_width": int(canvas_w),
+        "paired_whole_canvas_height": int(canvas_h),
+        "paired_whole_pad_left": int(left),
+        "paired_whole_pad_top": int(top),
+        "paired_whole_pad_value": float(cfg.get("pad_value", 0.0)),
+        "paired_whole_pad_anchor": anchor,
+        "paired_whole_source_width": int(src_w),
+        "paired_whole_source_height": int(src_h),
+        "paired_whole_scale_x": float(target_w / canvas_w),
+        "paired_whole_scale_y": float(target_h / canvas_h),
+    }
+
+
+def _pad_then_resize_rgb(rgb: np.ndarray, cfg: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]]:
+    """Pad a whole RGB image to a common canvas first, then resize it."""
+    arr = np.asarray(rgb, dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError(f"Expected an RGB image, got shape {arr.shape}.")
+    src_h, src_w = int(arr.shape[0]), int(arr.shape[1])
+    geometry = _paired_whole_geometry_metadata(src_h, src_w, cfg)
+    canvas_w = int(geometry["paired_whole_canvas_width"])
+    canvas_h = int(geometry["paired_whole_canvas_height"])
+    left = int(geometry["paired_whole_pad_left"])
+    top = int(geometry["paired_whole_pad_top"])
+    pad_value = float(geometry["paired_whole_pad_value"])
+    pad_u8 = int(round(np.clip(pad_value, 0.0, 1.0) * 255.0))
+    canvas = np.full((canvas_h, canvas_w, 3), pad_u8, dtype=np.uint8)
+    canvas[top:top + src_h, left:left + src_w] = arr
+
+    target_w = max(1, int(cfg.get("target_width", cfg.get("size", 1024)) or 1024))
+    target_h = max(1, int(cfg.get("target_height", cfg.get("size", 1024)) or 1024))
+    if canvas_w == target_w and canvas_h == target_h:
+        out = canvas
+    elif cv2 is not None:
+        interpolation = cv2.INTER_AREA if target_w <= canvas_w and target_h <= canvas_h else cv2.INTER_LINEAR
+        out = cv2.resize(canvas, (target_w, target_h), interpolation=interpolation).astype(np.uint8, copy=False)
+    else:  # pragma: no cover - OpenCV is a declared project dependency
+        resampling = getattr(Image, "Resampling", Image)
+        out = np.asarray(Image.fromarray(canvas, mode="RGB").resize((target_w, target_h), resample=resampling.BILINEAR))
+    return out, geometry
+
+
 def _save_export_images(
     image: torch.Tensor,
     root: Path,
@@ -2487,6 +3317,15 @@ def _save_export_images(
     config: dict[str, Any],
     *,
     source_arrays: dict[str, np.ndarray] | None = None,
+    full_source_arrays: dict[str, np.ndarray] | None = None,
+    full_source_masks: dict[str, np.ndarray] | None = None,
+    source_windows: dict[str, tuple[int, int, int, int]] | None = None,
+    crop_window: tuple[int, int, int, int] | None = None,
+    crop_pad_value: float = 0.0,
+    whole_stage_cache: dict[str, tuple[np.ndarray, np.ndarray | None]] | None = None,
+    cache_namespace: str = "export",
+    reject_blank_output: bool = False,
+    min_output_signal_fraction: float = 0.0,
 ) -> dict[str, Any]:
     """Save the model-training RGB image and, optionally, a preserved 16-bit PNG."""
     img_cfg = config.get("image_export", {})
@@ -2496,13 +3335,42 @@ def _save_export_images(
     train_path.parent.mkdir(parents=True, exist_ok=True)
 
     arr = _tensor_to_float2d(image)
-    rgb, rgb_meta = _make_rgb_image(arr, config, source_arrays=source_arrays)
+    rgb, rgb_meta = _make_rgb_image(
+        arr,
+        config,
+        source_arrays=source_arrays,
+        full_source_arrays=full_source_arrays,
+        full_source_masks=full_source_masks,
+        source_windows=source_windows,
+        crop_window=crop_window,
+        crop_pad_value=crop_pad_value,
+        whole_stage_cache=whole_stage_cache,
+        cache_namespace=cache_namespace,
+    )
+    output_signal_fraction = float(np.any(rgb != 0, axis=-1).mean())
+    if bool(reject_blank_output) and output_signal_fraction < max(
+        float(min_output_signal_fraction),
+        np.finfo(np.float32).eps,
+    ):
+        # Do not leave a stale image behind when an output root is intentionally
+        # reused. Labels/metadata are written only after this function returns.
+        train_path.unlink(missing_ok=True)
+        return {
+            "image_path": _path_as_posix(train_path.relative_to(root)),
+            "rgb_scheme": str(img_cfg.get("rgb_scheme", "multi_window")),
+            "histogram_equalization_enabled": bool(config.get("histogram_equalization", {}).get("enabled", True)),
+            "output_signal_fraction": output_signal_fraction,
+            "output_rejected_blank": True,
+            **rgb_meta,
+        }
     Image.fromarray(rgb, mode="RGB").save(train_path)
 
     out: dict[str, Any] = {
         "image_path": _path_as_posix(train_path.relative_to(root)),
         "rgb_scheme": str(img_cfg.get("rgb_scheme", "multi_window")),
         "histogram_equalization_enabled": bool(config.get("histogram_equalization", {}).get("enabled", True)),
+        "output_signal_fraction": output_signal_fraction,
+        "output_rejected_blank": False,
         **rgb_meta,
     }
 
@@ -2533,6 +3401,13 @@ def _make_rgb_image(
     config: dict[str, Any],
     *,
     source_arrays: dict[str, np.ndarray] | None = None,
+    full_source_arrays: dict[str, np.ndarray] | None = None,
+    full_source_masks: dict[str, np.ndarray] | None = None,
+    source_windows: dict[str, tuple[int, int, int, int]] | None = None,
+    crop_window: tuple[int, int, int, int] | None = None,
+    crop_pad_value: float = 0.0,
+    whole_stage_cache: dict[str, tuple[np.ndarray, np.ndarray | None]] | None = None,
+    cache_namespace: str = "export",
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Return an 8-bit RGB image according to ``image_export.rgb_scheme``.
 
@@ -2551,6 +3426,18 @@ def _make_rgb_image(
         channels = [ch, ch.copy(), ch.copy()]
         meta["rgb_windows"] = [[lo, hi]] * 3
 
+    elif scheme in {"paper69_mammoclip_uint8", "mammoclip_uint8_replicated"}:
+        finite = arr[np.isfinite(arr)]
+        if finite.size and float(finite.min()) >= 0.0 and float(finite.max()) <= 255.0:
+            ch = np.clip(arr, 0.0, 255.0).astype(np.uint8)
+        elif finite.size:
+            lo, hi = float(finite.min()), float(finite.max())
+            ch = (((arr - lo) / max(hi - lo, 1e-12)) * 255.0).clip(0, 255).astype(np.uint8)
+        else:
+            ch = np.zeros(arr.shape, dtype=np.uint8)
+        channels = [ch, ch.copy(), ch.copy()]
+        meta["paper69_mammoclip_uint8_replicated"] = True
+
     elif scheme == "equalized_rgb":
         lo, hi = _safe_percentile(arr, img_cfg.get("single_window", [0.5, 99.5]), mask)
         ch = _equalize_uint8(_to_uint8_window(arr, lo, hi), mask=mask)
@@ -2567,7 +3454,19 @@ def _make_rgb_image(
         meta.update(literature_meta)
 
     elif scheme in {"custom_channel_pipeline", "gui_channel_pipeline"}:
-        channels, custom_meta = _make_custom_channel_pipeline_rgb(arr, img_cfg, mask, source_arrays=source_arrays)
+        channels, custom_meta = _make_custom_channel_pipeline_rgb(
+            arr,
+            img_cfg,
+            mask,
+            source_arrays=source_arrays,
+            full_source_arrays=full_source_arrays,
+            full_source_masks=full_source_masks,
+            source_windows=source_windows,
+            crop_window=crop_window,
+            crop_pad_value=crop_pad_value,
+            whole_stage_cache=whole_stage_cache,
+            cache_namespace=cache_namespace,
+        )
         meta.update(custom_meta)
 
     elif scheme == "bitpack16":
@@ -2596,6 +3495,7 @@ def _make_rgb_image(
         raise ValueError(
             "Unknown image_export.rgb_scheme. Expected one of: "
             "multi_window, grayscale_rgb, equalized_rgb, "
+            "paper69_mammoclip_uint8, "
             "intensity_equalized_gradient, raw_clahe_detail, raw_replicated, "
             "raw_clahe_masked_raw, raw_clahe_tophat, custom_channel_pipeline, bitpack16."
         )
@@ -2725,6 +3625,13 @@ def _make_custom_channel_pipeline_rgb(
     mask: np.ndarray,
     *,
     source_arrays: dict[str, np.ndarray] | None = None,
+    full_source_arrays: dict[str, np.ndarray] | None = None,
+    full_source_masks: dict[str, np.ndarray] | None = None,
+    source_windows: dict[str, tuple[int, int, int, int]] | None = None,
+    crop_window: tuple[int, int, int, int] | None = None,
+    crop_pad_value: float = 0.0,
+    whole_stage_cache: dict[str, tuple[np.ndarray, np.ndarray | None]] | None = None,
+    cache_namespace: str = "export",
 ) -> tuple[list[np.ndarray], dict[str, Any]]:
     """Create RGB channels using a GUI-exported per-channel operation pipeline.
 
@@ -2743,6 +3650,9 @@ def _make_custom_channel_pipeline_rgb(
     }
     source_arrays = dict(source_arrays or {})
     source_arrays.setdefault("current_crop", arr)
+    full_source_arrays = dict(full_source_arrays or {})
+    full_source_masks = dict(full_source_masks or {})
+    source_windows = dict(source_windows or {})
     source_masks: dict[str, np.ndarray] = {}
     for key, value in source_arrays.items():
         if value is None:
@@ -2769,25 +3679,28 @@ def _make_custom_channel_pipeline_rgb(
         if stat_mask is not None and stat_mask.shape != work.shape:
             stat_mask = _foreground_mask(work)
 
-        applied: list[dict[str, Any]] = []
-        for step in _custom_channel_steps(pipeline, channel):
-            if not isinstance(step, dict):
-                continue
-            op = str(step.get("op", "none")).casefold().strip()
-            params = step.get("params", {}) or {}
-            if op in {"none", "", "null"}:
-                continue
-            work = _apply_custom_channel_operation(work, op, params, stat_mask)
-            if stat_mask is not None and stat_mask.shape != work.shape:
-                stat_mask = _foreground_mask(work)
-            elif _custom_operation_should_preserve_background(op) and stat_mask is not None and stat_mask.any():
-                work = np.where(stat_mask, work, float(params.get("outside_value", 0.0))).astype(np.float32)
-            applied.append({"op": op, "params": params})
+        work, applied, scope_meta = apply_scoped_steps(
+            work,
+            _custom_channel_steps(pipeline, channel),
+            apply_operation=lambda work_arr, op, params, work_mask: _apply_custom_channel_operation(
+                work_arr, op, params, work_mask
+            ),
+            make_stat_mask=_foreground_mask,
+            operation_preserves_background=_custom_operation_should_preserve_background,
+            full_source=full_source_arrays.get(source_used),
+            full_stat_mask=full_source_masks.get(source_used),
+            window_xyxy=source_windows.get(source_used, crop_window),
+            pad_value=float(crop_pad_value),
+            whole_stage_cache=whole_stage_cache,
+            cache_namespace=str(cache_namespace),
+            source_name=source_used,
+        )
         channels.append(_float_to_uint8_custom(work))
         meta[f"custom_{channel}_source_requested"] = source_name
         meta[f"custom_{channel}_source_used"] = source_used
         meta[f"custom_{channel}_source_fallback"] = int(source_fallback)
         meta[f"custom_{channel}_steps"] = applied
+        meta[f"custom_{channel}_scope"] = scope_meta
     return channels, meta
 
 
@@ -3224,6 +4137,12 @@ def _foreground_mask(arr: np.ndarray, threshold: float | None = None) -> np.ndar
             threshold = max(float(lo + 0.02 * (hi - lo)), float(lo) + 1e-6)
     mask = finite & (arr > float(threshold))
     mask = _cleanup_foreground_mask(mask, min_area_fraction=0.001, keep_largest=True)
+    if not mask.any() and float(np.nanmax(arr)) > float(np.nanmin(arr)):
+        # Very small previews can make the border-based threshold sample most
+        # of the image. Fall back to all pixels above the finite minimum rather
+        # than handing an all-false mask to operations that would zero output.
+        fallback = finite & (arr > float(np.nanmin(arr)))
+        mask = _cleanup_foreground_mask(fallback, min_area_fraction=0.001, keep_largest=True)
     return mask
 
 
@@ -3373,6 +4292,9 @@ def _write_square_crop_debug_logs(
         "is_positive_window",
         "crop_mode",
         "crop_window_xyxy",
+        "breast_fraction_mask_source",
+        "foreground_fraction",
+        "min_breast_fraction_for_all_crops",
         "negative_foreground_fraction",
         "bbox_safe_foreground_fraction",
         "bbox_safe_margin_ok",
@@ -3553,7 +4475,16 @@ def _validate_square_crop_contract(
             "eligible_negative_candidates": eligible_negatives,
             "saved_negative_crops": saved_negatives,
         }
-        if bool(contract.get("require_all_source_annotations_represented", False)) and represented_ids != source_mass_count:
+        require_annotations_by_split = dict(
+            contract.get("require_all_source_annotations_represented_by_split", {}) or {}
+        )
+        require_annotations = bool(
+            require_annotations_by_split.get(
+                split_name,
+                contract.get("require_all_source_annotations_represented", False),
+            )
+        )
+        if require_annotations and represented_ids != source_mass_count:
             errors.append(
                 f"{split_name}: represented {represented_ids}/{source_mass_count} source annotations"
             )
@@ -3564,28 +4495,109 @@ def _validate_square_crop_contract(
 
     metrics["splits"] = source_metrics
     train_mode = _deterministic_selection_mode(crop_cfg, "train")
-    if train_mode != "negative_fraction":
-        errors.append(f"train: deterministic selection mode is {train_mode!r}, expected 'negative_fraction'")
+    expected_train_mode = str(
+        contract.get("expected_train_selection_mode", "negative_fraction")
+    )
+    if train_mode != expected_train_mode:
+        errors.append(
+            f"train: deterministic selection mode is {train_mode!r}, expected {expected_train_mode!r}"
+        )
+    expected_eval_mode = str(contract.get("expected_eval_selection_mode", "all"))
     for split_name in ["val", "test"]:
         mode = _deterministic_selection_mode(crop_cfg, split_name)
-        if mode != "all":
-            errors.append(f"{split_name}: deterministic selection mode is {mode!r}, expected 'all'")
+        if mode != expected_eval_mode:
+            errors.append(
+                f"{split_name}: deterministic selection mode is {mode!r}, expected {expected_eval_mode!r}"
+            )
 
-    train_candidates = int(source_metrics["train"]["eligible_negative_candidates"])
-    keep_fraction = _deterministic_negative_keep_fraction(crop_cfg, "train")
-    expected_train_negatives = int(round(train_candidates * keep_fraction))
-    actual_train_negatives = int(source_metrics["train"]["saved_negative_crops"])
-    metrics["train_negative_selection"] = {
-        "candidate_count": train_candidates,
-        "keep_fraction": keep_fraction,
-        "expected_saved_count": expected_train_negatives,
-        "actual_saved_count": actual_train_negatives,
+    if expected_train_mode == "negative_fraction":
+        train_candidates = int(source_metrics["train"]["eligible_negative_candidates"])
+        keep_fraction = _deterministic_negative_keep_fraction(crop_cfg, "train")
+        expected_train_negatives = int(round(train_candidates * keep_fraction))
+        actual_train_negatives = int(source_metrics["train"]["saved_negative_crops"])
+        metrics["train_negative_selection"] = {
+            "candidate_count": train_candidates,
+            "keep_fraction": keep_fraction,
+            "expected_saved_count": expected_train_negatives,
+            "actual_saved_count": actual_train_negatives,
+        }
+        if actual_train_negatives != expected_train_negatives:
+            errors.append(
+                f"train: saved {actual_train_negatives}/{train_candidates} eligible negatives; "
+                f"expected rounded {keep_fraction:.3f} retention ({expected_train_negatives})"
+            )
+
+    train_images = list(coco_by_split.get("train", {}).get("images", []))
+    mass_breast_crops = sum(
+        int(image.get("source_breast_has_mass", 0) or 0) for image in train_images
+    )
+    negative_breast_crops = len(train_images) - mass_breast_crops
+    achieved_mass_breast_fraction = (
+        float(mass_breast_crops / len(train_images)) if train_images else 0.0
+    )
+    metrics["train_source_breast_crop_balance"] = {
+        "mass_breast_crops": mass_breast_crops,
+        "negative_breast_crops": negative_breast_crops,
+        "mass_breast_fraction": achieved_mass_breast_fraction,
     }
-    if actual_train_negatives != expected_train_negatives:
+    expected_breast_fraction = contract.get(
+        "expected_train_mass_breast_crop_fraction"
+    )
+    if expected_breast_fraction is not None and not math.isclose(
+        achieved_mass_breast_fraction,
+        float(expected_breast_fraction),
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
         errors.append(
-            f"train: saved {actual_train_negatives}/{train_candidates} eligible negatives; "
-            f"expected rounded {keep_fraction:.3f} retention ({expected_train_negatives})"
+            "train: source-breast crop balance is "
+            f"{achieved_mass_breast_fraction:.6f}; expected {float(expected_breast_fraction):.6f}"
         )
+
+    strict_min_by_split = dict(
+        contract.get("min_breast_fraction_strictly_greater_than_by_split", {}) or {}
+    )
+    # Backward compatibility for manifests/configs written before per-split
+    # breast-mask thresholds were supported.
+    legacy_train_min = contract.get("train_min_breast_fraction_strictly_greater_than")
+    if legacy_train_min is not None:
+        strict_min_by_split.setdefault("train", legacy_train_min)
+    for split_name, strict_min_breast_fraction in strict_min_by_split.items():
+        if split_name not in {"train", "val", "test"}:
+            errors.append(
+                "min_breast_fraction_strictly_greater_than_by_split contains "
+                f"unknown split {split_name!r}"
+            )
+            continue
+        split_images = list(coco_by_split.get(split_name, {}).get("images", []))
+        missing_fraction = [
+            image for image in split_images if image.get("breast_fraction") is None
+        ]
+        violating_fraction = [
+            image
+            for image in split_images
+            if image.get("breast_fraction") is not None
+            and float(image.get("breast_fraction")) <= float(strict_min_breast_fraction)
+        ]
+        metrics[f"{split_name}_breast_fraction"] = {
+            "required_strictly_greater_than": float(strict_min_breast_fraction),
+            "minimum_saved": min(
+                (
+                    float(image.get("breast_fraction"))
+                    for image in split_images
+                    if image.get("breast_fraction") is not None
+                ),
+                default=None,
+            ),
+            "missing_count": len(missing_fraction),
+            "violating_count": len(violating_fraction),
+        }
+        if missing_fraction or violating_fraction:
+            errors.append(
+                f"{split_name}: breast-mask coverage contract failed for "
+                f"{len(missing_fraction)} missing and {len(violating_fraction)} <= "
+                f"{float(strict_min_breast_fraction):.3f} crops"
+            )
 
     min_inference_grid_fraction = float(contract.get("min_inference_grid_fraction", 0.0) or 0.0)
     for split_name in ["val", "test"]:
@@ -3595,6 +4607,22 @@ def _validate_square_crop_contract(
                 f"{split_name}: saved {fraction:.3%} of the complete grid; "
                 f"minimum is {min_inference_grid_fraction:.3%}"
             )
+        complete_grid_by_split = dict(
+            contract.get("require_complete_inference_grid_by_split", {}) or {}
+        )
+        require_complete_grid = bool(
+            complete_grid_by_split.get(
+                split_name,
+                contract.get("require_complete_inference_grid", False),
+            )
+        )
+        if require_complete_grid:
+            saved = int(source_metrics[split_name]["saved_crops"])
+            complete = int(source_metrics[split_name]["complete_grid_windows"])
+            if saved != complete:
+                errors.append(
+                    f"{split_name}: saved {saved}/{complete} windows; complete inference grid required"
+                )
 
     crop_size = int(crop_cfg.get("crop_size", 0))
     for split_name, coco in coco_by_split.items():
@@ -3820,10 +4848,21 @@ def _coco_image_record(
         "export_split": split_name,
         "dataset": dataset_name,
         "preserved_16bit_path": save_info.get("preserved_16bit_path"),
+        "paired_whole_image_path": save_info.get("paired_whole_image_path"),
         "rgb_scheme": save_info.get("rgb_scheme"),
     }
     if crop_info:
         out["crop_window_xyxy"] = crop_info.get("window_xyxy")
+        out["source_breast_key"] = crop_info.get("source_breast_key")
+        out["source_breast_has_mass"] = crop_info.get("source_breast_has_mass")
+        out["breast_fraction"] = crop_info.get("foreground_fraction")
+        out["min_breast_fraction"] = crop_info.get(
+            "min_breast_fraction_for_all_crops",
+            crop_info.get("min_foreground_fraction"),
+        )
+        out["breast_fraction_mask_source"] = crop_info.get(
+            "breast_fraction_mask_source"
+        )
     return out
 
 
@@ -3918,6 +4957,10 @@ def _sample_stats_row(
         "preserved_16bit_path": save_info.get("preserved_16bit_path", ""),
         "preserved_16bit_lo": save_info.get("preserved_16bit_lo", ""),
         "preserved_16bit_hi": save_info.get("preserved_16bit_hi", ""),
+        "paired_whole_image_path": save_info.get("paired_whole_image_path", ""),
+        "paired_whole_width": save_info.get("paired_whole_width", ""),
+        "paired_whole_height": save_info.get("paired_whole_height", ""),
+        "paired_whole_storage": save_info.get("paired_whole_storage", ""),
     }
     if crop_info:
         window = crop_info.get("window_xyxy")
@@ -3933,12 +4976,26 @@ def _sample_stats_row(
                 "negative_selected_count": crop_info.get("negative_selected_count", ""),
                 "negative_achieved_keep_fraction": crop_info.get("negative_achieved_keep_fraction", ""),
                 "source_image_has_finding": crop_info.get("source_image_has_finding", ""),
+                "source_breast_key": crop_info.get("source_breast_key", ""),
+                "source_breast_has_mass": crop_info.get("source_breast_has_mass", ""),
+                "source_breast_ratio_selection": crop_info.get("source_breast_ratio_selection", ""),
+                "source_breast_mass_candidate_count": crop_info.get("source_breast_mass_candidate_count", ""),
+                "source_breast_negative_candidate_count": crop_info.get("source_breast_negative_candidate_count", ""),
+                "source_breast_mandatory_positive_window_count": crop_info.get("source_breast_mandatory_positive_window_count", ""),
+                "source_breast_selected_mass_count": crop_info.get("source_breast_selected_mass_count", ""),
+                "source_breast_selected_negative_count": crop_info.get("source_breast_selected_negative_count", ""),
+                "source_breast_target_mass_ratio": crop_info.get("source_breast_target_mass_ratio", ""),
+                "source_breast_achieved_mass_ratio": crop_info.get("source_breast_achieved_mass_ratio", ""),
                 "is_positive_window": crop_info.get("is_positive_window", ""),
                 "requested_positive": crop_info.get("requested_positive"),
                 "accepted": crop_info.get("accepted"),
                 "foreground_filter_enabled": crop_info.get("foreground_filter_enabled", ""),
+                "all_crop_breast_fraction_filter_enabled": crop_info.get("all_crop_breast_fraction_filter_enabled", ""),
+                "breast_fraction_mask_source": crop_info.get("breast_fraction_mask_source", ""),
                 "foreground_fraction": crop_info.get("foreground_fraction", ""),
                 "min_foreground_fraction": crop_info.get("min_foreground_fraction", ""),
+                "min_breast_fraction_for_all_crops": crop_info.get("min_breast_fraction_for_all_crops", ""),
+                "breast_fraction_comparison_for_all_crops": crop_info.get("breast_fraction_comparison_for_all_crops", ""),
                 "negative_foreground_filter_enabled": crop_info.get("negative_foreground_filter_enabled", ""),
                 "negative_foreground_fraction": crop_info.get("negative_foreground_fraction", ""),
                 "negative_min_foreground_fraction": crop_info.get("negative_min_foreground_fraction", ""),
@@ -3979,6 +5036,7 @@ def _sample_metadata_record(
         "source_dicom_path": str(record.get("dicom_path", "")),
         "training_image": save_info.get("image_path"),
         "preserved_16bit_image": save_info.get("preserved_16bit_path"),
+        "paired_whole_image": save_info.get("paired_whole_image_path"),
         "encoding": save_info,
         "export_boxes_xyxy": _boxes_to_list(boxes),
         "crop_info": crop_info or {},
@@ -4009,14 +5067,23 @@ def _flatten_metadata_row(row: dict[str, Any]) -> dict[str, Any]:
         "source_dicom_path": row.get("source_dicom_path"),
         "training_image": row.get("training_image"),
         "preserved_16bit_image": row.get("preserved_16bit_image"),
+        "paired_whole_image": row.get("paired_whole_image"),
         "breast_birads": row.get("breast_birads"),
         "breast_density": row.get("breast_density"),
         "num_export_boxes": len(row.get("export_boxes_xyxy", []) or []),
         "crop_window_xyxy": crop.get("window_xyxy", ""),
         "crop_mode": crop.get("crop_mode", ""),
+        "source_breast_key": crop.get("source_breast_key", ""),
+        "source_breast_has_mass": crop.get("source_breast_has_mass", ""),
+        "source_breast_target_mass_ratio": crop.get("source_breast_target_mass_ratio", ""),
+        "source_breast_achieved_mass_ratio": crop.get("source_breast_achieved_mass_ratio", ""),
         "foreground_filter_enabled": crop.get("foreground_filter_enabled", ""),
+        "all_crop_breast_fraction_filter_enabled": crop.get("all_crop_breast_fraction_filter_enabled", ""),
+        "breast_fraction_mask_source": crop.get("breast_fraction_mask_source", ""),
         "foreground_fraction": crop.get("foreground_fraction", ""),
         "min_foreground_fraction": crop.get("min_foreground_fraction", ""),
+        "min_breast_fraction_for_all_crops": crop.get("min_breast_fraction_for_all_crops", ""),
+        "breast_fraction_comparison_for_all_crops": crop.get("breast_fraction_comparison_for_all_crops", ""),
         "bbox_safe_boundary_margin_fraction": crop.get("bbox_safe_boundary_margin_fraction", ""),
         "bbox_safe_foreground_fraction": crop.get("bbox_safe_foreground_fraction", ""),
         "bbox_safe_score": crop.get("bbox_safe_score", ""),
@@ -4027,6 +5094,9 @@ def _flatten_metadata_row(row: dict[str, Any]) -> dict[str, Any]:
         "histogram_equalization_enabled": enc.get("histogram_equalization_enabled", ""),
         "preserved_16bit_lo": enc.get("preserved_16bit_lo", ""),
         "preserved_16bit_hi": enc.get("preserved_16bit_hi", ""),
+        "paired_whole_width": enc.get("paired_whole_width", ""),
+        "paired_whole_height": enc.get("paired_whole_height", ""),
+        "paired_whole_storage": enc.get("paired_whole_storage", ""),
     }
 
 
@@ -4204,9 +5274,11 @@ def _collect_export_file_counts(output_root: Path) -> dict[str, int]:
             img_dir = output_root / dataset_name / "images" / split_name
             label_dir = output_root / dataset_name / "labels" / split_name
             preserved_dir = output_root / dataset_name / "preserved_16bit" / split_name
+            paired_whole_dir = output_root / dataset_name / "whole_images" / split_name
             counts[f"{dataset_name}.{split_name}.images_png"] = _count_files(img_dir, "*.png")
             counts[f"{dataset_name}.{split_name}.labels_txt"] = _count_files(label_dir, "*.txt")
             counts[f"{dataset_name}.{split_name}.preserved_16bit_png"] = _count_files(preserved_dir, "*.png")
+            counts[f"{dataset_name}.{split_name}.paired_whole_png"] = _count_files(paired_whole_dir, "*.png")
     return counts
 
 

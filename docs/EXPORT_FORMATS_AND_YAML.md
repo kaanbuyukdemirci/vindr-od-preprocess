@@ -32,6 +32,13 @@ G:/preprocessed-vindr/
       train/
       val/
       test/
+    whole_images/                    # present when paired_whole_images.enabled
+      train/                         # same basename as each crop
+      val/
+      test/
+    metadata/
+      samples_metadata.jsonl
+      samples_metadata_flat.csv
     vindr_mass.yaml                  # recommended portable Ultralytics YAML
     ultralytics/
       vindr_mass.yaml                # compatibility copy, also portable
@@ -76,9 +83,23 @@ VinDr-Mammo already has an official `split` column with `training` and `test`. T
 
 ```yaml
 splits:
+  strategy: random_study_fraction
   val_fraction_from_training: 0.15
   seed: 123
 ```
+
+Supported source split strategies are:
+
+- `random_study_fraction`: reserve a seeded fraction of official training
+  studies for validation; official test remains untouched.
+- `official_only`: retain VinDr's original training/test membership and create
+  no validation set.
+- `exact_study_count`: select `validation_study_count` complete studies, with an
+  optional exact `validation_image_count`.
+
+Splitting is by `study_id`, so all mammographic views from one examination stay
+together. VinDr has no official validation cohort; do not use its official test
+set for early stopping.
 
 ## Square crop behavior
 
@@ -92,6 +113,7 @@ For the square-crop export:
 square_crops:
   crop_size: 1024
   stride: 512
+  edge_policy: edge_align
   random_crops_per_annotation: 1
   random_crops_per_negative_image: 1
   positive_fraction: 0.80
@@ -103,12 +125,34 @@ The most important parameters are:
 |---|---|
 | `crop_size` | The square crop size `n`, so each crop is `n x n`. |
 | `stride` | Sliding-window stride for validation and test. Lower means more overlap and more crops. |
+| `edge_policy` | `edge_align` shifts the last start to the boundary. `regular_stride_pad` preserves the stride grid and pads the final out-of-image region with `pad_value`. |
 | `random_crops_per_annotation` | Number of mass-centered random crops to create per mass box in the training split. |
 | `random_crops_per_negative_image` | Number of clean random crops for images with no mass annotations. |
 | `positive_fraction` | Approximate target positive/negative balance for training crops. For example, `0.80` means about 80 percent positive crops. |
 | `center_shift_fraction` | Random shift around the mass center, as a fraction of crop size. With `0.25` and `1024`, the center can shift up to about 256 pixels. |
 | `deterministic_include_empty` | Global default for deterministic splits. If true, deterministic crops include clean windows. |
 | `<split>_deterministic_include_empty` | Split-specific override, for example `train_deterministic_include_empty: false` keeps only positive deterministic train crops while val/test can still include empty windows. |
+
+## Paired whole-image context
+
+Enable a whole-breast context input for every crop with:
+
+```yaml
+paired_whole_images:
+  enabled: true
+  target_width: 1024
+  target_height: 1024
+  canvas_mode: per_image_square
+  pad_value: 0.0
+  pad_anchor: left_top
+  storage_mode: hardlink
+```
+
+Each companion is written to `whole_images/<split>/<same crop basename>.png`.
+The breast image is padded to a square before resizing, so its aspect ratio is
+not warped. Repeated companions from one source mammogram are hard-linked when
+the filesystem supports it. The complete loader contract is in
+[`PAIRED_CROP_DATA_CONTRACT.md`](PAIRED_CROP_DATA_CONTRACT.md).
 
 ## Partial annotation policy
 
@@ -158,7 +202,7 @@ On Linux, the same YAML works after moving the dataset because it contains only 
 ```bash
 yolo detect train \
   model=yolo11n.pt \
-  data=/mnt/t9/preprocessed-vindr/square_crops/vindr_mass.yaml \
+  data=/mnt/t9/vindr-data/preprocessed-vindr/square_crops/vindr_mass.yaml \
   imgsz=1024
 ```
 
@@ -490,11 +534,11 @@ Pass this file directly to Ultralytics. The older compatibility YAML under `squa
 
 ### v3 deterministic positive-only train dataset
 
-The default configuration now targets `/mnt/t9/preprocessed-vindr-v3`. The purpose is to create a deterministic training set but exclude empty training windows:
+The default configuration now targets `/mnt/t9/vindr-data/preprocessed-vindr-v3`. The purpose is to create a deterministic training set but exclude empty training windows:
 
 ```yaml
 paths:
-  output_root: "/mnt/t9/preprocessed-vindr-v3"
+  output_root: "/mnt/t9/vindr-data/preprocessed-vindr-v3"
 
 square_crops:
   crop_size: 1024
@@ -564,6 +608,121 @@ square_crops:
 ```
 
 The exporter stores `foreground_filter_enabled`, `foreground_fraction`, and `min_foreground_fraction` in `samples.csv` and per-sample metadata so you can audit which crops passed the filter.
+
+For a strict dataset contract that also rejects annotated/positive crops below a
+breast-occupancy threshold, use the optional all-crop policy:
+
+```yaml
+preprocess:
+  retain_breast_mask_for_export: true
+
+square_crops:
+  require_min_breast_fraction_for_all_crops: true
+  min_breast_fraction_for_all_crops: 0.30
+  breast_fraction_comparison_for_all_crops: greater_than_or_equal
+  require_retained_breast_mask_for_all_crops: true
+```
+
+This policy applies to positive and negative crops in deterministic or random
+export modes. It divides the retained mask pixels inside the window by the full
+crop area, so edge padding counts as non-breast. With
+`require_retained_breast_mask_for_all_crops: true`, export fails clearly instead
+of silently estimating a replacement mask if fixed preprocessing did not retain
+one. Saved metadata includes `foreground_fraction`,
+`min_breast_fraction_for_all_crops`, and `breast_fraction_mask_source`.
+Set `breast_fraction_comparison_for_all_crops: strictly_greater_than` when the
+threshold itself must be rejected (for example, Paper 22 improved requires
+`breast_fraction > 0.10`, not `>= 0.10`). All of these keys support a
+`train_`, `val_`, or `test_` prefix.
+
+### Patient/breast-aware training subset
+
+The custom Paper 22 improved preset first selects train and validation at
+`study_id` level from the mass-positive cohort. It then expands only the
+selected training studies to every view and labels a breast by
+`(study_id, laterality)`:
+
+```yaml
+source_cohort:
+  finding_category: Mass
+  positive_images_only: true
+  train_expand_to_all_patient_breast_views: true
+  train_breast_status_unit: study_laterality
+
+square_crops:
+  train_deterministic_selection_mode: source_breast_ratio
+  train_deterministic_target_source_breast_mass_ratio: 0.50
+  train_require_min_breast_fraction_for_all_crops: true
+  train_min_breast_fraction_for_all_crops: 0.10
+  train_breast_fraction_comparison_for_all_crops: strictly_greater_than
+  train_require_retained_breast_mask_for_all_crops: true
+
+  val_deterministic_selection_mode: all
+  test_deterministic_selection_mode: all
+  val_require_min_breast_fraction_for_all_crops: true
+  val_min_breast_fraction_for_all_crops: 0.10
+  val_breast_fraction_comparison_for_all_crops: strictly_greater_than
+  val_require_retained_breast_mask_for_all_crops: true
+  test_require_min_breast_fraction_for_all_crops: true
+  test_min_breast_fraction_for_all_crops: 0.10
+  test_breast_fraction_comparison_for_all_crops: strictly_greater_than
+  test_require_retained_breast_mask_for_all_crops: true
+  val_deterministic_require_foreground: false
+  test_deterministic_require_foreground: false
+  val_negative_require_foreground: false
+  test_negative_require_foreground: false
+```
+
+The selector balances the final training crop count by source-breast status, not by
+whether an individual tile contains a box. Thus the mass-breast half includes
+both lesion tiles and clean tiles from breasts known to contain a Mass in at
+least one view. Every eligible lesion-containing window is mandatory; remaining
+windows are sampled without replacement to the largest feasible exact ratio.
+COCO image records and CSV metadata include `source_breast_key`,
+`source_breast_has_mass`, and achieved balance fields.
+
+Validation and test are not class-balanced. They retain every grid candidate
+whose fixed full-image breast-mask fraction is strictly greater than 10%, which
+removes background-only marker/label windows while preserving source IDs and
+source-coordinate labels for Maximum Box Fusion evaluation.
+
+### Online deterministic training balance with complete validation/test grids
+
+Simple Dataset v1 uses deterministic sliding windows without collecting the
+entire training candidate pool first. Every positive training window is written;
+eligible negative windows are admitted online while the running counts need
+another negative toward the configured target ratio. Sources and candidate
+windows are shuffled with the configured seed to reduce order bias:
+
+```yaml
+square_crops:
+  train_crop_mode: deterministic
+  train_deterministic_selection_mode: positive_ratio
+  train_deterministic_target_positive_ratio: 0.50
+  train_online_positive_ratio_selection_for_deterministic: true
+  train_online_balance_shuffle_source_records: true
+  train_online_balance_shuffle_windows: true
+
+  train_require_clean_negative_windows: true
+  train_deterministic_require_foreground: true
+  train_deterministic_min_foreground_fraction: 0.80
+  train_negative_require_foreground: true
+  train_negative_min_foreground_fraction: 0.80
+
+  val_deterministic_selection_mode: all
+  test_deterministic_selection_mode: all
+  val_online_positive_ratio_selection_for_deterministic: false
+  test_online_positive_ratio_selection_for_deterministic: false
+  val_deterministic_require_foreground: false
+  test_deterministic_require_foreground: false
+  val_negative_require_foreground: false
+  test_negative_require_foreground: false
+```
+
+Online training balance is approximate because negatives encountered before the
+running stream needs them can be skipped. It never drops a positive window to
+force the target. Validation and test take the normal non-balancing path and save
+their complete generated stride grids.
 
 ## COCO size statistics in visualization reports
 

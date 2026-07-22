@@ -568,6 +568,35 @@ label input[type="radio"] {
   margin-left: 0;
 }
 
+.button-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 38px;
+  padding: 0 14px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  color: #1e40af;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.queue-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 10px;
+  font-size: 12px;
+}
+
+.queue-table th,
+.queue-table td {
+  padding: 8px;
+  border: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
 .viewer-toolbar label,
 .field .dash-checklist label,
 .field .dash-radioitems label {

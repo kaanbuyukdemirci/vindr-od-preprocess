@@ -86,6 +86,7 @@ These controls run before square-crop selection and before the RGB channel pipel
 |---|---|---|
 | Crop size n | `square_crops.crop_size` | Square crop size in pixels. |
 | Deterministic stride | `square_crops.stride` | Sliding-window stride in pixels. |
+| Image-edge window policy | `square_crops.edge_policy` | `edge_align` shifts the last window to end at the image boundary; `regular_stride_pad` keeps exact stride origins and zero-pads the out-of-image part. |
 | PREVIEW ONLY, crop proposal mode | GUI preview, export uses split controls | Selects deterministic sliding, stochastic random, or bbox-safe breast-biased random crop proposals for browsing. |
 | PREVIEW ONLY, show only crops with visible mass | GUI only | Filters preview candidates to positive crops. Export balance is controlled in the export panel. |
 | PREVIEW ONLY, positive crop threshold | GUI only | Visibility fraction required for the GUI to call a crop positive. |
@@ -102,8 +103,9 @@ These controls run before square-crop selection and before the RGB channel pipel
 | Breast foreground bias strength | `square_crops.bbox_safe_breast_bias_strength` | Prefers candidate crops with more breast foreground. |
 | Left/chest-wall alignment bias strength | `square_crops.bbox_safe_left_bias_strength` | Gently prefers left-aligned crops after orientation normalization. |
 | X-projection peak bias strength | `square_crops.bbox_safe_projection_bias_strength` | Prefers crops containing strong horizontal foreground support. |
-| Require crop to contain breast foreground | `square_crops.deterministic_require_foreground` | Rejects windows with too little foreground. |
-| Minimum foreground fraction in crop | `square_crops.deterministic_min_foreground_fraction` | Minimum breast-mask fraction for foreground-filtered crops. |
+| Train/validation/test: Filter by breast coverage | `square_crops.<split>_require_min_breast_fraction_for_all_crops` | Three independent switches under **Foreground-ratio crop filter**. Each rejects windows with too little retained breast-mask coverage in that split. |
+| Train/validation/test: Minimum breast fraction | `square_crops.<split>_min_breast_fraction_for_all_crops` | Three independent thresholds. The GUI writes `strictly_greater_than`, so `0.10` means `breast_fraction > 0.10`. |
+| Minimum foreground fraction in crop | `square_crops.deterministic_min_foreground_fraction` or `train_min_breast_fraction_for_all_crops` | Minimum breast-mask fraction for foreground-filtered crops. Improved Paper 22 uses a strict `> 0.10` comparison, including annotated training crops. |
 | Foreground threshold for square crops | `square_crops.deterministic_foreground_threshold` | Auto or manual threshold for crop foreground filtering. |
 | Show foreground mask preview for selected crop | GUI only | Displays the foreground pixels used by the crop filter. |
 
@@ -128,6 +130,7 @@ Used only when an RGB channel source is `contralateral_same_view_crop`.
 | Source | `image_export.custom_channel_pipeline.<R/G/B>.source` | Uses the current crop or the aligned opposite-breast crop. |
 | Number of steps | `image_export.custom_channel_pipeline.<R/G/B>.steps` | Number of ordered preprocessing operations in that channel. |
 | Step | `image_export.custom_channel_pipeline.<R/G/B>.steps[].op` | Operation name. Parameters below depend on the selected operation. |
+| Apply to whole fixed-preprocessed image before cropping | `image_export.custom_channel_pipeline.<R/G/B>.steps[].apply_before_crop` | Runs that operation on the complete fixed-preprocessed source, then extracts the requested crop. Off runs it on the crop. Whole-scoped operations are evaluated before crop-scoped operations. |
 
 ### Channel Operations
 
@@ -176,10 +179,29 @@ Used only when an RGB channel source is `contralateral_same_view_crop`.
 | Delete output folder before export | `export.clean_output_root` | Removes the target export folder before writing. Use carefully. |
 | Sliding crop export (square_crops) | `export.save_square_crops` | Writes overlapping fixed-size crop images and labels. |
 | Whole-image export (baseline_uncropped) | `export.save_baseline_uncropped` | Writes one preprocessed image per mammogram without final square cropping. |
+| Save paired whole image for every crop | `paired_whole_images.enabled` | Writes `whole_images/<split>/<same crop basename>.png`; the simple preset pads to a square before resizing to 1024. |
+| Paired whole image size | `paired_whole_images.target_width`, `target_height` | Output dimensions of the context image. |
+| Deduplicate repeated whole images with hard links | `paired_whole_images.storage_mode` | Keeps one pathname per crop while repeated companions from the same mammogram share disk blocks when supported. |
+| Split policy | `splits.strategy` | Chooses a seeded random study-fraction validation set, original VinDr train/test only, or an exact validation study count. The official test set always remains test. |
+| Validation fraction | `splits.val_fraction_from_training` | Fraction of official training studies reserved for validation in `random_study_fraction` mode. |
+| Validation study/image counts | `splits.validation_study_count`, `validation_image_count` | Exact-count mode. Image count `0` in the GUI means unconstrained. |
+| Split seed | `splits.seed` | Makes the selected validation study membership reproducible. |
+| Stratify by BI-RADS | `splits.stratify_by_birads` | Samples validation studies proportionally across study-level BI-RADS strata. |
 | Vendor mode / selected vendors | `vendor_filter` | Exports all vendors or only selected vendors. |
 | Train/val/test crop mode | `square_crops.<split>_crop_mode` | Per-split deterministic, random, or bbox-safe random export mode. |
-| Train/val/test mass/empty selection | `square_crops.<split>_deterministic_selection_mode` | Exports mass only, all windows, finding-image windows, or all mass plus sampled non-mass. |
+| Train/val/test mass/empty selection | `square_crops.<split>_deterministic_selection_mode` | Exports mass only, all eligible windows, finding-image windows, all mass plus sampled non-mass, or train-only source-breast balancing. Source-breast mode classifies breasts by `(study_id, laterality)`, expands only selected training patients, and keeps all validation/test windows that pass their breast-mask rule. |
 | Train/val/test target mass-positive crop ratio | `square_crops.<split>_positive_fraction` and related fields | Target positive fraction for deterministic sampling or random crop requests. |
 | BBox-safe export parameters | `square_crops.bbox_safe_*` | Reuses the crop-preview bbox-safe controls for export. |
 | Show simple timing breakdown during export | `runtime.simple_profiler_enabled` | Enables coarse timing buckets during export. |
 | Profiler GUI update frequency | `runtime.simple_profiler_emit_every` | Reduces UI overhead by updating timing every N progress events. |
+
+## Storage And Export Queue
+
+| GUI label | Meaning |
+|---|---|
+| Selected-disk space | Resolves the nearest existing parent of the requested output folder and reports total, used, free, queued reservations, and predicted remaining space. |
+| Estimate current pipeline | Computes a conservative upper bound from source dimensions, crop geometry, enabled baseline/paired outputs, labels, and metadata. Foreground rejection and balancing can make the real export smaller. |
+| Add current pipeline to queue | Deep-copies the effective configuration, output path, and estimate into a FIFO job. Later GUI changes do not mutate the queued job. |
+| Start queue | Runs one extraction at a time and continues to the next job after a failure. |
+| Remove / retry | Removes queued or completed jobs, or appends a failed job to the end of the queue. A running export is not cancellable. |
+| Open queue in another window | Opens the queue monitor at `?queue=1`; the main Studio can remain on preview controls. |

@@ -17,6 +17,10 @@ DEFAULT_PREPROCESS_OPTIONS: dict[str, Any] = {
     "crop_breast": False,
     "mask_outside_breast": False,
     "mirror_right_to_left": False,
+    "trim_border_px": 0,
+    # Optional paper-replication transform: per-image min-max conversion to
+    # uint8-valued float pixels before the breast/background crop.
+    "intensity_scale_before_geometry": "none",
     "crop_padding": 10,
     "crop_padding_fraction": 0.03,
     "minimum_padding_px": 32,
@@ -84,7 +88,52 @@ def apply_geometry_preprocessing(
         "crop_box_xyxy": None,
         "mirrored": False,
         "original_shape": (int(image.shape[-2]), int(image.shape[-1])),
+        "trim_border_px": int(opts.get("trim_border_px", 0) or 0),
+        "trim_box_xyxy": None,
+        "intensity_scale_before_geometry": str(opts.get("intensity_scale_before_geometry", "none")),
     }
+
+    trim = max(0, int(opts.get("trim_border_px", 0) or 0))
+    source_offset_x = 0
+    source_offset_y = 0
+    if trim > 0:
+        height, width = int(image.shape[-2]), int(image.shape[-1])
+        if width > 2 * trim and height > 2 * trim:
+            trim_box = (trim, trim, width - trim, height - trim)
+            image = image[:, trim:height - trim, trim:width - trim].contiguous()
+            boxes, next_keep = _crop_boxes(
+                boxes,
+                trim_box,
+                min_visibility=float(opts.get("min_box_visibility_after_crop", 0.30)),
+            )
+            box_keep = _compose_keep_masks(box_keep, next_keep)
+            mass_boxes, next_mass_keep = _crop_boxes(
+                mass_boxes,
+                trim_box,
+                min_visibility=float(opts.get("min_box_visibility_after_crop", 0.30)),
+            )
+            mass_box_keep = _compose_keep_masks(mass_box_keep, next_mass_keep)
+            source_offset_x = trim
+            source_offset_y = trim
+            info["trim_box_xyxy"] = trim_box
+
+    intensity_scale = str(opts.get("intensity_scale_before_geometry", "none") or "none").casefold().strip()
+    if intensity_scale in {"minmax_uint8", "uint8_minmax", "mammo_clip_uint8"}:
+        arr = _image_to_numpy(image)
+        finite = arr[np.isfinite(arr)]
+        if finite.size:
+            lo = float(finite.min())
+            hi = float(finite.max())
+            if hi > lo:
+                scaled = ((arr - lo) / (hi - lo) * 255.0).astype(np.uint8)
+            else:
+                scaled = np.zeros(arr.shape, dtype=np.uint8)
+        else:
+            scaled = np.zeros(arr.shape, dtype=np.uint8)
+        image = torch.as_tensor(
+            np.ascontiguousarray(scaled), dtype=torch.float32, device=image.device
+        ).unsqueeze(0)
+        info["intensity_scale_before_geometry"] = "minmax_uint8"
 
     foreground_mask: np.ndarray | None = None
     if opts.get("mask_outside_breast") and not opts["crop_breast"]:
@@ -114,14 +163,22 @@ def apply_geometry_preprocessing(
         x0, y0, x1, y1 = crop_box
         image = image[:, y0:y1, x0:x1].contiguous()
         foreground_mask = np.asarray(mask[y0:y1, x0:x1], dtype=bool)
-        boxes, box_keep = _crop_boxes(boxes, crop_box, min_visibility=float(opts.get("min_box_visibility_after_crop", 0.30)))
-        mass_boxes, mass_box_keep = _crop_boxes(mass_boxes, crop_box, min_visibility=float(opts.get("min_box_visibility_after_crop", 0.30)))
+        boxes, next_keep = _crop_boxes(boxes, crop_box, min_visibility=float(opts.get("min_box_visibility_after_crop", 0.30)))
+        box_keep = _compose_keep_masks(box_keep, next_keep)
+        mass_boxes, next_mass_keep = _crop_boxes(mass_boxes, crop_box, min_visibility=float(opts.get("min_box_visibility_after_crop", 0.30)))
+        mass_box_keep = _compose_keep_masks(mass_box_keep, next_mass_keep)
         if opts.get("mask_outside_breast"):
             crop_mask = foreground_mask
             mask_t = torch.as_tensor(crop_mask, dtype=image.dtype, device=image.device).unsqueeze(0)
             image = image * mask_t
             info["breast_mask_pixels"] = int(crop_mask.sum())
-        info["crop_box_xyxy"] = crop_box
+        info["crop_box_after_trim_xyxy"] = crop_box
+        info["crop_box_xyxy"] = (
+            int(crop_box[0] + source_offset_x),
+            int(crop_box[1] + source_offset_y),
+            int(crop_box[2] + source_offset_x),
+            int(crop_box[3] + source_offset_y),
+        )
 
     if opts["mirror_right_to_left"]:
         if pre_crop_should_mirror is None:
@@ -321,6 +378,15 @@ def _breast_mask(arr: np.ndarray, *, threshold: float | None = None, options: di
         return np.zeros(arr.shape, dtype=bool)
     if threshold is None:
         method = str(opts.get("breast_mask_method", "largest_connected_tissue")).casefold().strip()
+        if method in {
+            "mammo_clip_contiguous_variance",
+            "mammoclip_contiguous_variance",
+            "paper69_mammoclip_background_crop",
+        }:
+            x0, y0, x1, y1 = _mammo_clip_background_crop_box(arr)
+            mask = np.zeros(arr.shape, dtype=bool)
+            mask[y0:y1, x0:x1] = True
+            return mask
         if method in {"largest_connected_tissue", "largest_component", "simple_largest_connected_tissue", "robust_largest_connected_tissue"}:
             threshold = _robust_tissue_threshold(arr)
             mask = np.isfinite(arr) & (arr > float(threshold))
@@ -336,6 +402,72 @@ def _breast_mask(arr: np.ndarray, *, threshold: float | None = None, options: di
         threshold = max(float(p_low + 0.02 * (p_high - p_low)), float(p_low) + 1e-6)
     mask = np.isfinite(arr) & (arr > float(threshold))
     return _postprocess_breast_mask(mask, opts)
+
+
+def _mammo_clip_background_crop_box(arr: np.ndarray) -> tuple[int, int, int, int]:
+    """Reproduce MammoCLIP's public longest-nonconstant-run breast crop.
+
+    Paper 69 does not publish its crop implementation. Its authors state that
+    preprocessing is a full-resolution excess-background crop and that the
+    dataset follows MammoCLIP. This helper therefore implements the closest
+    public reference exactly, while callers can keep the result at native size.
+    """
+    src = np.nan_to_num(np.asarray(arr, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    height, width = src.shape
+    if height == 0 or width == 0:
+        return (0, 0, width, height)
+    lo = float(src.min())
+    hi = float(src.max())
+    if hi > lo:
+        img = ((src - lo) / (hi - lo) * 255.0).astype(np.uint8)
+    else:
+        img = np.zeros(src.shape, dtype=np.uint8)
+    detect = np.where(img <= 40, 0, img)
+
+    y_a = height // 2 + int(height * 0.4)
+    y_b = height // 2 - int(height * 0.4)
+    col_nonconstant = detect[y_b:y_a].std(axis=0) != 0
+    col_indices = _longest_true_run_indices(col_nonconstant)
+    if col_indices.size == 0:
+        col_indices = np.arange(width)
+    narrowed = detect[:, col_indices]
+
+    narrowed_width = int(narrowed.shape[1])
+    x_a = narrowed_width // 2 + int(narrowed_width * 0.4)
+    x_b = narrowed_width // 2 - int(narrowed_width * 0.4)
+    row_nonconstant = narrowed[:, x_b:x_a].std(axis=1) != 0
+    row_indices = _longest_true_run_indices(row_nonconstant)
+    if row_indices.size == 0:
+        row_indices = np.arange(height)
+
+    x0 = int(col_indices[0])
+    x1 = int(col_indices[-1]) + 1
+    y0 = int(row_indices[0])
+    y1 = int(row_indices[-1]) + 1
+    if x1 <= x0 or y1 <= y0:
+        return (0, 0, width, height)
+    return (x0, y0, x1, y1)
+
+
+def _longest_true_run_indices(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=bool).reshape(-1)
+    best_start = 0
+    best_length = 0
+    start: int | None = None
+    for idx, value in enumerate(values):
+        if value and start is None:
+            start = idx
+        if (not value or idx == len(values) - 1) and start is not None:
+            end = idx + 1 if value and idx == len(values) - 1 else idx
+            length = end - start
+            if length > best_length:
+                best_start, best_length = start, length
+            start = None
+    if best_length <= 0:
+        # MammoCLIP's original CountUpContinuingOnes code selects the full axis
+        # when every entry is constant; retain that benign fallback.
+        return np.arange(len(values), dtype=int)
+    return np.arange(best_start, best_start + best_length, dtype=int)
 
 
 def _robust_tissue_threshold(arr: np.ndarray) -> float:
@@ -388,11 +520,22 @@ def _postprocess_breast_mask(mask: np.ndarray, opts: dict[str, Any]) -> np.ndarr
     if bool(opts.get("breast_mask_keep_largest_component", True)):
         mask = _largest_component_mask(mask, min_area_fraction=float(opts.get("min_component_area_fraction", 0.001)))
     if bool(opts.get("breast_mask_fill_holes", True)):
-        flood = mask.astype(np.uint8).copy()
+        # Flood from an artificial background border rather than assuming the
+        # real image's (0, 0) pixel is background. A valid breast/component can
+        # touch that corner; seeding directly there leaves the flood unchanged,
+        # causing ``~flood`` to classify every real background pixel as a hole
+        # and turn the complete image mask true.
+        padded = np.pad(
+            mask.astype(np.uint8),
+            ((1, 1), (1, 1)),
+            mode="constant",
+            constant_values=0,
+        )
+        flood = padded.copy()
         h, w = flood.shape
         flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
         cv2.floodFill(flood, flood_mask, (0, 0), 1)
-        holes = ~flood.astype(bool)
+        holes = (~flood.astype(bool))[1:-1, 1:-1]
         mask = mask | holes
     return mask
 
@@ -424,6 +567,22 @@ def _crop_boxes(boxes: torch.Tensor, crop_box: tuple[int, int, int, int], *, min
     visible_area = ((out[:, 2] - out[:, 0]).clamp(min=0) * (out[:, 3] - out[:, 1]).clamp(min=0))
     keep = (out[:, 2] > out[:, 0]) & (out[:, 3] > out[:, 1]) & ((visible_area / original_area) >= float(min_visibility))
     return out[keep].contiguous(), keep.cpu()
+
+
+def _compose_keep_masks(previous: torch.Tensor, current: torch.Tensor) -> torch.Tensor:
+    """Map a keep mask on already-filtered boxes back to the original rows."""
+    previous = previous.detach().cpu().to(dtype=torch.bool).reshape(-1)
+    current = current.detach().cpu().to(dtype=torch.bool).reshape(-1)
+    active = torch.where(previous)[0]
+    if int(active.numel()) != int(current.numel()):
+        raise ValueError(
+            "Cannot compose box keep masks with incompatible lengths: "
+            f"{int(active.numel())} active versus {int(current.numel())} current."
+        )
+    out = torch.zeros_like(previous)
+    if active.numel():
+        out[active[current]] = True
+    return out
 
 
 def _mirror_boxes(boxes: torch.Tensor, width: int) -> torch.Tensor:

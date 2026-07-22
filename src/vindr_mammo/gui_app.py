@@ -44,7 +44,19 @@ from .crops import (
     sliding_square_windows,
 )
 from .dataset import VindrMammoDataset
-from .export import export_from_config, load_export_config, make_train_val_test_split
+from .export import (
+    _apply_custom_channel_operation as _export_apply_channel_operation,
+    _custom_operation_should_preserve_background as _export_operation_should_preserve_background,
+    _float_to_uint8_custom as _export_float_to_uint8,
+    _foreground_mask as _export_foreground_mask,
+    _expand_training_to_patient_breast_views,
+    _records_for_source_cohort,
+    export_from_config,
+    load_export_config,
+    make_train_val_test_split,
+    normalize_split_strategy_kwargs,
+)
+from .pipeline_scope import apply_scoped_steps
 from .preprocessing import _breast_chest_wall_side, _robust_tissue_threshold, align_contralateral_image_to_reference
 from .visualize import create_visualizations_from_export
 
@@ -372,14 +384,14 @@ def _render_saved_dataset_viewer_mode(cfg: dict[str, Any]) -> None:
         "This reads PNG, YOLO label, CSV, and YAML files only. It does not load the original DICOMs."
     )
 
-    default_root = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/preprocessed-vindr-v19")))
+    default_root = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/vindr-data/preprocessed-vindr-v19")))
     controls = st.columns([3.0, 1.0])
     dataset_root_text = controls[0].text_input(
         "Exported dataset root or square_crops folder",
         value=str(default_root),
         help=(
-            "Use the export root, for example /mnt/t9/preprocessed-vindr-v19, or point directly to "
-            "/mnt/t9/preprocessed-vindr-v19/square_crops."
+            "Use the export root, for example /mnt/t9/vindr-data/preprocessed-vindr-v19, or point directly to "
+            "/mnt/t9/vindr-data/preprocessed-vindr-v19/square_crops."
         ),
         key="saved_viewer_dataset_root",
     )
@@ -666,12 +678,12 @@ def _render_dataset_visualization_mode(cfg: dict[str, Any]) -> None:
         "read DICOMs and it does not regenerate crops."
     )
 
-    default_root = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/preprocessed-vindr-v3")))
+    default_root = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/vindr-data/preprocessed-vindr-v3")))
     path_text = st.text_input(
         "Exported dataset path",
         value=str(default_root),
         help=(
-            "Usually this is the export root, for example /mnt/t9/preprocessed-vindr-v3. "
+            "Usually this is the export root, for example /mnt/t9/vindr-data/preprocessed-vindr-v3. "
             "You may also point directly to square_crops or baseline_uncropped."
         ),
         key="viz_mode_dataset_path",
@@ -977,14 +989,14 @@ def _render_manifest_comparison_mode(cfg: dict[str, Any]) -> None:
     )
 
     default_paths = "\n".join([
-        str(cfg.get("paths", {}).get("output_root", "/mnt/t9/preprocessed-vindr-v3")),
+        str(cfg.get("paths", {}).get("output_root", "/mnt/t9/vindr-data/preprocessed-vindr-v3")),
     ])
     path_text = st.text_area(
         "Dataset directories or manifest/export_summary paths, one per line",
         value=st.session_state.get("manifest_compare_paths", default_paths),
         height=140,
         key="manifest_compare_paths",
-        help="Examples: /mnt/t9/preprocessed-vindr-v5 or /mnt/t9/preprocessed-vindr-v5/manifest.json",
+        help="Examples: /mnt/t9/vindr-data/preprocessed-vindr-v5 or /mnt/t9/vindr-data/preprocessed-vindr-v5/manifest.json",
     )
     uploaded = st.file_uploader(
         "Optional: upload manifest/export_summary JSON files",
@@ -1394,10 +1406,14 @@ def _current_preprocessing_yaml_payload(
             "mode": crop_controls.get("mode"),
             "crop_size": crop_controls.get("crop_size"),
             "stride": crop_controls.get("stride"),
+            "edge_policy": crop_controls.get("edge_policy", "edge_align"),
             "only_mass_crops": crop_controls.get("only_mass_crops"),
             "positive_crop_visible_mass_fraction": crop_controls.get("positivity_threshold"),
             "require_foreground": crop_controls.get("require_foreground"),
             "min_foreground_fraction": crop_controls.get("min_foreground_fraction"),
+            "split_breast_filters": dict(
+                crop_controls.get("split_breast_filters", {}) or {}
+            ),
             "foreground_threshold": crop_controls.get("foreground_threshold"),
             "random_preview_count": crop_controls.get("random_preview_count"),
             "random_seed": crop_controls.get("random_seed"),
@@ -1432,9 +1448,28 @@ def _current_preprocessing_yaml_payload(
             "square_crops": {
                 "crop_size": crop_controls.get("crop_size"),
                 "stride": crop_controls.get("stride"),
+                "edge_policy": crop_controls.get("edge_policy", "edge_align"),
                 "deterministic_require_foreground": crop_controls.get("require_foreground"),
                 "deterministic_min_foreground_fraction": crop_controls.get("min_foreground_fraction"),
                 "deterministic_foreground_threshold": crop_controls.get("foreground_threshold"),
+                **{
+                    f"{split}_{suffix}": value
+                    for split, settings in dict(
+                        crop_controls.get("split_breast_filters", {}) or {}
+                    ).items()
+                    for suffix, value in {
+                        "require_min_breast_fraction_for_all_crops": bool(
+                            dict(settings or {}).get("enabled", False)
+                        ),
+                        "min_breast_fraction_for_all_crops": float(
+                            dict(settings or {}).get("minimum", 0.05)
+                        ),
+                        "breast_fraction_comparison_for_all_crops": "strictly_greater_than",
+                        "require_retained_breast_mask_for_all_crops": bool(
+                            dict(settings or {}).get("enabled", False)
+                        ),
+                    }.items()
+                },
                 # Export mass-vs-empty balance is intentionally not written from the preview sidebar.
                 # Set it in the Export dataset panel, which writes split-specific *_positive_fraction fields.
                 "center_shift_fraction": crop_options.get("center_shift_fraction"),
@@ -1567,12 +1602,29 @@ def _split_df_cached(records_json: str, val_fraction: float, seed: int) -> pd.Da
 
 def _load_split_records(dataset: VindrMammoDataset, cfg: dict[str, Any]) -> tuple[dict[str, list[dict[str, Any]]], pd.DataFrame]:
     split_cfg = cfg.get("splits", {})
+    cohort_records, _cohort_summary = _records_for_source_cohort(dataset, cfg)
     split_records, split_df = make_train_val_test_split(
-        dataset.image_records,
-        val_fraction=float(split_cfg.get("val_fraction_from_training", 0.15)),
-        seed=int(split_cfg.get("seed", 123)),
-        stratify_by_birads=bool(split_cfg.get("stratify_by_birads", False)),
+        cohort_records,
+        **normalize_split_strategy_kwargs(split_cfg),
     )
+    split_records, expansion_summary = _expand_training_to_patient_breast_views(
+        dataset, split_records, cfg
+    )
+    if expansion_summary.get("enabled", False):
+        rows = []
+        for split_name in ["train", "val", "test"]:
+            for record in split_records.get(split_name, []):
+                rows.append({
+                    "export_split": split_name,
+                    "official_split": record.get("split"),
+                    "study_id": str(record.get("study_id", "")),
+                    "image_id": str(record.get("image_id", "")),
+                    "laterality": record.get("laterality"),
+                    "view_position": record.get("view_position"),
+                    "source_breast_key": record.get("_source_breast_key", ""),
+                    "source_breast_has_mass": record.get("_source_breast_has_mass", ""),
+                })
+        split_df = pd.DataFrame(rows)
     return split_records, split_df
 
 
@@ -1906,6 +1958,27 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         value=int(crop_cfg.get("stride", 512)),
         key=_widget_key("crop_stride"),
     )
+    edge_policy_options = {
+        "edge_align": "Align final window to image edge (legacy)",
+        "regular_stride_pad": "Keep regular stride and pad outside image",
+    }
+    configured_edge_policy = str(crop_cfg.get("edge_policy", "edge_align") or "edge_align").casefold().strip()
+    if configured_edge_policy == "pad":
+        configured_edge_policy = "regular_stride_pad"
+    if configured_edge_policy not in edge_policy_options:
+        configured_edge_policy = "edge_align"
+    edge_policy_label = st.sidebar.selectbox(
+        "Deterministic edge policy",
+        options=list(edge_policy_options.values()),
+        index=list(edge_policy_options.keys()).index(configured_edge_policy),
+        key=_widget_key("crop_edge_policy"),
+        help=(
+            "Legacy edge alignment moves the last window back so it ends at the image edge, which can make "
+            "the last step shorter than the requested stride. Regular-stride padding keeps the origin on the "
+            "stride grid and fills any pixels beyond the image with the crop padding value."
+        ),
+    )
+    edge_policy = {label: key for key, label in edge_policy_options.items()}[edge_policy_label]
 
     train_mode_for_default = str(crop_cfg.get("train_crop_mode", "deterministic")).strip().casefold()
     if train_mode_for_default == "random":
@@ -2106,23 +2179,43 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
             )
 
     with st.sidebar.expander("Foreground-ratio crop filter", expanded=False):
-        require_foreground = st.checkbox(
-            "Require crop to contain breast foreground",
-            value=bool(crop_cfg.get("deterministic_require_foreground", False)),
-            key=_widget_key("crop_require_foreground"),
-            help=(
-                "Reject crop windows whose breast-pixel fraction is below the threshold. Example: with minimum=0.05, "
-                "at least 5% of the crop must look like breast foreground. This is shared with export when enabled."
-            ),
+        st.caption(
+            "Configure train, validation, and test independently. Enabled splits use a strict "
+            "breast_fraction > threshold rule based on the retained full-image mask."
         )
-        min_foreground_fraction = st.slider(
-            "Minimum foreground fraction in crop",
-            min_value=0.0,
-            max_value=1.0,
-            value=float(crop_cfg.get("deterministic_min_foreground_fraction", 0.05)),
-            step=0.01,
-            key=_widget_key("crop_min_foreground_fraction"),
-        )
+        split_require_foreground: dict[str, bool] = {}
+        split_min_foreground_fraction: dict[str, float] = {}
+        split_columns = st.columns(3)
+        for split, column in zip(("train", "val", "test"), split_columns):
+            with column:
+                st.markdown(f"**{split.title()}**")
+                split_require_foreground[split] = st.checkbox(
+                    "Filter by breast coverage",
+                    value=bool(crop_cfg.get(
+                        f"{split}_require_min_breast_fraction_for_all_crops",
+                        crop_cfg.get("deterministic_require_foreground", False),
+                    )),
+                    key=_widget_key(f"crop_{split}_require_foreground"),
+                    help=(
+                        f"Reject {split} windows whose retained breast-mask fraction is not "
+                        "strictly above the threshold."
+                    ),
+                )
+                split_min_foreground_fraction[split] = st.slider(
+                    "Minimum breast fraction",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(crop_cfg.get(
+                        f"{split}_min_breast_fraction_for_all_crops",
+                        crop_cfg.get("deterministic_min_foreground_fraction", 0.05),
+                    )),
+                    step=0.01,
+                    key=_widget_key(f"crop_{split}_min_foreground_fraction"),
+                )
+        # The interactive crop preview represents training behavior. Export
+        # receives the complete split-specific mapping below.
+        require_foreground = split_require_foreground["train"]
+        min_foreground_fraction = split_min_foreground_fraction["train"]
         fg_threshold_mode = st.radio(
             "Foreground threshold for square crops",
             ["auto", "manual"],
@@ -2323,6 +2416,7 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         "mode": "bbox_safe_random" if crop_mode == "bbox-safe breast-biased random" else ("random" if crop_mode == "stochastic random" else "deterministic"),
         "crop_size": int(crop_size),
         "stride": int(stride),
+        "edge_policy": str(edge_policy),
         "allow_partial_annotations": bool(allow_partial),
         "min_box_visibility": float(min_box_visibility),
         "reject_partial_windows": bool(policy.get("reject_partial_windows", not bool(allow_partial))) if _is_loaded_config_active() else not bool(allow_partial),
@@ -2343,6 +2437,7 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     return {
         "crop_size": int(crop_size),
         "stride": int(stride),
+        "edge_policy": str(edge_policy),
         "mode": "bbox_safe_random" if crop_mode == "bbox-safe breast-biased random" else ("random" if crop_mode == "stochastic random" else "deterministic"),
         "random_preview_count": int(random_preview_count),
         "random_seed": int(random_seed),
@@ -2350,6 +2445,13 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         "positivity_threshold": float(positivity_threshold),
         "require_foreground": bool(require_foreground),
         "min_foreground_fraction": float(min_foreground_fraction),
+        "split_breast_filters": {
+            split: {
+                "enabled": bool(split_require_foreground[split]),
+                "minimum": float(split_min_foreground_fraction[split]),
+            }
+            for split in ("train", "val", "test")
+        },
         "foreground_threshold": foreground_threshold,
         "foreground_mask_preview": bool(foreground_mask_preview),
         "bbox_safe_boundary_margin_fraction": float(bbox_safe_boundary_margin_fraction),
@@ -2639,10 +2741,21 @@ def _pipeline_controls(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
                     key=f"{channel}_op_{i}{control_suffix}",
                 )
                 default_params = {}
+                default_before_crop = False
                 if i < len(default_steps_raw) and isinstance(default_steps_raw[i], dict) and str(default_steps_raw[i].get("op", "none")) == op:
                     default_params = dict(default_steps_raw[i].get("params", {}) or {})
+                    default_before_crop = bool(default_steps_raw[i].get("apply_before_crop", False))
+                apply_before_crop = st.checkbox(
+                    "Apply this method to the whole fixed-preprocessed image before square cropping",
+                    value=default_before_crop,
+                    key=f"{channel}_before_crop_{i}{control_suffix}",
+                    help=(
+                        "Checked: run on the whole breast, then extract the selected crop. "
+                        "Unchecked: run only on the crop, matching legacy behavior."
+                    ),
+                )
                 params = _op_parameter_controls(channel, i, op, default_params, widget_suffix=control_suffix)
-                steps.append({"op": op, "params": params})
+                steps.append({"op": op, "params": params, "apply_before_crop": bool(apply_before_crop)})
             pipeline[channel] = {"source": source, "steps": steps}
     return pipeline
 
@@ -2920,6 +3033,9 @@ def _selection_mode_from_config(crop_cfg: dict[str, Any], split: str) -> str:
         "negative_fraction": "negative_fraction",
         "negative fraction": "negative_fraction",
         "all positive + fraction of negatives": "negative_fraction",
+        "source_breast_ratio": "source_breast_ratio",
+        "source breast ratio": "source_breast_ratio",
+        "50/50 crops by source breast status": "source_breast_ratio",
         "finding_images_all_windows": "finding_images_all_windows",
         "finding_images_only_all_windows": "finding_images_all_windows",
         "findings_images_all_windows": "finding_images_all_windows",
@@ -2967,6 +3083,7 @@ def _deterministic_selection_controls(crop_cfg: dict[str, Any], split_crop_modes
         "all": "all",
         "positive_ratio": "all mass + sampled non-mass",
         "negative_fraction": "all positive + fraction of negatives",
+        "source_breast_ratio": "50/50 crops by source breast status",
         "finding_images_all_windows": "finding images only, all crops",
     }
     payload: dict[str, dict[str, Any]] = {}
@@ -2977,6 +3094,8 @@ def _deterministic_selection_controls(crop_cfg: dict[str, Any], split_crop_modes
             label = mode_to_label.get(current_mode, "all mass + sampled non-mass")
             split_mode = str(split_crop_modes.get(split, crop_cfg.get(f"{split}_crop_mode", "deterministic"))).strip().casefold()
             split_options = list(options)
+            if split == "train":
+                split_options.insert(2, "50/50 crops by source breast status")
             if split_mode in {"random", "bbox_safe_random"}:
                 # Random generators do not have a natural sliding-window "all" mode.
                 # Their export balance is controlled by the target ratio only.
@@ -2996,7 +3115,10 @@ def _deterministic_selection_controls(crop_cfg: dict[str, Any], split_crop_modes
                 ),
             )
             target_ratio = _split_target_positive_ratio_from_config(crop_cfg, split)
-            if selected_label == "all mass + sampled non-mass":
+            if selected_label in {
+                "all mass + sampled non-mass",
+                "50/50 crops by source breast status",
+            }:
                 target_ratio = st.slider(
                     f"{split.title()} target mass-positive crop ratio",
                     min_value=0.01,
@@ -3029,6 +3151,7 @@ def _deterministic_selection_controls(crop_cfg: dict[str, Any], split_crop_modes
                     "all": "all",
                     "all mass + sampled non-mass": "positive_ratio",
                     "all positive + fraction of negatives": "negative_fraction",
+                    "50/50 crops by source breast status": "source_breast_ratio",
                     "finding images only, all crops": "finding_images_all_windows",
                 }[selected_label],
                 "target_positive_ratio": float(target_ratio),
@@ -3041,12 +3164,17 @@ def _apply_deterministic_selection_to_config(square: dict[str, Any], payload: di
     for split in ["train", "val", "test"]:
         split_payload = payload.get(split, {})
         mode = str(split_payload.get("mode", "all")).strip().casefold()
-        if mode not in {"mass_only", "all", "positive_ratio", "negative_fraction", "finding_images_all_windows"}:
+        if mode not in {
+            "mass_only", "all", "positive_ratio", "negative_fraction",
+            "source_breast_ratio", "finding_images_all_windows"
+        }:
             mode = "all"
         ratio = float(split_payload.get("target_positive_ratio", square.get("positive_fraction", 0.50)))
         ratio = min(max(ratio, 0.01), 1.0)
         square[f"{split}_deterministic_selection_mode"] = mode
         square[f"{split}_deterministic_target_positive_ratio"] = ratio
+        if mode == "source_breast_ratio":
+            square[f"{split}_deterministic_target_source_breast_mass_ratio"] = ratio
         negative_fraction = float(split_payload.get(
             "negative_keep_fraction",
             square.get(f"{split}_deterministic_negative_keep_fraction", square.get("deterministic_negative_keep_fraction", 0.20)),
@@ -3138,7 +3266,7 @@ def _export_dataset_from_gui_panel(
             "and RGB channel pipeline. This runs the same exporter as main.py, but with a GUI-built config."
         )
         export_cfg_defaults = dict(cfg.get("export", {}) or {})
-        current_output = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/preprocessed-vindr-v3")))
+        current_output = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/vindr-data/preprocessed-vindr-v3")))
         output_parent = st.text_input(
             "Export parent folder",
             value=str(current_output.parent),
@@ -3148,7 +3276,7 @@ def _export_dataset_from_gui_panel(
         dataset_name = st.text_input(
             "Dataset folder name",
             value=current_output.name if current_output.name else "preprocessed-vindr-gui",
-            help="Final output path is parent/name. Example: /mnt/t9/preprocessed-vindr-v4.",
+            help="Final output path is parent/name. Example: /mnt/t9/vindr-data/preprocessed-vindr-v4.",
             key=_widget_key("gui_export_dataset_name"),
         )
         output_root = Path(output_parent) / dataset_name
@@ -3228,15 +3356,20 @@ def _export_dataset_from_gui_panel(
             "Use this when you want 50% mass crops and 50% empty crops. For random and bbox-safe random, the exporter now "
             "uses an online approximate balance by default: it saves mass crops immediately, keeps running counts, and saves "
             "empty crops when the current split needs more empty crops. Empty crops can come from any source image, including "
-            "images with no mass. For deterministic sliding, positive-ratio selection still uses the exact planning-based sampler."
+            "images with no mass. Deterministic sliding also supports online balance when "
+            "square_crops.<split>_online_positive_ratio_selection_for_deterministic is enabled; Simple Dataset v1 enables it "
+            "for training only and keeps complete deterministic grids for validation/test."
         )
         selection_payload = _deterministic_selection_controls(crop_cfg, split_crop_modes)
-        with st.expander("Random/bbox-safe balance behavior", expanded=False):
+        with st.expander("Online balance behavior", expanded=False):
             online_default = bool(crop_cfg.get("online_positive_ratio_selection_for_random", True))
+            deterministic_online_train = bool(crop_cfg.get("train_online_positive_ratio_selection_for_deterministic", False))
             shuffle_default = bool(crop_cfg.get("online_balance_shuffle_source_records", True))
             st.write({
                 "online_positive_ratio_selection_for_random": online_default,
+                "train_online_positive_ratio_selection_for_deterministic": deterministic_online_train,
                 "online_balance_shuffle_source_records": shuffle_default,
+                "online_balance_shuffle_windows": bool(crop_cfg.get("online_balance_shuffle_windows", True)),
                 "global_positive_ratio_selection_for_random": bool(crop_cfg.get("global_positive_ratio_selection_for_random", False)),
                 "global_negative_candidate_crops_per_image_when_balancing": int(crop_cfg.get("global_negative_candidate_crops_per_image_when_balancing", 1) or 1),
             })
@@ -3369,16 +3502,77 @@ def _build_gui_export_config(
     square = out.setdefault("square_crops", {})
     square["crop_size"] = int(crop_controls.get("crop_size", square.get("crop_size", 1024)))
     square["stride"] = int(crop_controls.get("stride", square.get("stride", 512)))
+    square["edge_policy"] = str(crop_controls.get("edge_policy", square.get("edge_policy", "edge_align")))
     for split in ["train", "val", "test"]:
         mode = str(split_crop_modes.get(split, square.get(f"{split}_crop_mode", "deterministic"))).strip().casefold()
         if mode not in {"deterministic", "random", "bbox_safe_random"}:
             mode = "deterministic"
         square[f"{split}_crop_mode"] = mode
     _apply_deterministic_selection_to_config(square, deterministic_selection)
+    configured_split_filters = dict(crop_controls.get("split_breast_filters", {}) or {})
+    split_breast_filters: dict[str, tuple[bool, float]] = {}
+    for split in ["train", "val", "test"]:
+        settings = dict(configured_split_filters.get(split, {}) or {})
+        enabled = bool(settings.get(
+            "enabled",
+            crop_controls.get("require_foreground", False),
+        ))
+        minimum = float(settings.get(
+            "minimum",
+            crop_controls.get("min_foreground_fraction", 0.05),
+        ))
+        split_breast_filters[split] = (enabled, minimum)
+        square[f"{split}_require_min_breast_fraction_for_all_crops"] = enabled
+        square[f"{split}_min_breast_fraction_for_all_crops"] = minimum
+        square[f"{split}_breast_fraction_comparison_for_all_crops"] = (
+            "strictly_greater_than"
+        )
+        square[f"{split}_require_retained_breast_mask_for_all_crops"] = enabled
+    if str(square.get("train_deterministic_selection_mode", "")) == "source_breast_ratio":
+        for forced_split in ["train", "val", "test"]:
+            square[f"{forced_split}_crop_mode"] = "deterministic"
+        out["source_cohort"] = {
+            "finding_category": "Mass",
+            "positive_images_only": True,
+            "train_expand_to_all_patient_breast_views": True,
+            "train_breast_status_unit": "study_laterality",
+        }
+        square["train_deterministic_require_foreground"] = False
+        square["train_negative_require_foreground"] = False
+        for eval_split in ["val", "test"]:
+            square[f"{eval_split}_deterministic_selection_mode"] = "all"
+            square[f"{eval_split}_deterministic_require_foreground"] = False
+            square[f"{eval_split}_negative_require_foreground"] = False
+            square[f"{eval_split}_require_clean_negative_windows"] = False
+        contract = out.setdefault("replication_contract", {})
+        if bool(contract.get("enabled", False)):
+            contract["min_breast_fraction_strictly_greater_than_by_split"] = {
+                split: minimum
+                for split, (enabled, minimum) in split_breast_filters.items()
+                if enabled
+            }
     square["deterministic_include_empty"] = bool(square.get("deterministic_include_empty", True))
     square["deterministic_require_foreground"] = bool(crop_controls.get("require_foreground", False))
     square["deterministic_min_foreground_fraction"] = float(crop_controls.get("min_foreground_fraction", 0.05))
     square["deterministic_foreground_threshold"] = crop_controls.get("foreground_threshold", None)
+    # Simple Dataset v1 turns the foreground control into a hard all-crop
+    # breast-mask contract. Keep that explicit policy synchronized with the
+    # visible GUI checkbox/value so an exported config never claims one
+    # threshold in the interface while silently enforcing another.
+    if "require_min_breast_fraction_for_all_crops" in square:
+        require_all_crop_breast = bool(crop_controls.get("require_foreground", False))
+        min_all_crop_breast = float(crop_controls.get("min_foreground_fraction", 0.30))
+        square["require_min_breast_fraction_for_all_crops"] = require_all_crop_breast
+        square["min_breast_fraction_for_all_crops"] = min_all_crop_breast
+        square["negative_require_foreground"] = require_all_crop_breast
+        square["negative_min_foreground_fraction"] = min_all_crop_breast
+        square["require_foreground_for_empty_crops"] = require_all_crop_breast
+        square["min_foreground_fraction"] = min_all_crop_breast
+        for split in ["train", "val", "test"]:
+            square[f"{split}_deterministic_require_foreground"] = require_all_crop_breast
+            square[f"{split}_deterministic_min_foreground_fraction"] = min_all_crop_breast
+            square[f"{split}_negative_require_foreground"] = require_all_crop_breast
+            square[f"{split}_negative_min_foreground_fraction"] = min_all_crop_breast
     # Global fallback for older configs and non-GUI exports. GUI export writes split-specific
     # *_positive_fraction values above, so the export panel is the source of truth.
     square["positive_fraction"] = float(square.get("positive_fraction", 0.50))
@@ -3854,6 +4048,9 @@ def _show_comparison_statistics(results: list[dict[str, Any]], pipeline: dict[st
             result["crop_image"],
             pipeline,
             source_crops=_source_crops_from_result(result),
+            source_full_images=_source_full_images_from_result(result),
+            crop_window=(result.get("selected_crop") or {}).get("window"),
+            cache_namespace=f"preview:{result.get('record_index', i)}",
         )
         row, hists = _comparison_features_for_sample(slot_name, result, processed_rgb)
         feature_rows.append(row)
@@ -4287,7 +4484,13 @@ def _prepare_sample(
                 )
                 windows.append(w)
     else:
-        windows = sliding_square_windows(width, height, crop_controls["crop_size"], crop_controls["stride"])
+        windows = sliding_square_windows(
+            width,
+            height,
+            crop_controls["crop_size"],
+            crop_controls["stride"],
+            edge_policy=str(crop_controls.get("edge_policy", "edge_align")),
+        )
         failed_windows: list[dict[str, Any]] = []
 
     crops = []
@@ -4361,6 +4564,7 @@ def _prepare_sample(
             )
 
     contralateral_crop_image = None
+    contralateral_full_image = None
     contralateral_info: dict[str, Any] = {"requested": bool(need_contralateral), "found": False}
     if need_contralateral and selected is not None and crop_image is not None:
         contralateral_index = _find_contralateral_record_index(dataset, loaded["record"])
@@ -4375,6 +4579,7 @@ def _prepare_sample(
                 moving_tensor,
                 options=dict(crop_controls.get("contralateral_source_alignment", {}) or {}),
             )
+            contralateral_full_image = aligned_tensor.detach().cpu().squeeze(0).numpy().astype(np.float32, copy=False)
             empty_boxes = torch.zeros((0, 4), dtype=torch.float32)
             paired_crop_result = crop_image_and_boxes_to_window(
                 aligned_tensor,
@@ -4416,6 +4621,7 @@ def _prepare_sample(
         "foreground_mask_crop": foreground_mask_crop,
         "show_foreground_mask_preview": bool(crop_controls.get("foreground_mask_preview", False)),
         "contralateral_crop_image": contralateral_crop_image,
+        "contralateral_full_image": contralateral_full_image,
         "contralateral_info": contralateral_info,
         "record_index": int(record_index),
     }
@@ -4449,7 +4655,14 @@ def _show_sample(
     selected = result["selected_crop"] or {}
     window = selected.get("window")
 
-    processed_rgb, processing_meta = apply_channel_pipeline(crop, pipeline, source_crops=_source_crops_from_result(result))
+    processed_rgb, processing_meta = apply_channel_pipeline(
+        crop,
+        pipeline,
+        source_crops=_source_crops_from_result(result),
+        source_full_images=_source_full_images_from_result(result),
+        crop_window=window,
+        cache_namespace=f"preview:{result.get('record_index', 0)}",
+    )
     display_controls = display_controls or {"visible_channels": ["R", "G", "B"], "show_channel_panels": False}
     visible_channels = display_controls.get("visible_channels", ["R", "G", "B"]) or []
     processed_rgb_display = _mask_rgb_channels(processed_rgb, visible_channels)
@@ -4609,14 +4822,30 @@ def _source_crops_from_result(result: dict[str, Any]) -> dict[str, np.ndarray]:
     return out
 
 
+def _source_full_images_from_result(result: dict[str, Any]) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {"current_crop": result.get("image")}
+    contralateral = result.get("contralateral_full_image")
+    if contralateral is not None:
+        out["contralateral_same_view_crop"] = contralateral
+    return out
+
+
 def apply_channel_pipeline(
     crop_float: np.ndarray,
     pipeline: dict[str, Any],
     *,
     source_crops: dict[str, np.ndarray] | None = None,
+    source_full_images: dict[str, np.ndarray] | None = None,
+    source_windows: dict[str, tuple[int, int, int, int]] | None = None,
+    crop_window: tuple[int, int, int, int] | None = None,
+    pad_value: float = 0.0,
+    whole_stage_cache: dict[str, tuple[np.ndarray, np.ndarray | None]] | None = None,
+    cache_namespace: str = "preview",
 ) -> tuple[np.ndarray, dict[str, Any]]:
     source_crops = dict(source_crops or {})
     source_crops.setdefault("current_crop", crop_float)
+    source_full_images = dict(source_full_images or {})
+    source_windows = dict(source_windows or {})
     channels = []
     meta = {"channels": {}}
     for channel in ["R", "G", "B"]:
@@ -4631,33 +4860,29 @@ def apply_channel_pipeline(
             arr = np.asarray(source_crops[source_name], dtype=np.float32).copy()
             source_fallback = False
 
-        # Compute statistics over the visible breast/foreground pixels by default.
-        # This matters when the fixed breast crop is disabled: otherwise black
-        # background can dominate low percentile windows, for example [0, 10],
-        # and make the operation appear unchanged.
-        stat_mask = _operation_stat_mask(arr)
-
-        applied = []
-        for step in _channel_steps(pipeline, channel):
-            op = step.get("op", "none")
-            params = step.get("params", {}) or {}
-            if op == "none":
-                continue
-            arr = _apply_operation(arr, op, params, stat_mask=stat_mask)
-            # Keep the mask tied to the same physical foreground region after
-            # point-wise transforms; recompute only if the shape changes.
-            if stat_mask.shape != arr.shape:
-                stat_mask = _operation_stat_mask(arr)
-            elif _operation_should_preserve_background(op) and stat_mask is not None and stat_mask.any():
-                arr = np.where(stat_mask, arr, float(params.get("outside_value", 0.0))).astype(np.float32)
-            applied.append({"op": op, "params": params})
-        ch = _float_to_uint8(arr)
+        full_source = source_full_images.get(source_name_used)
+        selected_window = source_windows.get(source_name_used, crop_window)
+        arr, applied, scope_meta = apply_scoped_steps(
+            arr,
+            _channel_steps(pipeline, channel),
+            apply_operation=lambda work, op, params, mask: _export_apply_channel_operation(work, op, params, mask),
+            make_stat_mask=_export_foreground_mask,
+            operation_preserves_background=_export_operation_should_preserve_background,
+            full_source=full_source,
+            window_xyxy=selected_window,
+            pad_value=float(pad_value),
+            whole_stage_cache=whole_stage_cache,
+            cache_namespace=str(cache_namespace),
+            source_name=source_name_used,
+        )
+        ch = _export_float_to_uint8(arr)
         channels.append(ch)
         meta["channels"][channel] = {
             "source_requested": source_name,
             "source_used": source_name_used,
             "source_fallback": source_fallback,
             "steps": applied,
+            **scope_meta,
         }
     return np.stack(channels, axis=-1).astype(np.uint8, copy=False), meta
 

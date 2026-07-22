@@ -399,6 +399,7 @@ class VindrMammoDataset(Dataset):
                 height=height,
                 crop_size=int(self.crop_options["crop_size"]),
                 stride=int(self.crop_options["stride"]),
+                edge_policy=str(self.crop_options.get("edge_policy", "edge_align")),
             )
             kept = 0
             max_windows = self.crop_options.get("deterministic_max_windows_per_image")
@@ -554,6 +555,9 @@ class VindrMammoDataset(Dataset):
             self.preprocess_options.get("crop_breast")
             or self.preprocess_options.get("mask_outside_breast")
             or self.preprocess_options.get("mirror_right_to_left")
+            or int(self.preprocess_options.get("trim_border_px", 0) or 0) > 0
+            or str(self.preprocess_options.get("intensity_scale_before_geometry", "none")).casefold()
+            not in {"", "none", "off", "false"}
         ):
             target["preprocessing"] = {
                 **self.preprocess_options,
@@ -612,7 +616,13 @@ class VindrMammoDataset(Dataset):
             # In image/exam mode we cannot return all deterministic windows from one
             # index, so use the first deterministic window. Use index_level='crop'
             # when you want every sliding window as a separate training sample.
-            windows = sliding_square_windows(width, height, int(self.crop_options["crop_size"]), int(self.crop_options["stride"]))
+            windows = sliding_square_windows(
+                width,
+                height,
+                int(self.crop_options["crop_size"]),
+                int(self.crop_options["stride"]),
+                edge_policy=str(self.crop_options.get("edge_policy", "edge_align")),
+            )
             window = windows[0]
             info = {"requested_positive": None, "accepted": True, "note": "first_deterministic_window_in_image_mode"}
         else:
@@ -1569,7 +1579,13 @@ class VindrMammoDataset(Dataset):
         try:
             self.crop_options = opts
             if opts["mode"] == "deterministic":
-                windows = sliding_square_windows(int(image.shape[-1]), int(image.shape[-2]), int(opts["crop_size"]), int(opts["stride"]))
+                windows = sliding_square_windows(
+                    int(image.shape[-1]),
+                    int(image.shape[-2]),
+                    int(opts["crop_size"]),
+                    int(opts["stride"]),
+                    edge_policy=str(opts.get("edge_policy", "edge_align")),
+                )
                 window = next((w for w in windows if window_has_positive_mass(w, target["mass"]["boxes"], opts)), windows[0])
                 info = {"requested_positive": None, "accepted": True}
             else:
