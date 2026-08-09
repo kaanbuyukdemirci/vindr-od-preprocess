@@ -6,13 +6,18 @@ import torch
 from vindr_mammo.dataset import VindrMammoDataset
 from vindr_mammo.export import (
     _append_coco_annotations,
+    _fixed_preprocessed_boxes_to_original,
     _make_rgb_image,
     _validate_square_crop_contract,
     _windows_for_export_split,
     make_train_val_test_split,
 )
 from vindr_mammo.preprocessing import make_preprocess_options
-from vindr_mammo.presets import PAPER_22_PRESET_KEY, apply_study_preset
+from vindr_mammo.presets import (
+    PAPER_22_IMPROVED_PRESET_KEY,
+    PAPER_22_PRESET_KEY,
+    apply_study_preset,
+)
 
 
 def _paper_crop_config() -> tuple[dict, dict]:
@@ -208,12 +213,29 @@ def test_coco_annotations_retain_stable_source_identity() -> None:
         source_annotation_ids=[42],
         source_annotation_rows=[44],
         source_boxes=torch.tensor([[101.0, 202.0, 111.0, 222.0]]),
+        source_original_boxes=torch.tensor([[301.0, 402.0, 311.0, 422.0]]),
     )
 
     assert count == 1
     assert coco["annotations"][0]["source_annotation_id"] == 42
     assert coco["annotations"][0]["source_annotation_row"] == 44
     assert coco["annotations"][0]["source_bbox_xyxy"] == [101.0, 202.0, 111.0, 222.0]
+    assert coco["annotations"][0]["source_bbox_coordinate_space"] == "fixed_preprocessed"
+    assert coco["annotations"][0]["source_bbox_original_xyxy"] == [301.0, 402.0, 311.0, 422.0]
+    assert coco["annotations"][0]["source_bbox_original_coordinate_space"] == "original_dicom"
+
+
+def test_mirrored_fixed_boxes_are_restored_to_original_dicom_coordinates() -> None:
+    restored = _fixed_preprocessed_boxes_to_original(
+        torch.tensor([[20.0, 30.0, 40.0, 70.0]]),
+        {
+            "mirrored": True,
+            "processed_shape": (100, 120),
+            "crop_box_xyxy": (10, 15, 130, 115),
+        },
+    )
+
+    assert torch.equal(restored, torch.tensor([[90.0, 45.0, 110.0, 85.0]]))
 
 
 def test_source_identity_contract_catches_duplicate_instances_hiding_missing_gt() -> None:
@@ -247,6 +269,79 @@ def test_source_identity_contract_catches_duplicate_instances_hiding_missing_gt(
 
     assert report["status"] == "fail"
     assert any("represented 1/2 source annotations" in error for error in report["errors"])
+
+
+def test_custom_contract_checks_negative_sources_against_independent_provenance() -> None:
+    config = apply_study_preset(
+        {"paths": {"data_root": "/data", "output_root": "/exports/base"}},
+        PAPER_22_IMPROVED_PRESET_KEY,
+    )
+    config["replication_contract"]["strict"] = False
+    source_debug = {
+        ("train", "mass-in-this-view"): {
+            "source_image_has_mass": 1,
+            "source_breast_has_mass": 1,
+            "n_source_mass_boxes": 1,
+            "_included_annotation_indices": set(),
+        },
+        ("train", "mass-in-paired-view"): {
+            "source_image_has_mass": 0,
+            "source_breast_has_mass": 1,
+            "n_source_mass_boxes": 0,
+            "_included_annotation_indices": set(),
+        },
+    }
+    train_images = [
+        {
+            "id": index,
+            "file_name": f"negative-{index}.png",
+            "width": 640,
+            "height": 640,
+            "crop_window_xyxy": [0, 0, 640, 640],
+            "breast_fraction": 0.50,
+            "source_image_id": source_image_id,
+            # Simulate the exact v7 failure: self-reported metadata says clean.
+            "source_image_has_mass": 0,
+            "source_breast_has_mass": 0,
+        }
+        for index, source_image_id in enumerate(
+            ["mass-in-this-view", "mass-in-paired-view"],
+            start=1,
+        )
+    ]
+    report = _validate_square_crop_contract(
+        split_records={
+            "train": [
+                {"image_id": "mass-in-this-view"},
+                {"image_id": "mass-in-paired-view"},
+            ],
+            "val": [],
+            "test": [],
+        },
+        coco_by_split={
+            "train": {"images": train_images, "annotations": []},
+            "val": {"images": [], "annotations": []},
+            "test": {"images": [], "annotations": []},
+        },
+        source_debug=source_debug,
+        candidate_positive_window_keys=set(),
+        saved_positive_window_keys=set(),
+        crop_cfg=config["square_crops"],
+        config=config,
+    )
+
+    source_policy = report["metrics"]["train_negative_crop_source_policy"]
+    assert source_policy["required"] == "mass_negative_breasts_only"
+    assert source_policy["invalid_source_image_crops"] == 1
+    assert source_policy["invalid_source_breast_crops"] == 2
+    assert source_policy["invalid_negative_crops"] == 2
+    assert source_policy["source_image_metadata_mismatches"] == 1
+    assert source_policy["source_breast_metadata_mismatches"] == 2
+    assert any(
+        "2 empty crops came from breasts with Mass in the source or paired view"
+        in error
+        for error in report["errors"]
+    )
 
 
 def test_paper_png_recipe_is_exact_replicated_uint8_grayscale() -> None:

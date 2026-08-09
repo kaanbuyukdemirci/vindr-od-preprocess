@@ -16,3 +16,4 @@ scipy
 dash
 plotly
 streamlit
+transformers>=4.56

@@ -1,34 +1,60 @@
 # Paper 22 dataset handoff
 
-Copy this document into the model project and treat it as the Paper 22 data
-contract. The GUI/CLI exposes two presets: the legacy paper-like v2 preset and
-the current custom improved v4 preset. Never combine splits, labels, manifests,
-or results from different versions.
+Copy this document into the model project and treat it as the dataset contract.
+The GUI/CLI exposes two separate presets. Do not mix their splits, crops,
+labels, manifests, or reported results.
 
 ## Selectable presets
 
 | Preset | Key | Output root | Status |
 |---|---|---|---|
-| Paper 22 — closest available reproduction (v2; not exact) | `bulatovic_yolov8_patched_inference_vindr` | `/mnt/t9/vindr-data/preprocessed-vindr-paper22-v2` | Materialized and accepted |
-| Custom Paper 22 — improved breast-balanced foreground crops (v4) | `paper22_patient_breast_balanced_v4` | `/mnt/t9/vindr-data/preprocessed-vindr-paper22-improved-v4` | Configuration ready; run required |
+| Paper 22 — closest available reproduction (v2; not exact) | `bulatovic_yolov8_patched_inference_vindr` | `/mnt/t9/vindr-data/preprocessed-vindr-paper22-v2` | Existing paper-like dataset |
+| Custom Paper 22 — CLAHE, canonical orientation, crop-balanced (v8) | `paper22_crop_label_balanced_v8` | `/mnt/t9/vindr-data/preprocessed-vindr-paper22-improved-v8` | Corrected preset; regenerate before training |
 
-The clear CLI aliases are `paper22` and `custom-paper22` respectively.
-`paper22-improved` remains accepted for backward compatibility.
+The CLI aliases are `paper22` and `custom-paper22`. The custom preset is a
+controlled experiment inspired by Paper 22, not an exact reproduction.
 
-An accepted v3 export remains at
-`/mnt/t9/vindr-data/preprocessed-vindr-paper22-improved-v3`, but it is archived:
-its validation/test sets contain complete unfiltered grids. Do not use v3 when
-the experiment requires the current all-split breast-foreground rule.
+## Important v7 provenance warning
 
-## Improved v4 source split
+Do not describe the existing
+`/mnt/t9/vindr-data/preprocessed-vindr-paper22-improved-v7` export as using
+Mass-negative-image-only or Mass-negative-breast-only sampling.
 
-VinDr's supplied tables do not expose a separate reusable patient identifier.
-`study_id` is therefore the patient/exam grouping unit: all CC/MLO and
-left/right views from one study stay in one split. No study may cross splits.
+An independent audit of its 2,014 empty training crops found:
 
-The v2 mass-positive split is selected first. V4 expands only the 398 selected
-training studies to all of their official-training views. Validation source
-membership and official-test source membership remain identical to v2/v3.
+| Audit result | Empty crops |
+|---|---:|
+| Source image itself contains a Mass elsewhere | 1,770 |
+| Current or paired view of the same breast contains a Mass | 1,798 |
+| Breast contains no Mass in either view | 216 |
+
+The v7 crop-local labels are internally usable as ordinary hard negatives, but
+the manifest's stricter provenance claim is false. The cause was an exporter
+default that marked expanded source records as Mass-negative before selection;
+the old contract then trusted the same incorrect exported flag.
+
+V8 fixes both layers:
+
+1. `source_image_has_mass` is computed directly from source findings.
+2. `source_breast_has_mass` is computed across both views sharing
+   `(study_id, laterality)`.
+3. An empty crop is eligible only when both flags are zero.
+4. The strict completion contract checks COCO metadata against independently
+   computed source provenance and fails on either a policy violation or a
+   metadata mismatch.
+
+V8 has a new preset key and output directory so it cannot silently overwrite
+or redefine the completed v7 artifact.
+
+## V8 source split and pixels
+
+VinDr does not expose a separate reusable patient identifier in the supplied
+tables. This pipeline therefore uses `study_id` as the patient/exam grouping
+unit; no study may cross train, validation, or test.
+
+The v2 Mass-positive split is selected first. V8 expands only the selected
+training studies to all official-training views. Validation membership and the
+official-test Mass-positive source membership remain the same as v2.
 
 | Split | Studies/patient-exams | Source images | Source Mass boxes |
 |---|---:|---:|---:|
@@ -36,97 +62,63 @@ membership and official-test source membership remain identical to v2/v3.
 | Validation | 71 | 136 | 148 |
 | Test | 115 | 219 | 237 |
 
-Training contains 796 breasts, defined as `(study_id, laterality)`:
+Training contains 796 breasts:
 
 | Source-breast status | Breasts | Views |
 |---|---:|---:|
 | Mass in at least one view | 417 | 834 |
 | No Mass in either view | 379 | 758 |
 
-## Breast foreground and crop selection
+After DICOM/VOI and polarity processing, the exporter masks the breast and
+mirrors right-facing images, boxes, and masks together so the chest wall is on
+the left. CLAHE (`clip_limit=2.0`, `tile_grid_size=8`) is then applied once to
+the full fixed-preprocessed mammogram before tiling. The enhanced grayscale
+signal is replicated into R/G/B.
 
-The full-mammogram breast mask is computed once before tiling and retained for
-crop decisions. Outside-breast pixels are masked in the exported image, and
-every train, validation, and test crop must satisfy:
+## Crop and label policy
 
-```text
-breast_fraction > 0.10
-```
+- Crop size: `640 x 640`.
+- Stride: 512 pixels, corresponding to 20% overlap.
+- Final grid start: edge-aligned.
+- Every split requires retained breast-mask fraction strictly greater than
+  10%; exactly 10% is rejected.
+- A clipped Mass is labeled when at least 5% of its original box area remains;
+  exactly 5% is included.
+- Every eligible Mass-containing training crop is mandatory.
+- Empty training crops may come only from breasts with no Mass annotation in
+  either view.
+- The running training target is approximately 50% positive crops and 50%
+  empty crops. It is a one-pass seeded selection, so a small deviation such as
+  52/48 is acceptable.
+- A sub-threshold lesion fragment is not eligible as a clean negative.
+- Validation and test are not class-balanced; they keep every grid window that
+  passes the `>10%` breast-mask rule.
 
-The comparison is strict: exactly 10% is rejected. The denominator is the full
-640x640 crop, so zero padding counts as non-breast. Background-only windows and
-standalone laterality/view markers such as LCC therefore do not enter any
-split. A retained window may still touch the image boundary or contain an empty
-label when more than 10% of it is genuine breast tissue.
+Because v8 has not yet been generated, its crop counts must be read from its
+new manifest after export. Do not copy v7's 4,028/1,347/2,124 crop counts into
+a v8 experiment report.
 
-In the GUI, open **Foreground-ratio crop filter** to adjust train, validation,
-and test independently. Custom Paper 22 v4 loads all three switches as enabled
-at `0.10`, but each switch and threshold can be changed before export. The
-resolved config and manifest record the effective per-split choices.
+## Paper comparison
 
-All candidate windows use 640x640 crops, stride 512, 20% overlap, and an
-edge-aligned final start. Validation/test keep every grid candidate passing the
-breast-mask rule; they are not class-balanced or negatively sampled. Because
-they are foreground-filtered, they are not complete geometric grids.
+The original paper reports 640-pixel patches, 20% overlap, background removal,
+and retaining 20% of negative-patch candidates. V8 deliberately differs by
+using CLAHE, canonical left-facing orientation, a `>=5%` partial-box rule,
+strict `>10%` breast-mask crop filtering, all-view training expansion, and an
+approximately 50/50 crop-label target whose negatives come only from breasts
+with no Mass in either view.
 
-Training is additionally sampled without replacement into an exact 50/50 crop
-mixture by source-breast status:
+V8 test uses the same 219 official VinDr source mammograms and 237 source Mass
+annotations as the paper-like v2 test, but it is not the same model-facing
+patch set. Mirroring, CLAHE, breast-mask filtering, and the 5% box rule change
+the pixels, retained windows, and crop-local annotation instances.
 
-- 50% of training crops come from mass-positive breasts.
-- 50% come from negative breasts.
-- The group is determined by the source breast, not by whether that individual
-  crop contains a visible Mass.
-- Every eligible lesion-containing training window is mandatory before the
-  remaining candidates are sampled.
-- A sub-threshold lesion fragment cannot be admitted as a clean negative.
-
-The previous v3 run produced 8,455 crops from each source-breast group. V4 keeps
-the same deterministic training rule, but its final manifest remains the
-authority after regeneration.
-
-## Training labels versus evaluation labels
-
-Training consumes crop-local labels. Each source Mass is intersected with the
-crop window, clipped to crop bounds, and translated into 640x640 crop
-coordinates. COCO stores crop-local `xywh`; YOLO stores normalized
-`class x_center y_center width height` with class ID `0`.
-
-Source-level evaluation must not treat crops as independent mammograms. Each
-COCO crop records:
+## Files to load after regeneration
 
 ```text
-source_image_id
-source_study_id
-crop_window_xyxy = [x0, y0, x1, y1]
+<root> = /mnt/t9/vindr-data/preprocessed-vindr-paper22-improved-v8/square_crops
 ```
 
-Each crop annotation also records `source_annotation_id`,
-`source_annotation_row`, and `source_bbox_xyxy`. The original image-level Mass
-labels are preserved in `metadata/source_csv/finding_annotations.csv`.
-
-For Maximum Box Fusion evaluation:
-
-1. Add crop `(x0, y0)` to each predicted crop box.
-2. Clamp it to the original mammogram dimensions.
-3. Group predictions by `source_image_id`.
-4. Apply Maximum Box Fusion within each source image.
-5. Evaluate fused predictions against the original image-level boxes, not the
-   clipped crop labels.
-6. Deduplicate ground truth by `source_annotation_id`.
-
-Foreground filtering does not change source coordinates or source ground truth.
-The model-side evaluator should assess submitted-window coverage against the
-eligible foreground grid rather than requiring 100% of the geometric grid.
-
-## Files to load
-
-After generating v4, set:
-
-```text
-<root> = /mnt/t9/vindr-data/preprocessed-vindr-paper22-improved-v4/square_crops
-```
-
-COCO/MMDetection paths:
+COCO/MMDetection:
 
 ```text
 train images: <root>/images/train
@@ -137,56 +129,92 @@ test images:  <root>/images/test
 test COCO:    <root>/mmdetection/annotations/instances_test.json
 ```
 
-For Ultralytics, load `<root>/vindr_mass.yaml`. Do not regenerate labels from
-the source CSV, retile the PNGs, or resplit source images.
+Ultralytics uses `<root>/vindr_mass.yaml`. Do not re-tile the PNGs, resplit
+source images, or regenerate crop labels from the source CSV.
 
-Normal uint8-to-float conversion and division by 255 are appropriate. Do not
-repeat the DICOM transform, VOI processing, polarity correction, min-max
-scaling, breast masking, or per-image min-max normalization.
+Each crop references a 1024x1024 whole-mammogram context image under
+`<root>/whole_images/<split>/`. The file is stored once per source mammogram,
+so multiple crop rows intentionally share it. Resolve the path from
+`paired_whole_image`/`paired_whole_image_path` in the exported metadata or COCO
+image record. Crop-only models may ignore it.
 
-Example model configuration:
+Do not repeat DICOM transforms, polarity correction, min-max scaling, breast
+masking, mirroring, CLAHE, or per-image normalization in the model project.
+Normal uint8-to-float conversion and division by 255 are appropriate.
 
-```yaml
-data_root: /mnt/t9/vindr-data/preprocessed-vindr-paper22-improved-v4/square_crops
-output_root: /mnt/t9/vindr-model/models-vindr-paper22-improved-v4
-patching:
-  enabled: false
-  already_applied: true
-```
+## Source-coordinate evaluation
+
+Training labels are crop-local. Source-level evaluation must reconstruct
+predictions in mammogram coordinates and group them by `source_image_id`.
+COCO crop records include `crop_window_xyxy`,
+`source_preprocessing_mirrored`, source dimensions, and coordinate-space
+metadata. Annotations include `source_annotation_id`,
+`source_bbox_xyxy` in fixed-preprocessed coordinates, and
+`source_bbox_original_xyxy` in original-DICOM coordinates.
+
+For source-level evaluation:
+
+1. Add the crop origin to crop-local predictions.
+2. Undo horizontal mirroring when mapping predictions to original coordinates.
+3. Clamp to the source dimensions.
+4. Group by `source_image_id`.
+5. Apply the chosen cross-window fusion within each source image.
+6. Evaluate against original image-level ground truth.
+7. Deduplicate ground truth by `source_annotation_id`.
 
 ## Required post-export checks
 
-The current model-project `scripts/audit_paper22.py` defaults to v2
-cardinalities. Use it unchanged only for v2. It will reject v4 unless its
-expectations are made version-aware.
-
-After generating v4, require its own manifest gates before training:
+After regenerating v8, run:
 
 ```bash
 python - <<'PY'
 import json
 from pathlib import Path
 
-root = Path('/mnt/t9/vindr-data/preprocessed-vindr-paper22-improved-v4')
+root = Path('/mnt/t9/vindr-data/preprocessed-vindr-paper22-improved-v8')
 manifest = json.loads((root / 'manifest.json').read_text())
 assert manifest['status'] == 'completed'
 assert manifest['summary']['source_contract']['status'] == 'pass'
 contract = manifest['summary']['square_crops']['replication_contract']
 assert contract['status'] == 'pass', contract
+
 for split in ('train', 'val', 'test'):
     metric = contract['metrics'][f'{split}_breast_fraction']
     assert metric['missing_count'] == 0
     assert metric['violating_count'] == 0
     assert metric['minimum_saved'] > 0.10
-print('Paper 22 improved v4: PASS')
+
+balance = contract['metrics']['train_crop_label_balance']
+assert abs(balance['positive_fraction'] - 0.50) <= 0.05, balance
+
+source = contract['metrics']['train_negative_crop_source_policy']
+assert source['required'] == 'mass_negative_breasts_only', source
+assert source['invalid_negative_crops'] == 0, source
+assert source['invalid_source_image_crops'] == 0, source
+assert source['invalid_source_breast_crops'] == 0, source
+assert source['missing_source_provenance_crops'] == 0, source
+assert source['source_image_metadata_mismatches'] == 0, source
+assert source['source_breast_metadata_mismatches'] == 0, source
+
+visibility = contract['metrics']['crop_annotation_visibility']
+assert visibility['allow_partial_annotations'] is True
+assert visibility['minimum_visible_box_fraction'] == 0.05
+print('Custom Paper 22 v8: PASS')
 PY
 ```
 
-Also verify that every source annotation is represented, every crop has a
-matching label and COCO record, and no study overlaps another split. Do not
-publish v4 crop counts until the materialized manifest passes.
+Only after this passes should v8 be described as train-ready under the strict
+Mass-negative-breast sampling contract.
 
-## Generate the current improved preset
+## Visual review bundle
+
+V8 enables the debug review bundle by default with 200 random crop samples per
+split. Crop and mask GIFs show raw original, fixed-preprocessed full
+mammogram, and crop/red-mask panels. Every GIF frame is also stored separately
+under `square_crops/review/crop_frames/<split>/` or
+`square_crops/review/mask_frames/<split>/`.
+
+## Generate v8
 
 From `/home/kaan/Desktop/vindr-od-preprocess`:
 
@@ -194,6 +222,4 @@ From `/home/kaan/Desktop/vindr-od-preprocess`:
 python main.py --config config/export_config.yaml --preset custom-paper22
 ```
 
-This command writes v4 under `/mnt/t9/vindr-data`. It does not overwrite the
-legacy v2 or archived v3 directories. V4 is a custom controlled experiment,
-not an author-exact Paper 22 subset.
+This writes the corrected v8 directory without overwriting v2 or v7.

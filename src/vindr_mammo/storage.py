@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
+from .dataset_layout import resized_variant_configs
+
 
 Pathish = str | os.PathLike[str]
 
@@ -254,7 +256,7 @@ def estimate_export_space(
     if save_square and source_image_count:
         if records:
             for record, (width, height) in zip(records, dimensions, strict=False):
-                crop_image_count += _conservative_record_crop_count(
+                record_crop_count = _conservative_record_crop_count(
                     record,
                     width=width,
                     height=height,
@@ -262,6 +264,7 @@ def estimate_export_space(
                     crop_size=crop_size,
                     stride=stride,
                 )
+                crop_image_count += record_crop_count
         else:
             crop_image_count = _conservative_aggregate_crop_count(
                 aggregate,
@@ -291,28 +294,102 @@ def estimate_export_space(
 
     paired_cfg = _paired_whole_config(cfg)
     paired_enabled = bool(paired_cfg.get("enabled", False))
-    paired_per_crop = bool(paired_cfg.get("one_per_crop", paired_cfg.get("per_crop", True)))
+    # Paired whole images are canonical source-level assets. Every crop row may
+    # reference one, but only one resized file (and optionally one high-resolution file)
+    # is written for each source mammogram that can contribute crops.
+    paired_source_count = source_image_count if paired_enabled else 0
+    original_paired_enabled = bool(paired_cfg.get("save_original", False))
+    resized_variants = resized_variant_configs(paired_cfg) if paired_enabled else []
+    resized_paired_enabled = bool(resized_variants)
+    original_paired_count = paired_source_count if original_paired_enabled else 0
+    resized_paired_count = (
+        paired_source_count * len(resized_variants)
+        if resized_paired_enabled else 0
+    )
+    high_resolution_paired_enabled = bool(
+        paired_cfg.get("save_high_resolution")
+        if "save_high_resolution" in paired_cfg
+        else paired_cfg.get("save_native_resolution", False)
+    )
+    high_resolution_paired_count = (
+        paired_source_count if high_resolution_paired_enabled else 0
+    )
     paired_whole_image_count = (
-        crop_image_count if paired_enabled and paired_per_crop else source_image_count if paired_enabled else 0
+        original_paired_count
+        + resized_paired_count
+        + high_resolution_paired_count
     )
-    if paired_enabled and str(paired_cfg.get("storage_mode", "hardlink")).casefold() in {
-        "hardlink",
-        "link",
-        "deduplicate",
-    }:
+    if paired_enabled:
         assumptions.append(
-            "Paired whole-image companions are costed as full copies so the estimate remains "
-            "safe if hard-link creation falls back to copying."
+            "Paired whole images are stored once per source mammogram and shared by all of its crop rows."
         )
-    paired_width, paired_height = _output_dimensions(
-        paired_cfg,
-        default_width=1024,
-        default_height=1024,
-        keys=("size", "output_size"),
-    )
-
     crop_pixels = crop_image_count * crop_output_width * crop_output_height
-    paired_pixels = paired_whole_image_count * paired_width * paired_height
+    resized_paired_pixels = paired_source_count * sum(
+        int(variant["width"]) * int(variant["height"])
+        for variant in resized_variants
+    )
+    original_paired_pixels = 0
+    if original_paired_count:
+        if records:
+            original_paired_pixels = sum(
+                width * height for width, height in dimensions
+            )
+        else:
+            original_paired_pixels = (
+                original_paired_count * default_width * default_height
+            )
+        assumptions.append(
+            "Original-size processed whole images are costed at each source image's unpadded dimensions."
+        )
+    high_resolution_paired_pixels = 0
+    if high_resolution_paired_count:
+        canvas_mode = str(
+            paired_cfg.get(
+                "high_resolution_canvas_mode",
+                paired_cfg.get("canvas_mode", "per_image_square"),
+            )
+            or "per_image_square"
+        ).casefold().strip()
+        if canvas_mode in {"fixed", "fixed_canvas", "dataset_fixed"}:
+            canvas_width = _positive_int(
+                paired_cfg.get(
+                    "high_resolution_canvas_width", paired_cfg.get("canvas_width")
+                ),
+                default_width,
+            )
+            canvas_height = _positive_int(
+                paired_cfg.get(
+                    "high_resolution_canvas_height", paired_cfg.get("canvas_height")
+                ),
+                default_height,
+            )
+            high_resolution_paired_pixels = (
+                high_resolution_paired_count * canvas_width * canvas_height
+            )
+            assumptions.append(
+                "High-resolution paired whole images are costed at the configured fixed "
+                f"{canvas_width} x {canvas_height} common canvas."
+            )
+        elif records:
+            high_resolution_paired_pixels = sum(
+                max(width, height) ** 2 for width, height in dimensions
+            )
+            assumptions.append(
+                "High-resolution paired whole images are costed as per-image square canvases whose side is the source image's larger dimension."
+            )
+        else:
+            high_resolution_paired_pixels = (
+                high_resolution_paired_count
+                * max(default_width, default_height) ** 2
+            )
+            assumptions.append(
+                "High-resolution paired whole images are costed as per-image square canvases whose side is the aggregate source maximum."
+            )
+    paired_pixels = int(
+        resized_paired_pixels
+        + original_paired_pixels
+        + high_resolution_paired_pixels
+    )
     model_pixel_count = int(crop_pixels + baseline_pixels + paired_pixels)
     preserved_pixel_count = int(crop_pixels + baseline_pixels)
     model_image_count = int(crop_image_count + baseline_image_count + paired_whole_image_count)
@@ -333,6 +410,44 @@ def estimate_export_space(
     safety_factor = _positive_float(storage_cfg.get("safety_factor"), 1.15)
 
     rgb_bytes = int(math.ceil(model_pixel_count * rgb_bytes_per_pixel))
+    float32_cfg = dict(cfg.get("float32_export", {}) or {})
+    save_float32 = bool(float32_cfg.get("enabled", False))
+    configured_variants = float32_cfg.get("variants")
+
+    def float_variant_selected(name: str) -> bool:
+        if not isinstance(configured_variants, Mapping):
+            return True
+        return bool(configured_variants.get(name, False))
+
+    float32_pixels = 0
+    if save_float32:
+        if float_variant_selected("crops"):
+            float32_pixels += crop_pixels
+        if float_variant_selected("baseline_whole"):
+            float32_pixels += baseline_pixels
+        if float_variant_selected("resized_whole"):
+            float32_pixels += resized_paired_pixels
+        if float_variant_selected("original_whole"):
+            float32_pixels += original_paired_pixels
+        if float_variant_selected("high_resolution_whole"):
+            float32_pixels += high_resolution_paired_pixels
+    float32_bytes = int(float32_pixels * 3 * 4)
+    if save_float32:
+        selected_names = [
+            name
+            for name in (
+                "crops",
+                "resized_whole",
+                "original_whole",
+                "high_resolution_whole",
+                "baseline_whole",
+            )
+            if float_variant_selected(name)
+        ]
+        assumptions.append(
+            "Selected CHW float32 companions are costed at 12 bytes per RGB "
+            f"pixel for: {', '.join(selected_names) or 'no image types'}."
+        )
     save_preserved = bool((cfg.get("preserved_16bit", {}) or {}).get("save", True))
     # Paired whole-image companions are RGB-only. Preserved uint16 files are
     # written for normal crop/baseline model images.
@@ -345,6 +460,7 @@ def estimate_export_space(
     source_metadata_bytes = source_image_count * metadata_bytes_per_source
     breakdown = {
         "rgb_images": int(rgb_bytes),
+        "float32_pytorch_images": int(float32_bytes),
         "preserved_16bit_images": int(preserved_bytes),
         "sample_labels_and_metadata": int(sample_metadata_bytes),
         "source_metadata": int(source_metadata_bytes),
@@ -698,7 +814,11 @@ def _paired_whole_config(config: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(square, Mapping)
         else False
     )
-    return {"enabled": enabled, "one_per_crop": True, "size": 1024}
+    return {
+        "enabled": enabled,
+        "storage_mode": "single_file_per_source",
+        "size": 1024,
+    }
 
 
 def _output_dimensions(

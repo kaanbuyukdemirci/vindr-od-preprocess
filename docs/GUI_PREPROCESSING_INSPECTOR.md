@@ -320,6 +320,16 @@ Available export controls:
 
 When you click **Start exporting dataset**, the GUI calls the same exporter used by `main.py`, but with a temporary config built from the current GUI state. A progress bar is updated by export stage and by source image during square-crop export.
 
+In crop preview mode, paired exports show the selected model crop together with
+the unpadded original-size processed, compact resized, and high-resolution
+padded whole mammograms. The compact whole is padded to its own square before
+resizing; the high-resolution whole is padded independently to its configured
+common canvas. Saved dataset viewer mode loads these actual exported companion
+PNGs alongside the crop. The review bundle additionally writes matched-box
+overlays for every whole variant, three-way comparison frames and GIFs,
+transform-audit CSVs, dimension/padding/scale plots, and annotation-count parity
+plots under `square_crops/review/whole_variant_*`.
+
 The exported dataset still writes the usual structure:
 
 ```text
@@ -346,19 +356,21 @@ The GUI writes the usual visualization files under `<export_root>/visualizations
 
 The Dash export panel starts the exporter in a background thread and reports job status while it runs.
 
-For deterministic square-crop exports, each split can now use one of four selection modes:
+For deterministic square-crop exports, each split can use these selection modes:
 
 - `mass_only`: keep only deterministic windows with at least one visible mass.
 - `all`: keep every deterministic sliding-window crop.
 - `positive_ratio`: keep all mass-positive deterministic windows, then sample non-mass windows to approach the requested positive crop ratio for that split.
+- `crop_label_ratio`: stream every Mass-containing crop and admit shuffled empty crops only from breasts with no Mass in either the current or paired view. This is the Custom Paper 22 v8 default and avoids global planning.
+- `source_breast_ratio`: legacy exact-planning balance by `(study_id, laterality)` breast status.
 - `finding_images_all_windows`: skip source images with no mass/finding, but keep every deterministic crop from source images that contain at least one mass/finding somewhere.
 
 The corresponding YAML keys are:
 
 ```yaml
 square_crops:
-  # Allowed: mass_only, all, positive_ratio, finding_images_all_windows
-  train_deterministic_selection_mode: mass_only
+  # Also allowed: negative_fraction and source_breast_ratio
+  train_deterministic_selection_mode: crop_label_ratio
   val_deterministic_selection_mode: all
   test_deterministic_selection_mode: finding_images_all_windows
 
@@ -373,8 +385,12 @@ The older `train_deterministic_include_empty`, `val_deterministic_include_empty`
 `train_online_positive_ratio_selection_for_deterministic: true` switches the
 training split to streaming approximate balance: all positives are saved
 immediately and eligible negatives are saved only when the running counts need
-them. Simple Dataset v1 uses this online mode for train and uses `all` for
-validation/test, so those two grids are never balanced or foreground-filtered.
+them. Default Research Dataset v1 uses this online mode for train and uses `all` for
+validation/test, so those two grids are never balanced. Evaluation applies only
+a loose 5% retained-mask filter, with every eligible Mass-positive window
+explicitly protected from rejection.
+`crop_label_ratio` enables that streaming path automatically and restricts its
+empty-crop pool to breasts with no Mass in either the current or paired view.
 
 ## Manifest comparison and settings loading
 

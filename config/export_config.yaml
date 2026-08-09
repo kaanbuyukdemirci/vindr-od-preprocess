@@ -218,12 +218,79 @@ baseline_uncropped:
   pad_anchor: left_top
 paired_whole_images:
   enabled: false
+  # Save the fixed-preprocessed whole at its original H x W with no padding.
+  save_original: false
+  # Save the compact whole: per-image square padding, then resize.
+  save_resized: true
+  # Also save an unresized high-resolution whole mammogram.
+  save_high_resolution: false
   target_width: 1024
   target_height: 1024
-  canvas_mode: per_image_square
+  # The compact whole always keeps the legacy behavior: pad this mammogram to
+  # its own square first, then resize to target_width x target_height.
+  resized_canvas_mode: per_image_square
+  # High-resolution padding is independent. Use fixed plus the dimensions below
+  # for one common shape, or per_image_square for variable high-resolution sizes.
+  high_resolution_canvas_mode: per_image_square
+  high_resolution_canvas_width: 3584
+  high_resolution_canvas_height: 3584
+  size_divisor: 1
   pad_value: 0.0
   pad_anchor: left_top
-  storage_mode: hardlink
+  # One canonical file per source mammogram; every crop references this path.
+  storage_mode: single_file_per_source
+# Save selected image families as CHW torch.float32 [0, 1] tensors.
+# The Default Research Dataset preset turns this on automatically.
+float32_export:
+  enabled: false
+  format: pytorch_tensor
+  dtype: float32
+  layout: CHW
+  value_range: [0.0, 1.0]
+  mirror_png_paths: true
+  variants:
+    crops: true
+    resized_whole: true
+    original_whole: true
+    high_resolution_whole: true
+    baseline_whole: true
+dataset_review:
+  enabled: false
+  # When enabled, save one raw-original preview, resized fixed-preprocessed
+  # full-image preview, and retained breast mask per source image.
+  save_original_previews: true
+  save_source_previews: true
+  save_masks: true
+  source_preview_max_side: 1200
+  mask_overlay_alpha: 0.4
+  # Random crop/source samples are selected independently in train/val/test.
+  samples_per_split: 100
+  # Maximum contributing source images with saved debug assets per split.
+  source_assets_per_split: 100
+  seed: 123
+  create_crop_gifs: true
+  # Draw transformed Mass boxes on every enabled whole-image variant and build
+  # sampled triptychs, GIFs, CSV audits, and aggregate geometry plots.
+  create_whole_variant_gifs: true
+  create_mask_gifs: true
+  gif_panel_size: 640
+  gif_frame_duration_ms: 700
+annotation_geometry_report:
+  enabled: false
+  histogram_bins: 40
+  output_subdir: annotation_geometry
+  fit_definition: geometry_only_ignore_annotation_and_crop_locations
+reproducibility_bundle:
+  enabled: false
+  output_subdir: reproducibility
+  schema_version: 1
+  # Hash the compact replay metadata without rereading the whole image dataset.
+  write_metadata_sha256: true
+  # Preserve the exact Python package/entry-point source, including dirty edits.
+  include_software_source_snapshot: true
+  # Optional bitwise-audit modes; enabling either adds a large extra I/O pass.
+  include_source_dicom_sha256: false
+  include_exported_image_sha256: false
 crop_annotation_policy:
   allow_partial_annotations: true
   min_box_visibility: 0.3

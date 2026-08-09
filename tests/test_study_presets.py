@@ -13,6 +13,8 @@ from vindr_mammo.export import (
 )
 from vindr_mammo.dash_app import _config_control_outputs, _config_control_values
 from vindr_mammo.presets import (
+    DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+    DUAL_WHOLE_PRESET_KEY,
     PAPER_22_IMPROVED_PRESET_KEY,
     PAPER_22_PRESET_KEY,
     PAPER_69_PRESET_KEY,
@@ -32,9 +34,10 @@ def test_default_config_and_all_presets_use_vindr_data_parent() -> None:
     }
     expected_folders = {
         PAPER_22_PRESET_KEY: "preprocessed-vindr-paper22-v2",
-        PAPER_22_IMPROVED_PRESET_KEY: "preprocessed-vindr-paper22-improved-v4",
+        PAPER_22_IMPROVED_PRESET_KEY: "preprocessed-vindr-paper22-improved-v8",
         PAPER_69_PRESET_KEY: "preprocessed-vindr-paper69-em-detr-v3",
         SIMPLE_PRESET_KEY: "preprocessed-vindr-simple-preset-v1",
+        DUAL_WHOLE_PRESET_KEY: "preprocessed-vindr-default-research-dataset-v2",
     }
     for preset_key, folder in expected_folders.items():
         preset = apply_study_preset(config, preset_key)
@@ -48,7 +51,7 @@ def test_user_facing_preset_names_identify_paper_or_custom_status() -> None:
         "Paper 22 — closest available reproduction (v2; not exact)"
     )
     assert STUDY_PRESETS[PAPER_22_IMPROVED_PRESET_KEY]["label"] == (
-        "Custom Paper 22 — improved breast-balanced foreground crops (v4)"
+        "Custom Paper 22 — CLAHE, canonical orientation, crop-balanced (v8)"
     )
     assert STUDY_PRESETS[PAPER_69_PRESET_KEY]["label"] == (
         "Paper 69 — closest available reproduction (v3; not exact)"
@@ -56,6 +59,10 @@ def test_user_facing_preset_names_identify_paper_or_custom_status() -> None:
     assert STUDY_PRESETS[SIMPLE_PRESET_KEY]["label"] == (
         "Custom — balanced 1024 crops + paired whole breast (v1)"
     )
+    assert STUDY_PRESETS[DUAL_WHOLE_PRESET_KEY]["label"] == (
+        "Default Research Dataset (v2 — multi-resolution wholes + windows)"
+    )
+    assert DEFAULT_RESEARCH_DATASET_PRESET_KEY == DUAL_WHOLE_PRESET_KEY
 
 
 def test_paper_22_preset_preserves_data_parent_and_sets_reported_patch_recipe() -> None:

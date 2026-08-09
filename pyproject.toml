@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vindr-mammo-reader"
-version = "1.2.0"
+version = "1.3.0"
 description = "VinDr-Mammo PyTorch dataset, preprocessing, export, visualization, and preprocessing-inspection GUI tools for mass detection."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -39,6 +39,7 @@ dependencies = [
   "dash",
   "plotly",
   "streamlit",
+  "transformers>=4.56",
 ]
 
 [project.optional-dependencies]
@@ -49,6 +50,7 @@ vindr-mammo-export = "vindr_mammo.cli:export_main"
 vindr-mammo-visualize = "vindr_mammo.cli:visualize_main"
 vindr-mammo-gui = "vindr_mammo.cli:gui_main"
 vindr-mammo-streamlit-gui = "vindr_mammo.cli:streamlit_gui_main"
+vindr-mammo-debug-masks = "vindr_mammo.mask_debug:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

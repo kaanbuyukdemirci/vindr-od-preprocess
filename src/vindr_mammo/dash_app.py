@@ -19,14 +19,57 @@ from dash.exceptions import PreventUpdate
 from PIL import Image
 
 from .dataset import VindrMammoDataset
-from .export import load_export_config, make_train_val_test_split, normalize_split_strategy_kwargs
+from .dataset_layout import (
+    parse_resized_sizes,
+    parse_window_grids,
+    resized_sizes_text,
+    resized_variant_configs,
+    window_grids_text,
+)
+from .export import (
+    FLOAT32_EXPORT_VARIANTS,
+    _pad_rgb_to_canvas,
+    _pad_then_resize_rgb,
+    _paired_high_resolution_enabled,
+    _paired_high_resolution_geometry_config,
+    _paired_original_enabled,
+    _paired_resized_enabled,
+    _paired_resized_geometry_config,
+    float32_export_variant_selected,
+    load_export_config,
+    make_train_val_test_split,
+    normalize_split_strategy_kwargs,
+)
 from .export_queue import (
     DuplicateOutputRootError,
     ExportQueueManager,
     InvalidJobStateError,
     QueueJobNotFoundError,
 )
+from .features import (
+    DEFAULT_DINO_V3_COMPUTE_DTYPE,
+    DEFAULT_DINO_V3_INPUT_SIZE,
+    DEFAULT_DINO_V3_MODEL_ID,
+    DINO_V3_LVD_MEAN,
+    DINO_V3_LVD_STD,
+    DINO_V3_MODELS,
+    VARIANT_SPECS,
+    default_feature_dataset_root,
+    default_selected_variants,
+    estimate_dataset_channel_stats,
+    extract_features_from_config,
+    feature_output_folder,
+    feature_shape_summary,
+    scan_dataset_image_variants,
+)
+from .lazy_crops import (
+    default_lazy_crop_config,
+    estimate_lazy_crop_rows,
+    extract_lazy_crop_manifests,
+    scan_lazy_crop_source,
+)
 from .presets import (
+    DEFAULT_RESEARCH_DATASET_PRESET_KEY,
     PAPER_22_IMPROVED_PRESET_KEY,
     PAPER_69_PRESET_KEY,
     SIMPLE_PRESET_KEY,
@@ -69,6 +112,7 @@ from .gui_app import (
     _pipeline_channel_payload,
     _pipeline_uses_contralateral,
     _prepare_saved_viewer_display_image,
+    _prepare_saved_source_display_image,
     _prepare_sample,
     _saved_viewer_caption,
     _source_crops_from_result,
@@ -98,8 +142,8 @@ PIPELINE_STEP_COUNT = 4
 PARAM_HELP: dict[str, dict[str, str]] = {
     "preview_max_side": {
         "title": "Preview Max Side",
-        "body": "Limits the image size used for interactive preview. This is for speed only; export still uses the export YAML settings.",
-        "example": "Use 1536 for fast tuning, 2048 for a sharper preview, or full only when you need exact native-resolution behavior.",
+        "body": "Limits whole-image preview work for speed. Square-crop preview always reads the preprocessed mammogram at source resolution so its crop geometry matches export.",
+        "example": "Use 1024 for a fast whole-image preview. A 1024 crop remains an exact 1024-pixel source window regardless of this setting.",
     },
     "view_geometry": {
         "title": "View Geometry",
@@ -202,9 +246,9 @@ PARAM_HELP: dict[str, dict[str, str]] = {
         "example": "Useful when text labels or markers are brighter than background and detected as foreground.",
     },
     "min_box_visibility_after_crop": {
-        "title": "Minimum Box Visibility After Breast Crop",
-        "body": "Drops an annotation box if the breast crop leaves less than this fraction of its original area visible.",
-        "example": "0.30 means at least 30% of the box must remain after cropping.",
+        "title": "Source Annotation Retention After Breast Crop",
+        "body": "Source-level safeguard applied when the initial breast bounding-box crop clips an annotation. This happens before square windows are generated and is not the saved square-crop label threshold.",
+        "example": "0.05 retains a source annotation when at least 5% remains after the initial breast crop.",
     },
     "crop_size": {
         "title": "Crop Size",
@@ -227,19 +271,19 @@ PARAM_HELP: dict[str, dict[str, str]] = {
         "example": "Turn on to quickly inspect positives; turn off to debug empty/background crops.",
     },
     "positivity_threshold": {
-        "title": "Positive Crop Threshold",
-        "body": "A preview crop is positive if at least one mass box has this visible fraction inside the crop.",
-        "example": "0.30 means a crop is positive when 30% or more of a mass box remains visible.",
+        "title": "Preview-Only Positive Crop Threshold",
+        "body": "Used only to classify and filter candidate crops in the interactive preview. It does not decide which annotations are written to exported YOLO or COCO labels.",
+        "example": "0.05 marks a preview crop positive when at least 5% of one Mass annotation is visible.",
     },
     "allow_partial_annotations": {
-        "title": "Display Partial Boxes",
-        "body": "When enabled, boxes crossing the crop boundary are clipped and shown if they meet visibility requirements.",
-        "example": "Useful for debugging; strict exports often disable partial annotations.",
+        "title": "Saved Labels: Allow Partial Annotations",
+        "body": "When enabled, annotations crossing a square-crop boundary are clipped and written when they meet the saved-label inclusion threshold. The preview draws them by the same rule.",
+        "example": "Enable this to retain a Mass annotation with 5% or more visible area when the saved-label threshold is 0.05.",
     },
     "min_box_visibility": {
-        "title": "Minimum Box Visibility",
-        "body": "Minimum visible fraction required to draw or keep a clipped crop annotation.",
-        "example": "0.50 keeps boxes only when at least half the original box is visible.",
+        "title": "Saved-Label Annotation Inclusion Threshold",
+        "body": "Actual square-crop label rule. A clipped annotation is written to YOLO/COCO, and drawn in crop preview, when visible intersection area divided by original annotation area is at least this fraction.",
+        "example": "0.05 labels every Mass annotation with at least 5% of its original area visible in the square crop.",
     },
     "random_preview_count": {
         "title": "Random Crops To Preview",
@@ -656,13 +700,66 @@ PIPELINE_OP_LABELS = {
 }
 
 # A loaded YAML or study preset is the initial source of truth. The visual
-# builder starts empty and takes over only after the user adds a step.
+# builder is hydrated from it so the two editors always describe the same
+# channel pipeline.
 DEFAULT_VISUAL_OPS: dict[str, dict[int, str]] = {}
+
+
+VISUAL_PIPELINE_INPUT_SPECS: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("stage_sources", {"type": "stage-source", "stage": ALL}),
+    ("stage_ops", {"type": "stage-op", "stage": ALL, "idx": ALL}),
+    ("stage_before_crop", {"type": "stage-before-crop", "stage": ALL, "idx": ALL}),
+    ("stage_los", {"type": "stage-lo", "stage": ALL, "idx": ALL}),
+    ("stage_his", {"type": "stage-hi", "stage": ALL, "idx": ALL}),
+    ("stage_kernels", {"type": "stage-kernel", "stage": ALL, "idx": ALL}),
+    ("stage_sigmas", {"type": "stage-sigma", "stage": ALL, "idx": ALL}),
+    ("stage_amounts", {"type": "stage-amount", "stage": ALL, "idx": ALL}),
+    ("stage_clips", {"type": "stage-clip", "stage": ALL, "idx": ALL}),
+    ("stage_tiles", {"type": "stage-tile", "stage": ALL, "idx": ALL}),
+    ("stage_histeq_excludes", {"type": "stage-histeq-exclude", "stage": ALL, "idx": ALL}),
+    ("stage_histeq_los", {"type": "stage-histeq-lo", "stage": ALL, "idx": ALL}),
+    ("stage_histeq_his", {"type": "stage-histeq-hi", "stage": ALL, "idx": ALL}),
+    ("stage_outside_values", {"type": "stage-outside", "stage": ALL, "idx": ALL}),
+    ("stage_median_kernels", {"type": "stage-median-kernel", "stage": ALL, "idx": ALL}),
+    ("stage_bilateral_diameters", {"type": "stage-bilateral-diameter", "stage": ALL, "idx": ALL}),
+    ("stage_sigma_colors", {"type": "stage-sigma-color", "stage": ALL, "idx": ALL}),
+    ("stage_sigma_spaces", {"type": "stage-sigma-space", "stage": ALL, "idx": ALL}),
+    ("stage_local_los", {"type": "stage-local-lo", "stage": ALL, "idx": ALL}),
+    ("stage_local_his", {"type": "stage-local-hi", "stage": ALL, "idx": ALL}),
+    ("stage_detail_sigmas", {"type": "stage-detail-sigma", "stage": ALL, "idx": ALL}),
+    ("stage_unsharp_sigmas", {"type": "stage-unsharp-sigma", "stage": ALL, "idx": ALL}),
+    ("stage_edge_los", {"type": "stage-edge-lo", "stage": ALL, "idx": ALL}),
+    ("stage_edge_his", {"type": "stage-edge-hi", "stage": ALL, "idx": ALL}),
+    ("stage_edge_kernels", {"type": "stage-edge-kernel", "stage": ALL, "idx": ALL}),
+    ("stage_kernel_shapes", {"type": "stage-kernel-shape", "stage": ALL, "idx": ALL}),
+    ("stage_morph_kernels", {"type": "stage-morph-kernel", "stage": ALL, "idx": ALL}),
+    ("stage_gammas", {"type": "stage-gamma", "stage": ALL, "idx": ALL}),
+    ("stage_gains", {"type": "stage-gain", "stage": ALL, "idx": ALL}),
+    ("stage_z_limits", {"type": "stage-z-limit", "stage": ALL, "idx": ALL}),
+    ("stage_target_means", {"type": "stage-target-mean", "stage": ALL, "idx": ALL}),
+    ("stage_target_stds", {"type": "stage-target-std", "stage": ALL, "idx": ALL}),
+    ("stage_stat_los", {"type": "stage-stat-lo", "stage": ALL, "idx": ALL}),
+    ("stage_stat_his", {"type": "stage-stat-hi", "stage": ALL, "idx": ALL}),
+    ("stage_wiener_kernels", {"type": "stage-wiener-kernel", "stage": ALL, "idx": ALL}),
+    ("stage_wiener_noises", {"type": "stage-wiener-noise", "stage": ALL, "idx": ALL}),
+    ("stage_sharpen_amounts", {"type": "stage-sharpen-amount", "stage": ALL, "idx": ALL}),
+    ("stage_pectoral_sides", {"type": "stage-pectoral-side", "stage": ALL, "idx": ALL}),
+    ("stage_pectoral_widths", {"type": "stage-pectoral-width", "stage": ALL, "idx": ALL}),
+    ("stage_pectoral_heights", {"type": "stage-pectoral-height", "stage": ALL, "idx": ALL}),
+    ("stage_pectoral_fills", {"type": "stage-pectoral-fill", "stage": ALL, "idx": ALL}),
+)
+VISUAL_PIPELINE_PARAM_KEYS = tuple(key for key, _component_id in VISUAL_PIPELINE_INPUT_SPECS)
+
+
+def _visual_pipeline_inputs() -> list[Input]:
+    return [Input(component_id, "value") for _key, component_id in VISUAL_PIPELINE_INPUT_SPECS]
 
 DATASET_OBJECT_CACHE: dict[str, VindrMammoDataset] = {}
 
 
 EXPORT_QUEUE = ExportQueueManager()
+FEATURE_QUEUE = ExportQueueManager(runner=extract_features_from_config)
+LAZY_CROP_QUEUE = ExportQueueManager(runner=extract_lazy_crop_manifests)
 DATASET_METADATA_CACHE: dict[str, dict[str, Any]] = {}
 PREVIEW_SAMPLE_CACHE: dict[str, dict[str, Any]] = {}
 
@@ -745,7 +842,11 @@ def _layout(config_path: Path, cfg: dict[str, Any]) -> html.Div:
             dcc.Store(id="selected-help-store", data="config_path"),
             dcc.Store(id="space-estimate-store", data={}),
             dcc.Store(id="active-export-job-store", data=None),
+            dcc.Store(id="active-feature-job-store", data=None),
+            dcc.Store(id="active-lazy-crop-job-store", data=None),
             dcc.Interval(id="job-poll", interval=1200, disabled=True),
+            dcc.Interval(id="feature-poll", interval=1200, disabled=True),
+            dcc.Interval(id="lazy-crop-poll", interval=1200, disabled=True),
             # Keep queue/disk monitoring live in a separately opened browser
             # window even though that client did not click a queue action.
             dcc.Interval(id="queue-poll", interval=1200, disabled=False),
@@ -820,6 +921,8 @@ def _layout(config_path: Path, cfg: dict[str, Any]) -> html.Div:
                                     dcc.Tab(label="Save Data", value="export", children=html.Div(_export_controls_dash(cfg), className="controls-body")),
                                     dcc.Tab(label="Storage & Queue", value="queue", children=html.Div(_queue_controls_dash(cfg), className="controls-body")),
                                     dcc.Tab(label="Saved Viewer", value="saved", children=html.Div(_saved_controls_dash(cfg), className="controls-body")),
+                                    dcc.Tab(label="Feature Extraction", value="features", children=html.Div(_feature_controls_dash(cfg), className="controls-body")),
+                                    dcc.Tab(label="Lazy Crop Manifests", value="lazy-crops", children=html.Div(_lazy_crop_controls_dash(cfg), className="controls-body")),
                                     dcc.Tab(label="Manifest", value="manifests", children=html.Div(_manifest_controls_dash(), className="controls-body")),
                                     dcc.Tab(label="Guide", value="guide", children=html.Div(_guide_controls_dash(), className="controls-body")),
                                 ],
@@ -860,6 +963,8 @@ def _layout(config_path: Path, cfg: dict[str, Any]) -> html.Div:
                                             {"label": "Comparison", "value": "comparison"},
                                             {"label": "Dataset visualizations", "value": "visualizations"},
                                             {"label": "Saved dataset viewer", "value": "saved"},
+                                            {"label": "Feature extraction", "value": "features"},
+                                            {"label": "Lazy crop manifests", "value": "lazy-crops"},
                                             {"label": "Manifest tools", "value": "manifest"},
                                             {"label": "Storage & queue", "value": "queue"},
                                         ],
@@ -1006,6 +1111,21 @@ def _register_callbacks(app: Dash) -> None:
             ]
         )
 
+    @app.callback(
+        Output("control-tabs", "value", allow_duplicate=True),
+        Input("mode", "value"),
+        prevent_initial_call=True,
+    )
+    def _follow_viewer_mode_with_controls(mode: str) -> Any:
+        matching_tabs = {
+            "saved": "saved",
+            "features": "features",
+            "lazy-crops": "lazy-crops",
+            "manifest": "manifests",
+            "queue": "queue",
+        }
+        return matching_tabs.get(str(mode), no_update)
+
     @app.callback(Output("method-guide-body", "children"), Input("method-guide-op", "value"))
     def _render_method_guide(op: str) -> Any:
         op = str(op or "none")
@@ -1121,12 +1241,27 @@ def _register_callbacks(app: Dash) -> None:
         return pipeline, yaml.safe_dump(_make_yaml_safe(pipeline), sort_keys=False, width=100), "yaml"
 
     @app.callback(
+        Output("visual-pipeline-builder", "children"),
+        Input("pipeline-store", "data"),
+    )
+    def _sync_visual_builder_from_pipeline(pipeline: dict[str, Any]) -> Any:
+        return _visual_pipeline_builder(pipeline or {})
+
+    @app.callback(
+        Output("pipeline-yaml", "value", allow_duplicate=True),
         Output("pipeline-mode", "data", allow_duplicate=True),
-        Input({"type": "stage-op", "stage": ALL, "idx": ALL}, "value"),
+        *_visual_pipeline_inputs(),
         prevent_initial_call=True,
     )
-    def _activate_visual_pipeline(_ops: list[Any]) -> str:
-        return "visual"
+    def _activate_visual_pipeline(*values: Any) -> tuple[str, str]:
+        params = dict(zip(VISUAL_PIPELINE_PARAM_KEYS, values, strict=True))
+        pipeline = _visual_pipeline_from_params(params)
+        if pipeline is None:
+            raise PreventUpdate
+        return (
+            yaml.safe_dump(_make_yaml_safe(pipeline), sort_keys=False, width=100),
+            "visual",
+        )
 
     @app.callback(
         Output("pipeline-mode", "data", allow_duplicate=True),
@@ -1161,12 +1296,14 @@ def _register_callbacks(app: Dash) -> None:
         Input({"type": "stage-op", "stage": ALL, "idx": ALL}, "value"),
         State({"type": "stage-op", "stage": ALL, "idx": ALL}, "id"),
         State({"type": "stage-settings", "stage": ALL, "idx": ALL}, "id"),
+        State("pipeline-store", "data"),
         prevent_initial_call=False,
     )
     def _operation_setting_children(
         ops: list[Any],
         op_ids: list[dict[str, Any]],
         setting_ids: list[dict[str, Any]],
+        pipeline: dict[str, Any],
     ) -> list[Any]:
         op_by_stage_idx = _stage_idx_map(op_ids, ops)
         children = []
@@ -1174,7 +1311,13 @@ def _register_callbacks(app: Dash) -> None:
             stage = str(setting_id.get("stage"))
             idx = int(setting_id.get("idx", 0))
             op = str(op_by_stage_idx.get((stage, idx), "none") or "none")
-            children.append(_settings_controls_for_op(op, stage, idx))
+            stored_step = _visual_step_for_slot(pipeline or {}, stage, idx)
+            stored_params = (
+                dict(stored_step.get("params", {}) or {})
+                if str(stored_step.get("op", "none") or "none") == op
+                else {}
+            )
+            children.append(_settings_controls_for_op(op, stage, idx, stored_params))
         return children
 
     @app.callback(
@@ -1377,12 +1520,42 @@ def _register_callbacks(app: Dash) -> None:
         started = time.perf_counter()
         cfg = cfg or {}
         params = _state_to_params(state)
+        # Paired-canvas geometry has no dedicated editable control. Carry the
+        # loaded/preset configuration into previews so a fixed common canvas is
+        # shown exactly as it will be exported.
+        params["_paired_whole_config"] = copy.deepcopy(
+            cfg.get("paired_whole_images", {}) or {}
+        )
         if mode == "saved":
             return _render_saved_dataset(params, cfg)
         if mode == "visualizations":
             return _render_visualizations(cfg)
         if mode == "manifest":
             return _render_manifest_tools(params, cfg)
+        if mode == "features":
+            snapshot = FEATURE_QUEUE.snapshot()
+            return html.Div(
+                [
+                    html.H2("Feature extraction"),
+                    html.P(
+                        "Choose an already exported dataset and DINOv3 settings in the Feature Extraction control tab. The worker prefers non-quantized float32 tensors, writes same-stem feature files under the dataset's features/ folder, and records the exact reverse mapping in a JSONL manifest."
+                    ),
+                    _feature_queue_children(snapshot),
+                ]
+            )
+        if mode == "lazy-crops":
+            snapshot = LAZY_CROP_QUEUE.snapshot()
+            return html.Div(
+                [
+                    html.H2("Lazy crop manifests"),
+                    html.P(
+                        "Create virtual-crop and crop-annotation CSVs from an existing "
+                        "whole-image export. The extractor reads dimensions and Mass boxes "
+                        "from metadata and never decodes PNG or float32 image pixels."
+                    ),
+                    _lazy_crop_queue_children(snapshot),
+                ]
+            )
         if mode == "queue":
             return html.Div([
                 html.H2("Storage and extraction queue"),
@@ -1406,7 +1579,7 @@ def _register_callbacks(app: Dash) -> None:
             dataset = _dataset_from_cfg(
                 _cfg_with_preprocess(cfg, params),
                 read_image=True,
-                preview_max_side=int(params.get("preview_max_side") or 0),
+                preview_max_side=_preview_read_max_side(params),
             )
             records = pd.DataFrame(dataset_store.get("records", []))
             if mode == "comparison":
@@ -1674,6 +1847,678 @@ def _register_callbacks(app: Dash) -> None:
         table = _queue_table_children(snapshot)
         return table, options, value, table
 
+    @app.callback(
+        Output("feature-variants", "options"),
+        Output("feature-variants", "value"),
+        Output("feature-splits", "options"),
+        Output("feature-splits", "value"),
+        Output("feature-scan-summary", "children"),
+        Input("feature-scan-button", "n_clicks"),
+        Input("feature-dataset-root", "value"),
+        prevent_initial_call=False,
+    )
+    def _scan_feature_dataset(_clicks: int, root: str) -> tuple[Any, Any, Any, Any, Any]:
+        try:
+            scan = scan_dataset_image_variants(str(root or ""))
+        except Exception as exc:
+            return [], [], [{"label": "All", "value": "all"}], ["all"], html.Div(
+                f"Could not scan dataset: {exc}", className="error note"
+            )
+        variants = dict(scan.get("variants", {}) or {})
+        options = [
+            {
+                "label": (
+                    f"{item.get('label', key)} — {int(item.get('count', 0)):,} "
+                    f"({int(item.get('float32_count', 0)):,} float32)"
+                ),
+                "value": key,
+            }
+            for key, item in variants.items()
+        ]
+        selected = default_selected_variants(scan)
+        split_names = sorted(
+            {
+                split
+                for item in variants.values()
+                for split in dict(item.get("splits", {}) or {})
+            }
+        )
+        split_options = [{"label": "All", "value": "all"}] + [
+            {"label": split, "value": split} for split in split_names
+        ]
+        if not variants:
+            return options, selected, split_options, ["all"], html.Div(
+                f"No supported exported images were found under {scan.get('dataset_root')}.",
+                className="warning note",
+            )
+        rows = [
+            html.Li(
+                f"{item.get('label', key)}: {int(item.get('count', 0)):,} images; "
+                f"{int(item.get('float32_count', 0)):,} float32; "
+                f"{int(item.get('missing_float32_count', 0)):,} PNG fallbacks"
+            )
+            for key, item in variants.items()
+        ]
+        preset_note = (
+            "Default Research Dataset detected: original-size wholes are available but not selected by default."
+            if scan.get("is_default_research_dataset")
+            else "All detected image types are selected by default."
+        )
+        return options, selected, split_options, ["all"], html.Div(
+            [
+                html.Div([html.Strong("Dataset: "), str(scan.get("dataset_root"))]),
+                html.Ul(rows),
+                html.Div(preset_note, className="note"),
+            ]
+        )
+
+    @app.callback(
+        Output("feature-mean", "value"),
+        Output("feature-std", "value"),
+        Output("feature-normalization-status", "children"),
+        Input("feature-estimate-stats-button", "n_clicks"),
+        Input("feature-restore-stats-button", "n_clicks"),
+        State("feature-dataset-root", "value"),
+        State("feature-variants", "value"),
+        State("feature-splits", "value"),
+        State("feature-stat-sample-size", "value"),
+        State("feature-prefer-float", "value"),
+        prevent_initial_call=True,
+    )
+    def _estimate_feature_normalization(
+        _estimate_clicks: int,
+        _restore_clicks: int,
+        dataset_root: str,
+        variants: list[str],
+        splits: list[str],
+        sample_size: int,
+        prefer_float: list[str],
+    ) -> tuple[Any, Any, Any]:
+        trigger = callback_context.triggered_id
+        official_mean = ",".join(str(value) for value in DINO_V3_LVD_MEAN)
+        official_std = ",".join(str(value) for value in DINO_V3_LVD_STD)
+        if trigger == "feature-restore-stats-button":
+            return official_mean, official_std, html.Div(
+                "Restored the official LVD-1689M DINOv3/ImageNet normalization baseline.",
+                className="note",
+            )
+        if not variants:
+            return no_update, no_update, html.Div(
+                "Select at least one image type before estimating statistics.",
+                className="warning note",
+            )
+
+        selected_splits = list(splits or ["all"])
+        train_only = "all" in selected_splits
+        effective_splits = ["train"] if train_only else selected_splits
+        try:
+            stats = estimate_dataset_channel_stats(
+                str(dataset_root or ""),
+                variants=variants,
+                splits=effective_splits,
+                max_images=max(2, int(sample_size or 256)),
+                prefer_float32_sources=_is_on(prefer_float),
+                seed=123,
+            )
+        except Exception as exc:
+            return no_update, no_update, html.Div(
+                f"Could not estimate image statistics: {exc}",
+                className="error note",
+            )
+
+        mean_values = [float(value) for value in stats["recommended_mean"]]
+        std_values = [float(value) for value in stats["recommended_std"]]
+        mean_text = ",".join(f"{value:.8f}" for value in mean_values)
+        std_text = ",".join(f"{value:.8f}" for value in std_values)
+        grayscale = bool(stats.get("grayscale_replicated", False))
+        channel_note = (
+            "All sampled channels were identical. Repeating the scalar moments across R/G/B "
+            "keeps them identical after normalization."
+            if grayscale
+            else (
+                "The sampled channels were not identical, so separate per-channel moments were "
+                "used."
+            )
+        )
+        split_note = (
+            "All was selected, so only train images were sampled to avoid validation/test leakage."
+            if train_only
+            else f"Sampled the selected splits: {', '.join(effective_splits)}."
+        )
+        return mean_text, std_text, html.Div(
+            [
+                html.Div(
+                    [
+                        html.Strong("Estimated dataset moment matching applied. "),
+                        f"Mean = ({mean_text}); std = ({std_text}).",
+                    ]
+                ),
+                html.Div(
+                    f"Read {int(stats['sampled_images']):,} deterministic sample images "
+                    f"({int(stats['pixels_per_channel']):,} pixels per channel), range "
+                    f"[{float(stats['minimum']):.6f}, {float(stats['maximum']):.6f}], with "
+                    f"{int(stats['png_fallback_count']):,} PNG fallbacks."
+                ),
+                html.Div(channel_note),
+                html.Div(split_note),
+                html.Div(
+                    "On this sample, the chosen transform produces channel mean approximately "
+                    "0 and std approximately 1. It matches only these two moments, not the full "
+                    "DINOv3 pretraining-image distribution; validate both normalization choices "
+                    "on the downstream task.",
+                ),
+            ],
+            className="warning note",
+        )
+
+    @app.callback(
+        Output("feature-shape-summary", "children"),
+        Input("feature-model-id", "value"),
+        Input("feature-resize-mode", "value"),
+        Input("feature-input-width", "value"),
+        Input("feature-input-height", "value"),
+        Input("feature-batch-size", "value"),
+        Input("feature-outputs", "value"),
+        Input("feature-layer", "value"),
+        Input("feature-dataset-root", "value"),
+        prevent_initial_call=False,
+    )
+    def _feature_shapes(
+        model_id: str,
+        resize_mode: str,
+        width: int,
+        height: int,
+        batch_size: int,
+        outputs: list[str],
+        layer: int,
+        dataset_root: str,
+    ) -> Any:
+        summary = feature_shape_summary(
+            str(model_id),
+            input_width=int(width or 1024),
+            input_height=int(height or 1024),
+            resize_mode=str(resize_mode or "exact"),
+            outputs=outputs or [],
+            batch_size=int(batch_size or 1),
+        )
+        provisional = {
+            "paths": {"dataset_root": str(dataset_root or ".")},
+            "model": {"model_id": str(model_id)},
+            "input": {
+                "resize_mode": str(resize_mode or "exact"),
+                "width": int(width or 1024),
+                "height": int(height or 1024),
+            },
+            "extraction": {
+                "outputs": outputs or [],
+                "layer": int(layer if layer is not None else -1),
+            },
+        }
+        return html.Div(
+            [
+                html.Div(
+                    className="metric-row",
+                    children=[
+                        _metric(
+                            "Architecture",
+                            f"{summary.get('layers')} layers / {summary.get('hidden_size')} dim / "
+                            f"patch {summary.get('patch_size')} / {summary.get('register_tokens')} registers",
+                        ),
+                        _metric("Input", str(summary.get("input"))),
+                        _metric("Patch grid", str(summary.get("patch_grid"))),
+                        _metric(
+                            "Token sequence",
+                            str(summary.get("token_sequence", "variable")),
+                        ),
+                    ],
+                ),
+                html.Pre(json.dumps(summary.get("saved_shapes"), indent=2)),
+                html.Div(
+                    [html.Strong("Output folder: "), str(feature_output_folder(provisional))],
+                    className="note",
+                ),
+            ]
+        )
+
+    @app.callback(
+        Output("feature-start-status", "children"),
+        Output("feature-poll", "disabled"),
+        Output("active-feature-job-store", "data"),
+        Input("feature-start-button", "n_clicks"),
+        State("feature-dataset-root", "value"),
+        State("feature-variants", "value"),
+        State("feature-splits", "value"),
+        State("feature-network", "value"),
+        State("feature-model-id", "value"),
+        State("feature-model-path", "value"),
+        State("feature-local-only", "value"),
+        State("feature-device", "value"),
+        State("feature-compute-dtype", "value"),
+        State("feature-resize-mode", "value"),
+        State("feature-input-width", "value"),
+        State("feature-input-height", "value"),
+        State("feature-pad-value", "value"),
+        State("feature-mean", "value"),
+        State("feature-std", "value"),
+        State("feature-layer", "value"),
+        State("feature-outputs", "value"),
+        State("feature-batch-size", "value"),
+        State("feature-save-dtype", "value"),
+        State("feature-prefer-float", "value"),
+        State("feature-overwrite", "value"),
+        prevent_initial_call=True,
+    )
+    def _start_feature_extraction(
+        _clicks: int,
+        dataset_root: str,
+        variants: list[str],
+        splits: list[str],
+        network: str,
+        model_id: str,
+        model_path: str,
+        local_only: list[str],
+        device: str,
+        compute_dtype: str,
+        resize_mode: str,
+        width: int,
+        height: int,
+        pad_value: float,
+        mean: str,
+        std: str,
+        layer: int,
+        outputs: list[str],
+        batch_size: int,
+        save_dtype: str,
+        prefer_float: list[str],
+        overwrite: list[str],
+    ) -> tuple[Any, bool, Any]:
+        if not variants:
+            return html.Div("Select at least one detected image type.", className="warning note"), True, no_update
+        if not outputs:
+            return html.Div("Select at least one DINOv3 output tensor.", className="warning note"), True, no_update
+        feature_cfg: dict[str, Any] = {
+            "paths": {"dataset_root": str(dataset_root or "")},
+            "network": str(network or "dinov3"),
+            "variants": list(variants),
+            "splits": list(splits or ["all"]),
+            "model": {
+                "model_id": str(model_id),
+                "model_path": str(model_path or "").strip() or None,
+                "local_files_only": _is_on(local_only),
+                "device": str(device or "auto"),
+                "compute_dtype": str(compute_dtype or "float32"),
+                "frozen": True,
+                "pretrained": True,
+            },
+            "input": {
+                "resize_mode": str(resize_mode or "exact"),
+                "width": int(width or 1024),
+                "height": int(height or 1024),
+                "pad_value": float(pad_value or 0.0),
+                "mean": str(
+                    mean or ",".join(str(value) for value in DINO_V3_LVD_MEAN)
+                ),
+                "std": str(
+                    std or ",".join(str(value) for value in DINO_V3_LVD_STD)
+                ),
+            },
+            "extraction": {
+                "layer": int(layer if layer is not None else -1),
+                "outputs": list(outputs),
+                "batch_size": max(1, int(batch_size or 1)),
+                "save_dtype": str(save_dtype or "float32"),
+                "prefer_float32_sources": _is_on(prefer_float),
+                "overwrite": _is_on(overwrite),
+            },
+        }
+        output_root = feature_output_folder(feature_cfg)
+        feature_cfg["paths"]["output_root"] = str(output_root)
+        try:
+            scan = scan_dataset_image_variants(str(dataset_root or ""))
+            available = set(dict(scan.get("variants", {}) or {}))
+            missing = sorted(set(variants) - available)
+            if missing:
+                raise FileNotFoundError(
+                    f"Selected image types are no longer present: {', '.join(missing)}"
+                )
+            # Release an older completed/failed job for the exact same output
+            # so an explicit overwrite run can reuse the deterministic folder.
+            for job in FEATURE_QUEUE.snapshot().get("jobs", []):
+                if (
+                    str(job.get("output_root")) == str(output_root.resolve(strict=False))
+                    and str(job.get("status")) in {"completed", "failed"}
+                ):
+                    FEATURE_QUEUE.remove(str(job.get("job_id")))
+            job_id = FEATURE_QUEUE.enqueue(
+                feature_cfg,
+                name=output_root.name,
+                metadata={
+                    "kind": "feature_extraction",
+                    "network": "dinov3",
+                    "selected_variants": list(variants),
+                },
+            )
+            FEATURE_QUEUE.start()
+        except Exception as exc:
+            return html.Div(f"Could not start feature extraction: {exc}", className="error note"), True, no_update
+        return html.Div(
+            [
+                html.Div(f"Feature extraction queued and started. Job id: {job_id}", className="note"),
+                html.Div([html.Strong("Output: "), str(output_root)], className="note"),
+            ]
+        ), False, job_id
+
+    @app.callback(
+        Output("feature-progress-status", "children"),
+        Output("feature-queue-table", "children"),
+        Output("feature-poll", "disabled", allow_duplicate=True),
+        Input("feature-poll", "n_intervals"),
+        State("active-feature-job-store", "data"),
+        prevent_initial_call=True,
+    )
+    def _poll_feature_extraction(_tick: int, active_job_id: str | None) -> tuple[Any, Any, bool]:
+        snapshot = FEATURE_QUEUE.snapshot()
+        table = _feature_queue_children(snapshot)
+        if not active_job_id:
+            return no_update, table, True
+        try:
+            job = FEATURE_QUEUE.get_job(str(active_job_id))
+        except QueueJobNotFoundError:
+            return html.Div("Feature job is no longer retained.", className="warning note"), table, True
+        status = str(job.get("status"))
+        detail = _queue_progress_text(job)
+        if status in {"queued", "running"}:
+            return html.Div(f"DINOv3 extraction {status}. {detail}", className="note"), table, False
+        if status == "failed":
+            return html.Div(f"Feature extraction failed: {job.get('error')}", className="error note"), table, True
+        result = dict(job.get("result") or {})
+        fallback = int(result.get("png_fallback_count", 0) or 0)
+        cls = "warning note" if fallback else "note"
+        return html.Div(
+            f"Feature extraction complete: {int(result.get('saved_features', 0)):,} saved, "
+            f"{fallback:,} PNG fallbacks, {int(result.get('failed', 0)):,} failed. "
+            f"Output: {result.get('output_root')}",
+            className=cls,
+        ), table, True
+
+    @app.callback(
+        Output("lazy-crop-output-root", "value"),
+        Input("lazy-crop-dataset-root", "value"),
+        Input("lazy-crop-grids", "value"),
+        Input("lazy-crop-window-size", "value"),
+        Input("lazy-crop-stride", "value"),
+        prevent_initial_call=False,
+    )
+    def _sync_lazy_crop_output_root(
+        dataset_root: str, grids_text: str, window_size: int, stride: int
+    ) -> str:
+        selected = Path(str(dataset_root or ".")).expanduser().resolve(strict=False)
+        export_root = selected.parent if selected.name == "square_crops" else selected
+        try:
+            first_grid = parse_window_grids(grids_text)[0]
+            window_size = int(first_grid["window_size"])
+            stride = int(first_grid["stride"])
+        except ValueError:
+            pass
+        return str(
+            export_root
+            / "annotations"
+            / "windows"
+            / f"window_{int(window_size or 1024)}_stride_{int(stride or 128)}"
+        )
+
+    @app.callback(
+        Output("lazy-crop-scan-summary", "children"),
+        Input("lazy-crop-scan-button", "n_clicks"),
+        Input("lazy-crop-dataset-root", "value"),
+        prevent_initial_call=False,
+    )
+    def _scan_lazy_crop_dataset(_clicks: int, dataset_root: str) -> Any:
+        try:
+            scan = scan_lazy_crop_source(str(dataset_root or ""))
+        except Exception as exc:
+            return html.Div(f"Could not scan lazy-crop metadata: {exc}", className="error note")
+        by_split = dict(scan.get("source_images_by_split", {}) or {})
+        float_count = int(scan.get("same_geometry_float32_sources", 0) or 0)
+        return html.Div(
+            [
+                html.Div(
+                    f"{int(scan.get('source_images', 0)):,} original-size whole sources: "
+                    f"{int(by_split.get('train', 0)):,} train, "
+                    f"{int(by_split.get('val', 0)):,} validation, "
+                    f"{int(by_split.get('test', 0)):,} test."
+                ),
+                html.Div(
+                    f"{int(scan.get('source_mass_annotations', 0)):,} source Mass boxes; "
+                    f"{float_count:,} same-geometry original float32 sources; "
+                    f"{int(scan.get('decoded_images', 0))} decoded images."
+                ),
+                html.Div(
+                    "When the same-geometry float32 field is empty, training should crop "
+                    "source_png_path. The available resized-whole float32 tensor is recorded "
+                    "as context only because its coordinates differ.",
+                    className="warning note" if float_count == 0 else "note",
+                ),
+            ]
+        )
+
+    @app.callback(
+        Output("lazy-crop-estimate-status", "children"),
+        Input("lazy-crop-estimate-button", "n_clicks"),
+        State("lazy-crop-dataset-root", "value"),
+        State("lazy-crop-output-root", "value"),
+        State("lazy-crop-grids", "value"),
+        State("lazy-crop-window-size", "value"),
+        State("lazy-crop-stride", "value"),
+        State("lazy-crop-min-box-visibility", "value"),
+        State("lazy-crop-train-min-extent", "value"),
+        State("lazy-crop-eval-min-extent", "value"),
+        State("lazy-crop-preserve-positives", "value"),
+        State("lazy-crop-positive-fraction", "value"),
+        State("lazy-crop-clean-negative-breasts", "value"),
+        State("lazy-crop-seed", "value"),
+        State("lazy-crop-overwrite", "value"),
+        prevent_initial_call=True,
+    )
+    def _estimate_lazy_crops(
+        _clicks: int,
+        dataset_root: str,
+        output_root: str,
+        grids_text: str,
+        window_size: int,
+        stride: int,
+        min_box_visibility: float,
+        train_min_extent: float,
+        eval_min_extent: float,
+        preserve_positives: list[str],
+        positive_fraction: float,
+        clean_negative_breasts: list[str],
+        seed: int,
+        overwrite: list[str],
+    ) -> Any:
+        try:
+            grids = parse_window_grids(grids_text) if str(grids_text or "").strip() else [{
+                "window_size": int(window_size or 1024),
+                "stride": int(stride or 128),
+            }]
+            estimates = []
+            for grid in grids:
+                lazy_cfg = _lazy_crop_config_from_controls(
+                    dataset_root=dataset_root,
+                    output_root=(output_root if len(grids) == 1 else ""),
+                    window_size=int(grid["window_size"]),
+                    stride=int(grid["stride"]),
+                    min_box_visibility=min_box_visibility,
+                    train_min_extent=train_min_extent,
+                    eval_min_extent=eval_min_extent,
+                    preserve_positives=preserve_positives,
+                    positive_fraction=positive_fraction,
+                    clean_negative_breasts=clean_negative_breasts,
+                    seed=seed,
+                    overwrite=overwrite,
+                )
+                estimates.append(estimate_lazy_crop_rows(lazy_cfg))
+        except Exception as exc:
+            return html.Div(f"Lazy-crop estimate failed: {exc}", className="error note")
+        split_rows = {
+            split: sum(
+                int((estimate.get("complete_grid_rows_by_split", {}) or {}).get(split, 0))
+                for estimate in estimates
+            )
+            for split in ["train", "val", "test"]
+        }
+        total_rows = sum(int(estimate.get("complete_grid_rows", 0)) for estimate in estimates)
+        return html.Div(
+            [
+                html.Strong(
+                    f"{total_rows:,} complete-grid candidates across {len(estimates)} grid(s)"
+                ),
+                html.Div(
+                    f"train {int(split_rows.get('train', 0)):,} · "
+                    f"validation {int(split_rows.get('val', 0)):,} · "
+                    f"test {int(split_rows.get('test', 0)):,}"
+                ),
+                html.Div(
+                    "The final train count will be smaller after clean-negative balancing. "
+                    f"Estimated decoded images: {sum(int(value.get('decoded_images', 0)) for value in estimates)}."
+                ),
+                html.Ul([
+                    html.Li(str(value.get("output_root"))) for value in estimates
+                ]),
+            ],
+            className="summary-box",
+        )
+
+    @app.callback(
+        Output("lazy-crop-start-status", "children"),
+        Output("lazy-crop-poll", "disabled"),
+        Output("active-lazy-crop-job-store", "data"),
+        Input("lazy-crop-start-button", "n_clicks"),
+        State("lazy-crop-dataset-root", "value"),
+        State("lazy-crop-output-root", "value"),
+        State("lazy-crop-grids", "value"),
+        State("lazy-crop-window-size", "value"),
+        State("lazy-crop-stride", "value"),
+        State("lazy-crop-min-box-visibility", "value"),
+        State("lazy-crop-train-min-extent", "value"),
+        State("lazy-crop-eval-min-extent", "value"),
+        State("lazy-crop-preserve-positives", "value"),
+        State("lazy-crop-positive-fraction", "value"),
+        State("lazy-crop-clean-negative-breasts", "value"),
+        State("lazy-crop-seed", "value"),
+        State("lazy-crop-overwrite", "value"),
+        prevent_initial_call=True,
+    )
+    def _start_lazy_crops(
+        _clicks: int,
+        dataset_root: str,
+        output_root: str,
+        grids_text: str,
+        window_size: int,
+        stride: int,
+        min_box_visibility: float,
+        train_min_extent: float,
+        eval_min_extent: float,
+        preserve_positives: list[str],
+        positive_fraction: float,
+        clean_negative_breasts: list[str],
+        seed: int,
+        overwrite: list[str],
+    ) -> tuple[Any, bool, Any]:
+        try:
+            grids = parse_window_grids(grids_text) if str(grids_text or "").strip() else [{
+                "window_size": int(window_size or 1024),
+                "stride": int(stride or 128),
+            }]
+            scan = scan_lazy_crop_source(str(dataset_root or ""))
+            queued: list[tuple[str, Path]] = []
+            for grid in grids:
+                lazy_cfg = _lazy_crop_config_from_controls(
+                    dataset_root=dataset_root,
+                    output_root=(output_root if len(grids) == 1 else ""),
+                    window_size=int(grid["window_size"]),
+                    stride=int(grid["stride"]),
+                    min_box_visibility=min_box_visibility,
+                    train_min_extent=train_min_extent,
+                    eval_min_extent=eval_min_extent,
+                    preserve_positives=preserve_positives,
+                    positive_fraction=positive_fraction,
+                    clean_negative_breasts=clean_negative_breasts,
+                    seed=seed,
+                    overwrite=overwrite,
+                )
+                resolved_output = Path(lazy_cfg["paths"]["output_root"])
+                if _is_on(overwrite):
+                    for job in LAZY_CROP_QUEUE.snapshot().get("jobs", []):
+                        if (
+                            str(job.get("output_root"))
+                            == str(resolved_output.resolve(strict=False))
+                            and str(job.get("status")) in {"completed", "failed"}
+                        ):
+                            LAZY_CROP_QUEUE.remove(str(job.get("job_id")))
+                job_id = LAZY_CROP_QUEUE.enqueue(
+                    lazy_cfg,
+                    name=resolved_output.name,
+                    metadata={
+                        "kind": "lazy_crop_manifests",
+                        "source_images": int(scan.get("source_images", 0)),
+                        "decoded_images": 0,
+                        "window_size": int(grid["window_size"]),
+                        "stride": int(grid["stride"]),
+                    },
+                )
+                queued.append((job_id, resolved_output))
+            LAZY_CROP_QUEUE.start()
+        except Exception as exc:
+            return html.Div(f"Could not start lazy-crop extraction: {exc}", className="error note"), True, no_update
+        return (
+            html.Div(
+                [
+                    html.Div(f"Queued {len(queued)} lazy-window manifest job(s).", className="note"),
+                    html.Ul([
+                        html.Li(f"{job_id}: {resolved_output}")
+                        for job_id, resolved_output in queued
+                    ]),
+                ]
+            ),
+            False,
+            queued[-1][0],
+        )
+
+    @app.callback(
+        Output("lazy-crop-progress-status", "children"),
+        Output("lazy-crop-queue-table", "children"),
+        Output("lazy-crop-poll", "disabled", allow_duplicate=True),
+        Input("lazy-crop-poll", "n_intervals"),
+        State("active-lazy-crop-job-store", "data"),
+        prevent_initial_call=True,
+    )
+    def _poll_lazy_crops(_tick: int, active_job_id: str | None) -> tuple[Any, Any, bool]:
+        snapshot = LAZY_CROP_QUEUE.snapshot()
+        table = _lazy_crop_queue_children(snapshot)
+        if not active_job_id:
+            return no_update, table, True
+        try:
+            job = LAZY_CROP_QUEUE.get_job(str(active_job_id))
+        except QueueJobNotFoundError:
+            return html.Div("Lazy-crop job is no longer retained.", className="warning note"), table, True
+        status = str(job.get("status"))
+        if status in {"queued", "running"}:
+            return html.Div(
+                f"Lazy-crop extraction {status}. {_queue_progress_text(job)}",
+                className="note",
+            ), table, False
+        if status == "failed":
+            return html.Div(f"Lazy-crop extraction failed: {job.get('error')}", className="error note"), table, True
+        result = dict(job.get("result") or {})
+        return html.Div(
+            f"Lazy-crop extraction complete: {int(result.get('saved_crops', 0)):,} crop rows and "
+            f"{int(result.get('saved_annotations', 0)):,} annotation rows; "
+            f"{int(result.get('decoded_source_images', 0))} images decoded. "
+            f"Output: {result.get('output_root')}",
+            className="note",
+        ), table, True
+
 
 def _preview_controls_dash(cfg: dict[str, Any]) -> Any:
     return html.Div(
@@ -1742,7 +2587,7 @@ def _preprocess_controls(cfg: dict[str, Any]) -> Any:
                     _field("Close kernel", dcc.Dropdown(id="pp-close-kernel", options=[0, 7, 11, 15, 21, 31, 41], value=int(pp.get("breast_mask_close_kernel", 21) or 21), clearable=False), "breast_mask_close_kernel"),
                     _check("pp-fill-holes", "Fill breast-mask holes", bool(pp.get("breast_mask_fill_holes", True)), "breast_mask_fill_holes"),
                     _check("pp-largest-component", "Keep largest connected component", bool(pp.get("breast_mask_keep_largest_component", True)), "breast_mask_keep_largest_component"),
-                    _field("Minimum box visibility after breast crop", _number("pp-min-box-after-crop", float(pp.get("min_box_visibility_after_crop", 0.30)), min_=0, max_=1, step=0.05), "min_box_visibility_after_crop"),
+                    _field("Source annotations: retain after breast crop at visible fraction ≥", _number("pp-min-box-after-crop", float(pp.get("min_box_visibility_after_crop", 0.30)), min_=0, max_=1, step=0.05), "min_box_visibility_after_crop"),
                 ],
             ),
         ]
@@ -1768,8 +2613,8 @@ def _crop_controls_dash(cfg: dict[str, Any]) -> Any:
                         open=True,
                         children=[
                             html.Summary("Whole-image options"),
-                            _field("Preview image resize", dcc.Dropdown(id="preview-max-side", options=[{"label": "1024 px default", "value": 1024}, {"label": "640 px fastest", "value": 640}, {"label": "1536 px sharper", "value": 1536}, {"label": "2048 px sharpest", "value": 2048}, {"label": "Full resolution / no resize", "value": 0}], value=1024, clearable=False), "preview_max_side"),
-                            html.Div("1024 px is the default whole-image working resolution. Use 640 when you need faster previews.", className="note"),
+                            _field("Whole-image preview resize", dcc.Dropdown(id="preview-max-side", options=[{"label": "1024 px default", "value": 1024}, {"label": "640 px fastest", "value": 640}, {"label": "1536 px sharper", "value": 1536}, {"label": "2048 px sharpest", "value": 2048}, {"label": "Full resolution / no resize", "value": 0}], value=1024, clearable=False), "preview_max_side"),
+                            html.Div("This speed setting applies only to whole-image mode. Crop mode uses source-resolution pixels, then extracts the configured crop exactly as export will.", className="note"),
                             _field("Whole-image export resize mode", dcc.Dropdown(id="whole-resize-mode", options=[{"label": "No resize", "value": "none"}, {"label": "Resize to custom exact size (stretch)", "value": "stretch"}, {"label": "Resize to fit custom canvas + pad", "value": "fit_pad"}, {"label": "Resize to fill custom canvas + center crop", "value": "fill_crop"}], value="fit_pad", clearable=False), "preview_max_side"),
                             html.Div(className="grid-2", children=[
                                 _field("Custom target width px", _number("whole-resize-width", 1024, min_=1, step=1), "preview_max_side"),
@@ -1808,9 +2653,9 @@ def _crop_controls_dash(cfg: dict[str, Any]) -> Any:
                             ),
                             _field("Preview crop proposal mode", dcc.RadioItems(id="preview-mode", options=[{"label": "deterministic sliding", "value": "deterministic"}, {"label": "stochastic random", "value": "random"}, {"label": "bbox-safe breast-biased random", "value": "bbox_safe_random"}], value=str(crop.get("train_crop_mode", "deterministic")), inline=False), "preview_mode"),
                             _check("only-mass-crops", "Preview only: show only crops with visible mass", False, "only_mass_crops"),
-                            _field("Preview positive crop threshold", _number("positivity-threshold", float(policy.get("min_box_visibility", 0.30)), min_=0, max_=1, step=0.05), "positivity_threshold"),
-                            _check("allow-partial", "Display partial boxes after clipping", bool(policy.get("allow_partial_annotations", True)), "allow_partial_annotations"),
-                            _field("Minimum box visibility to draw/keep", _number("min-box-visibility", float(policy.get("min_box_visibility", 0.30)), min_=0, max_=1, step=0.05), "min_box_visibility"),
+                            _field("PREVIEW ONLY: crop counts positive at visible Mass fraction ≥", _number("positivity-threshold", float(policy.get("min_box_visibility", 0.30)), min_=0, max_=1, step=0.05), "positivity_threshold"),
+                            _check("allow-partial", "SAVED LABELS: allow clipped partial annotations", bool(policy.get("allow_partial_annotations", True)), "allow_partial_annotations"),
+                            _field("SAVED LABELS: include annotation at visible area fraction ≥", _number("min-box-visibility", float(policy.get("min_box_visibility", 0.30)), min_=0, max_=1, step=0.05), "min_box_visibility"),
                         ],
                     ),
                 ],
@@ -1977,7 +2822,10 @@ def _pipeline_controls_dash(cfg: dict[str, Any], pipeline: dict[str, Any]) -> An
                     "Pipeline order is: common start -> channel-specific R/G/B -> common end. Rows expand as you add steps.",
                     className="note",
                 ),
-                _visual_pipeline_builder(),
+                html.Div(
+                    id="visual-pipeline-builder",
+                    children=_visual_pipeline_builder(pipeline or _initial_pipeline(cfg)),
+                ),
             ]),
             html.Details(open=True, children=[
                 html.Summary("Preprocessing method guide"),
@@ -2032,7 +2880,33 @@ def _operation_guide() -> html.Div:
     )
 
 
-def _visual_pipeline_builder() -> html.Div:
+def _visual_channel_source(pipeline: dict[str, Any], stage: str) -> str:
+    if stage not in CHANNELS:
+        return "current_crop"
+    return str(_pipeline_channel_payload(pipeline, stage).get("source", "current_crop"))
+
+
+def _visual_step_for_slot(
+    pipeline: dict[str, Any],
+    stage: str,
+    idx: int,
+) -> dict[str, Any]:
+    """Map a channel pipeline into a visual-builder slot.
+
+    Loaded YAML has no separate common-stage representation, so shared steps
+    are shown explicitly in R, G, and B. This preserves the exact operation
+    order and parameters when the visual editor is hydrated.
+    """
+    if stage not in CHANNELS:
+        return {}
+    steps = list(_pipeline_channel_payload(pipeline, stage).get("steps", []) or [])
+    if idx < 0 or idx >= len(steps) or not isinstance(steps[idx], dict):
+        return {}
+    return copy.deepcopy(steps[idx])
+
+
+def _visual_pipeline_builder(pipeline: dict[str, Any] | None = None) -> html.Div:
+    pipeline = pipeline or {}
     return html.Div(
         className="pipeline-builder",
         children=[
@@ -2048,13 +2922,20 @@ def _visual_pipeline_builder() -> html.Div:
                                 {"label": "current image/view", "value": "current_crop"},
                                 {"label": "opposite breast same view", "value": "contralateral_same_view_crop"},
                             ],
-                            value="current_crop",
+                            value=_visual_channel_source(pipeline, stage),
                             clearable=False,
                             disabled=stage not in CHANNELS,
                         ),
                         "channel_source",
                     ) if stage in CHANNELS else None,
-                    *[_pipeline_step_row(stage, idx) for idx in range(PIPELINE_STEP_COUNT)],
+                    *[
+                        _pipeline_step_row(
+                            stage,
+                            idx,
+                            _visual_step_for_slot(pipeline, stage, idx),
+                        )
+                        for idx in range(PIPELINE_STEP_COUNT)
+                    ],
                 ],
             )
             for stage in PIPELINE_STAGES
@@ -2062,9 +2943,14 @@ def _visual_pipeline_builder() -> html.Div:
     )
 
 
-def _pipeline_step_row(stage: str, idx: int) -> html.Div:
-    default_op = DEFAULT_VISUAL_OPS.get(stage, {}).get(idx, "none")
-    style = None if _initial_row_visible(stage, idx) else {"display": "none"}
+def _pipeline_step_row(
+    stage: str,
+    idx: int,
+    step: dict[str, Any] | None = None,
+) -> html.Div:
+    step = dict(step or {})
+    default_op = str(step.get("op", DEFAULT_VISUAL_OPS.get(stage, {}).get(idx, "none")) or "none")
+    style = None if _initial_row_visible(stage, idx, step) else {"display": "none"}
     return html.Div(
         className="pipeline-step-row",
         id={"type": "stage-row", "stage": stage, "idx": idx},
@@ -2088,34 +2974,68 @@ def _pipeline_step_row(stage: str, idx: int) -> html.Div:
                         "label": "Apply to whole fixed-preprocessed image before square cropping",
                         "value": "on",
                     }],
-                    value=[],
+                    value=_on_value(bool(step.get("apply_before_crop", False))),
                 ),
                 "channel_steps",
                 "Unchecked keeps this method crop-local. Checked computes it on the whole breast, then extracts the crop.",
             ),
-            _operation_settings(stage, idx),
+            _operation_settings(stage, idx, default_op, dict(step.get("params", {}) or {})),
         ],
     )
 
 
-def _operation_settings(stage: str, idx: int) -> html.Div:
-    default_op = DEFAULT_VISUAL_OPS.get(stage, {}).get(idx, "none")
+def _operation_settings(
+    stage: str,
+    idx: int,
+    op: str = "none",
+    params: dict[str, Any] | None = None,
+) -> html.Div:
     return html.Div(
         id={"type": "stage-settings", "stage": stage, "idx": idx},
         className="operation-settings",
-        children=_settings_controls_for_op(default_op, stage, idx),
+        children=_settings_controls_for_op(op, stage, idx, params),
     )
 
 
-def _settings_controls_for_op(op: str, stage: str, idx: int) -> list[Any]:
+def _settings_controls_for_op(
+    op: str,
+    stage: str,
+    idx: int,
+    params: dict[str, Any] | None = None,
+) -> list[Any]:
+    params = dict(params or {})
+
+    def _float_param(name: str, default: float) -> float:
+        try:
+            return float(params.get(name, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _int_param(name: str, default: int) -> int:
+        try:
+            return int(params.get(name, default))
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _pair_param(name: str, default: tuple[float, float]) -> tuple[float, float]:
+        value = params.get(name, default)
+        try:
+            return float(value[0]), float(value[1])
+        except (TypeError, ValueError, IndexError):
+            return default
+
     group = _settings_group_for_op(op)
     if group == "percentiles":
+        lo, hi = _pair_param(
+            "percentiles",
+            (_default_stage_lo(stage, idx), _default_stage_hi(stage, idx)),
+        )
         return [
             html.Div(
                 className="param-group grid-3 compact-grid",
                 children=[
-                    _field("Low percentile", _number({"type": "stage-lo", "stage": stage, "idx": idx}, _default_stage_lo(stage, idx), min_=0, max_=100, step=0.5), "display_window"),
-                    _field("High percentile", _number({"type": "stage-hi", "stage": stage, "idx": idx}, _default_stage_hi(stage, idx), min_=0, max_=100, step=0.5), "display_window"),
+                    _field("Low percentile", _number({"type": "stage-lo", "stage": stage, "idx": idx}, lo, min_=0, max_=100, step=0.5), "display_window"),
+                    _field("High percentile", _number({"type": "stage-hi", "stage": stage, "idx": idx}, hi, min_=0, max_=100, step=0.5), "display_window"),
                 ],
             )
         ]
@@ -2124,84 +3044,89 @@ def _settings_controls_for_op(op: str, stage: str, idx: int) -> list[Any]:
             html.Div(
                 className="param-group grid-3 compact-grid",
                 children=[
-                    _field("Clip limit", _number({"type": "stage-clip", "stage": stage, "idx": idx}, 4.0, min_=0.1, max_=20, step=0.1), "channel_steps"),
-                    _field("Tile grid size", _number({"type": "stage-tile", "stage": stage, "idx": idx}, 8, min_=2, max_=64, step=1), "channel_steps"),
+                    _field("Clip limit", _number({"type": "stage-clip", "stage": stage, "idx": idx}, _float_param("clip_limit", 4.0), min_=0.1, max_=20, step=0.1), "channel_steps"),
+                    _field("Tile grid size", _number({"type": "stage-tile", "stage": stage, "idx": idx}, _int_param("tile_grid_size", 8), min_=2, max_=64, step=1), "channel_steps"),
                 ],
             )
         ]
     if group == "hist_equalize":
+        stat_lo, stat_hi = _pair_param("stat_percentiles", (1.0, 99.5))
         return [
             html.Div(
                 className="param-group grid-3 compact-grid",
                 children=[
-                    _field("Stat low %", _number({"type": "stage-histeq-lo", "stage": stage, "idx": idx}, 1.0, min_=0, max_=100, step=0.5), "display_window"),
-                    _field("Stat high %", _number({"type": "stage-histeq-hi", "stage": stage, "idx": idx}, 99.5, min_=0, max_=100, step=0.5), "display_window"),
+                    _field("Exclude chest-wall fraction", _number({"type": "stage-histeq-exclude", "stage": stage, "idx": idx}, _float_param("exclude_chest_wall_fraction", 0.0), min_=0, max_=0.45, step=0.01), "channel_steps"),
+                    _field("Stat low %", _number({"type": "stage-histeq-lo", "stage": stage, "idx": idx}, stat_lo, min_=0, max_=100, step=0.5), "display_window"),
+                    _field("Stat high %", _number({"type": "stage-histeq-hi", "stage": stage, "idx": idx}, stat_hi, min_=0, max_=100, step=0.5), "display_window"),
                 ],
             )
         ]
     if group == "mask":
-        return [html.Div(className="param-group grid-3 compact-grid", children=[_field("Outside value", _number({"type": "stage-outside", "stage": stage, "idx": idx}, 0.0, min_=0, max_=1, step=0.05), "channel_steps")])]
+        return [html.Div(className="param-group grid-3 compact-grid", children=[_field("Outside value", _number({"type": "stage-outside", "stage": stage, "idx": idx}, _float_param("outside_value", 0.0), min_=0, max_=1, step=0.05), "channel_steps")])]
     if group == "blur":
         return [html.Div(className="param-group grid-3 compact-grid", children=[
-            _field("Kernel size", _number({"type": "stage-kernel", "stage": stage, "idx": idx}, 5, min_=1, max_=101, step=2), "breast_mask_open_kernel"),
-            _field("Sigma", _number({"type": "stage-sigma", "stage": stage, "idx": idx}, 1.0, min_=0, max_=25, step=0.25), "channel_steps"),
+            _field("Kernel size", _number({"type": "stage-kernel", "stage": stage, "idx": idx}, _int_param("ksize", 5), min_=1, max_=101, step=2), "breast_mask_open_kernel"),
+            _field("Sigma", _number({"type": "stage-sigma", "stage": stage, "idx": idx}, _float_param("sigma", 1.0), min_=0, max_=25, step=0.25), "channel_steps"),
         ])]
     if group == "median":
-        return [html.Div(className="param-group grid-3 compact-grid", children=[_field("Kernel size", _number({"type": "stage-median-kernel", "stage": stage, "idx": idx}, 5, min_=1, max_=101, step=2), "breast_mask_open_kernel")])]
+        return [html.Div(className="param-group grid-3 compact-grid", children=[_field("Kernel size", _number({"type": "stage-median-kernel", "stage": stage, "idx": idx}, _int_param("ksize", 5), min_=1, max_=101, step=2), "breast_mask_open_kernel")])]
     if group == "bilateral":
         return [html.Div(className="param-group grid-3 compact-grid", children=[
-            _field("Diameter", _number({"type": "stage-bilateral-diameter", "stage": stage, "idx": idx}, 5, min_=1, max_=51, step=2), "channel_steps"),
-            _field("Sigma color", _number({"type": "stage-sigma-color", "stage": stage, "idx": idx}, 1.0, min_=0.001, max_=50, step=0.1), "channel_steps"),
-            _field("Sigma space", _number({"type": "stage-sigma-space", "stage": stage, "idx": idx}, 1.0, min_=0.001, max_=50, step=0.1), "channel_steps"),
+            _field("Diameter", _number({"type": "stage-bilateral-diameter", "stage": stage, "idx": idx}, _int_param("diameter", 5), min_=1, max_=51, step=2), "channel_steps"),
+            _field("Sigma color", _number({"type": "stage-sigma-color", "stage": stage, "idx": idx}, _float_param("sigma_color", 1.0), min_=0.001, max_=50, step=0.1), "channel_steps"),
+            _field("Sigma space", _number({"type": "stage-sigma-space", "stage": stage, "idx": idx}, _float_param("sigma_space", 1.0), min_=0.001, max_=50, step=0.1), "channel_steps"),
         ])]
     if group == "local_detail":
+        local_lo, local_hi = _pair_param("percentiles", (1.0, 99.0))
         return [html.Div(className="param-group grid-3 compact-grid", children=[
-            _field("Low percentile", _number({"type": "stage-local-lo", "stage": stage, "idx": idx}, 1.0, min_=0, max_=100, step=0.5), "display_window"),
-            _field("High percentile", _number({"type": "stage-local-hi", "stage": stage, "idx": idx}, 99.0, min_=0, max_=100, step=0.5), "display_window"),
-            _field("Detail sigma", _number({"type": "stage-detail-sigma", "stage": stage, "idx": idx}, 12.0, min_=0.1, max_=128, step=0.5), "channel_steps"),
+            _field("Low percentile", _number({"type": "stage-local-lo", "stage": stage, "idx": idx}, local_lo, min_=0, max_=100, step=0.5), "display_window"),
+            _field("High percentile", _number({"type": "stage-local-hi", "stage": stage, "idx": idx}, local_hi, min_=0, max_=100, step=0.5), "display_window"),
+            _field("Detail sigma", _number({"type": "stage-detail-sigma", "stage": stage, "idx": idx}, _float_param("sigma", 12.0), min_=0.1, max_=128, step=0.5), "channel_steps"),
         ])]
     if group == "unsharp":
         return [html.Div(className="param-group grid-3 compact-grid", children=[
-            _field("Amount", _number({"type": "stage-amount", "stage": stage, "idx": idx}, 1.0, min_=0, max_=20, step=0.1), "channel_steps"),
-            _field("Blur sigma", _number({"type": "stage-unsharp-sigma", "stage": stage, "idx": idx}, 1.0, min_=0.1, max_=25, step=0.25), "channel_steps"),
+            _field("Amount", _number({"type": "stage-amount", "stage": stage, "idx": idx}, _float_param("amount", 1.0), min_=0, max_=20, step=0.1), "channel_steps"),
+            _field("Blur sigma", _number({"type": "stage-unsharp-sigma", "stage": stage, "idx": idx}, _float_param("sigma", 1.0), min_=0.1, max_=25, step=0.25), "channel_steps"),
         ])]
     if group == "edge":
+        edge_lo, edge_hi = _pair_param("percentiles", (0.5, 99.5))
         return [html.Div(className="param-group grid-3 compact-grid", children=[
-            _field("Low percentile", _number({"type": "stage-edge-lo", "stage": stage, "idx": idx}, 0.5, min_=0, max_=100, step=0.5), "display_window"),
-            _field("High percentile", _number({"type": "stage-edge-hi", "stage": stage, "idx": idx}, 99.5, min_=0, max_=100, step=0.5), "display_window"),
-            _field("Kernel size", _number({"type": "stage-edge-kernel", "stage": stage, "idx": idx}, 3, min_=1, max_=31, step=2), "channel_steps"),
+            _field("Low percentile", _number({"type": "stage-edge-lo", "stage": stage, "idx": idx}, edge_lo, min_=0, max_=100, step=0.5), "display_window"),
+            _field("High percentile", _number({"type": "stage-edge-hi", "stage": stage, "idx": idx}, edge_hi, min_=0, max_=100, step=0.5), "display_window"),
+            _field("Kernel size", _number({"type": "stage-edge-kernel", "stage": stage, "idx": idx}, _int_param("ksize", 3), min_=1, max_=31, step=2), "channel_steps"),
         ])]
     if group == "morphology":
         return [html.Div(className="param-group grid-3 compact-grid", children=[
-            _field("Kernel shape", dcc.Dropdown(id={"type": "stage-kernel-shape", "stage": stage, "idx": idx}, options=["ellipse", "rect", "cross"], value="ellipse", clearable=False), "channel_steps"),
-            _field("Kernel size", _number({"type": "stage-morph-kernel", "stage": stage, "idx": idx}, 9, min_=1, max_=151, step=2), "breast_mask_open_kernel"),
+            _field("Kernel shape", dcc.Dropdown(id={"type": "stage-kernel-shape", "stage": stage, "idx": idx}, options=["ellipse", "rect", "cross"], value=str(params.get("kernel_shape", "ellipse")), clearable=False), "channel_steps"),
+            _field("Kernel size", _number({"type": "stage-morph-kernel", "stage": stage, "idx": idx}, _int_param("kernel_size", _int_param("ksize", 9)), min_=1, max_=151, step=2), "breast_mask_open_kernel"),
         ])]
     if group == "gamma":
-        return [html.Div(className="param-group grid-3 compact-grid", children=[_field("Gamma", _number({"type": "stage-gamma", "stage": stage, "idx": idx}, 1.0, min_=0.05, max_=5, step=0.05), "channel_steps")])]
+        return [html.Div(className="param-group grid-3 compact-grid", children=[_field("Gamma", _number({"type": "stage-gamma", "stage": stage, "idx": idx}, _float_param("gamma", 1.0), min_=0.05, max_=5, step=0.05), "channel_steps")])]
     if group == "log":
-        return [html.Div(className="param-group grid-3 compact-grid", children=[_field("Gain", _number({"type": "stage-gain", "stage": stage, "idx": idx}, 1.0, min_=0.001, max_=20, step=0.1), "channel_steps")])]
+        return [html.Div(className="param-group grid-3 compact-grid", children=[_field("Gain", _number({"type": "stage-gain", "stage": stage, "idx": idx}, _float_param("gain", 1.0), min_=0.001, max_=20, step=0.1), "channel_steps")])]
     if group == "zscore":
-        return [html.Div(className="param-group grid-3 compact-grid", children=[_field("Z limit", _number({"type": "stage-z-limit", "stage": stage, "idx": idx}, 3.0, min_=0.1, max_=12, step=0.1), "channel_steps")])]
+        return [html.Div(className="param-group grid-3 compact-grid", children=[_field("Z limit", _number({"type": "stage-z-limit", "stage": stage, "idx": idx}, _float_param("z_limit", 3.0), min_=0.1, max_=12, step=0.1), "channel_steps")])]
     if group == "standardize":
+        standard_lo, standard_hi = _pair_param("stat_percentiles", (1.0, 99.0))
         return [html.Div(className="param-group grid-3 compact-grid", children=[
-            _field("Target mean", _number({"type": "stage-target-mean", "stage": stage, "idx": idx}, 0.5, min_=0, max_=1, step=0.01), "channel_steps"),
-            _field("Target std", _number({"type": "stage-target-std", "stage": stage, "idx": idx}, 0.2, min_=0.001, max_=1, step=0.01), "channel_steps"),
-            _field("Stat low %", _number({"type": "stage-stat-lo", "stage": stage, "idx": idx}, 1.0, min_=0, max_=100, step=0.5), "display_window"),
-            _field("Stat high %", _number({"type": "stage-stat-hi", "stage": stage, "idx": idx}, 99.0, min_=0, max_=100, step=0.5), "display_window"),
+            _field("Target mean", _number({"type": "stage-target-mean", "stage": stage, "idx": idx}, _float_param("target_mean", 0.5), min_=0, max_=1, step=0.01), "channel_steps"),
+            _field("Target std", _number({"type": "stage-target-std", "stage": stage, "idx": idx}, _float_param("target_std", 0.2), min_=0.001, max_=1, step=0.01), "channel_steps"),
+            _field("Stat low %", _number({"type": "stage-stat-lo", "stage": stage, "idx": idx}, standard_lo, min_=0, max_=100, step=0.5), "display_window"),
+            _field("Stat high %", _number({"type": "stage-stat-hi", "stage": stage, "idx": idx}, standard_hi, min_=0, max_=100, step=0.5), "display_window"),
         ])]
     if group == "wiener":
         return [html.Div(className="param-group grid-3 compact-grid", children=[
-            _field("Kernel size", _number({"type": "stage-wiener-kernel", "stage": stage, "idx": idx}, 7, min_=1, max_=101, step=2), "channel_steps"),
-            _field("Noise estimate", _number({"type": "stage-wiener-noise", "stage": stage, "idx": idx}, 0.0, min_=0, max_=1, step=0.001), "channel_steps"),
+            _field("Kernel size", _number({"type": "stage-wiener-kernel", "stage": stage, "idx": idx}, _int_param("ksize", 7), min_=1, max_=101, step=2), "channel_steps"),
+            _field("Noise estimate", _number({"type": "stage-wiener-noise", "stage": stage, "idx": idx}, _float_param("noise", 0.0), min_=0, max_=1, step=0.001), "channel_steps"),
         ])]
     if group == "sharpen":
-        return [html.Div(className="param-group grid-3 compact-grid", children=[_field("Amount", _number({"type": "stage-sharpen-amount", "stage": stage, "idx": idx}, 1.0, min_=0, max_=20, step=0.1), "channel_steps")])]
+        return [html.Div(className="param-group grid-3 compact-grid", children=[_field("Amount", _number({"type": "stage-sharpen-amount", "stage": stage, "idx": idx}, _float_param("amount", 1.0), min_=0, max_=20, step=0.1), "channel_steps")])]
     if group == "pectoral":
         return [html.Div(className="param-group grid-3 compact-grid", children=[
-            _field("Side", dcc.Dropdown(id={"type": "stage-pectoral-side", "stage": stage, "idx": idx}, options=["left", "right"], value="left", clearable=False), "channel_steps"),
-            _field("Width fraction", _number({"type": "stage-pectoral-width", "stage": stage, "idx": idx}, 0.33, min_=0, max_=1, step=0.01), "channel_steps"),
-            _field("Height fraction", _number({"type": "stage-pectoral-height", "stage": stage, "idx": idx}, 0.45, min_=0, max_=1, step=0.01), "channel_steps"),
-            _field("Fill value", _number({"type": "stage-pectoral-fill", "stage": stage, "idx": idx}, 0.0, min_=0, max_=1, step=0.05), "channel_steps"),
+            _field("Side", dcc.Dropdown(id={"type": "stage-pectoral-side", "stage": stage, "idx": idx}, options=["left", "right"], value=str(params.get("side", "left")), clearable=False), "channel_steps"),
+            _field("Width fraction", _number({"type": "stage-pectoral-width", "stage": stage, "idx": idx}, _float_param("width_fraction", 0.33), min_=0, max_=1, step=0.01), "channel_steps"),
+            _field("Height fraction", _number({"type": "stage-pectoral-height", "stage": stage, "idx": idx}, _float_param("height_fraction", 0.45), min_=0, max_=1, step=0.01), "channel_steps"),
+            _field("Fill value", _number({"type": "stage-pectoral-fill", "stage": stage, "idx": idx}, _float_param("fill_value", 0.0), min_=0, max_=1, step=0.05), "channel_steps"),
         ])]
     return [html.Div("This operation has no settings.", className="note compact-note")]
 
@@ -2368,8 +3293,14 @@ def _operation_settings_old(stage: str, idx: int) -> html.Div:
     )
 
 
-def _initial_row_visible(stage: str, idx: int) -> bool:
+def _initial_row_visible(
+    stage: str,
+    idx: int,
+    step: dict[str, Any] | None = None,
+) -> bool:
     if idx == 0:
+        return True
+    if step and str(step.get("op", "none") or "none") != "none":
         return True
     return idx in DEFAULT_VISUAL_OPS.get(stage, {}) or (idx - 1) in DEFAULT_VISUAL_OPS.get(stage, {})
 
@@ -2470,6 +3401,12 @@ def _split_config_from_params(params: dict[str, Any]) -> dict[str, Any]:
             "stratify_by_birads": False,
         })
     elif strategy == "exact_study_count":
+        # The fraction control is disabled for exact-count splits and must not
+        # leak its stale GUI value into the effective configuration.  Apart
+        # from confusing the YAML preview, that stale value used to make an
+        # unchanged Paper 22 split look like a user override and disabled its
+        # replication contract.
+        out["val_fraction_from_training"] = 0.0
         out["validation_study_count"] = study_count
         out["validation_image_count"] = image_count_raw if image_count_raw > 0 else None
     return out
@@ -2477,12 +3414,28 @@ def _split_config_from_params(params: dict[str, Any]) -> dict[str, Any]:
 
 def _split_signature(split_cfg: dict[str, Any] | None) -> tuple[Any, ...]:
     split_cfg = dict(split_cfg or {})
+    strategy = _split_strategy_from_config(split_cfg)
+    seed = int(split_cfg.get("seed", 123) or 123)
+    if strategy == "official_only":
+        # No sampling occurs, so seed, stratification, and disabled control
+        # values do not change split identity.
+        return (strategy,)
+    if strategy == "exact_study_count":
+        return (
+            strategy,
+            int(split_cfg.get("validation_study_count", 0) or 0),
+            (
+                int(split_cfg.get("validation_image_count"))
+                if split_cfg.get("validation_image_count") not in {None, "", 0, "0"}
+                else None
+            ),
+            seed,
+            bool(split_cfg.get("stratify_by_birads", False)),
+        )
     return (
-        _split_strategy_from_config(split_cfg),
+        strategy,
         float(split_cfg.get("val_fraction_from_training", 0.0) or 0.0),
-        split_cfg.get("validation_study_count"),
-        split_cfg.get("validation_image_count"),
-        int(split_cfg.get("seed", 123) or 123),
+        seed,
         bool(split_cfg.get("stratify_by_birads", False)),
     )
 
@@ -2492,8 +3445,20 @@ def _export_controls_dash(cfg: dict[str, Any]) -> Any:
     current_output = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/vindr-data/preprocessed-vindr-gui")))
     crop_cfg = cfg.get("square_crops", {}) or {}
     paired_cfg = cfg.get("paired_whole_images", {}) or {}
+    review_cfg = cfg.get("dataset_review", {}) or {}
+    annotation_report_cfg = cfg.get("annotation_geometry_report", {}) or {}
+    reproducibility_cfg = cfg.get("reproducibility_bundle", {}) or {}
+    float32_cfg = cfg.get("float32_export", {}) or {}
     split_cfg = cfg.get("splits", {}) or {}
     split_strategy = _split_strategy_from_config(split_cfg)
+    high_geometry_cfg = _paired_high_resolution_geometry_config(paired_cfg)
+    paired_canvas_mode = str(
+        high_geometry_cfg.get("canvas_mode", "per_image_square")
+        or "per_image_square"
+    ).casefold().strip()
+    paired_common_canvas = paired_canvas_mode in {
+        "fixed", "fixed_canvas", "dataset_fixed"
+    }
     return html.Div(
         [
             html.Details(open=True, children=[
@@ -2501,33 +3466,151 @@ def _export_controls_dash(cfg: dict[str, Any]) -> Any:
                 _field("Export parent folder", dcc.Input(id="export-parent", value=str(current_output.parent), type="text", debounce=True), "export_path"),
                 _field("Dataset folder name", dcc.Input(id="export-name", value=current_output.name or "preprocessed-vindr-gui", type="text", debounce=True), "export_path"),
                 _check("clean-output", "Delete output folder before export", bool(export_cfg.get("clean_output_root", False)), "clean_output"),
+                _check(
+                    "grouped-dataset-layout",
+                    "Store pixels under images/ and every annotation under annotations/",
+                    str((cfg.get("dataset_layout", {}) or {}).get("kind", ""))
+                    == "images_annotations_v1",
+                ),
                 html.Div(
                     [
-                        _check("save-square-crops", "Sliding crop export (square_crops)", bool(export_cfg.get("save_square_crops", True)), "save_square_crops"),
-                        _check("save-baseline", "Whole-image export (baseline_uncropped)", bool(export_cfg.get("save_baseline_uncropped", False)), "save_baseline_uncropped"),
+                        _check("save-square-crops", "Save 1024 × 1024 crops and crop annotations", bool(export_cfg.get("save_square_crops", True)), "save_square_crops"),
                     ],
+                ),
+                html.Div(
+                    _check("save-baseline", "Whole-image export (baseline_uncropped)", bool(export_cfg.get("save_baseline_uncropped", False)), "save_baseline_uncropped"),
                     style={"display": "none"},
+                ),
+                _check(
+                    "save-float32",
+                    "Also save float32 PyTorch image tensors in [0, 1]",
+                    bool(float32_cfg.get("enabled", False)),
+                ),
+                _field(
+                    "Image types to save as float32",
+                    dcc.Checklist(
+                        id="save-float32-variants",
+                        options=[
+                            {"label": "1024 crops", "value": "crops"},
+                            {
+                                "label": "Resized whole images",
+                                "value": "resized_whole",
+                            },
+                            {
+                                "label": "Original-size whole images",
+                                "value": "original_whole",
+                            },
+                            {
+                                "label": "High-resolution whole images",
+                                "value": "high_resolution_whole",
+                            },
+                            {
+                                "label": "Baseline whole images",
+                                "value": "baseline_whole",
+                            },
+                        ],
+                        value=[
+                            variant
+                            for variant in FLOAT32_EXPORT_VARIANTS
+                            if float32_export_variant_selected(cfg, variant)
+                        ],
+                    ),
+                ),
+                html.Div(
+                    "Float32 tensors use CHW layout and mirror PNG stems under a float32/ folder. Their preprocessing stays in floating point—there is no intermediate uint8/uint16 encoding—and only the separate PNG branch is quantized to 0–255. The Default Research Dataset selects crops and resized whole images only.",
+                    className="note",
                 ),
                 html.Div(id="export-mode-summary", className="note"),
             ]),
             html.Details(open=bool(paired_cfg.get("enabled", False)), children=[
-                html.Summary("Paired whole image for every crop"),
+                html.Summary("Whole-image variants and matched annotations"),
+                html.Div(
+                    _check(
+                        "paired-whole-enabled",
+                        "Enable whole-image companion export",
+                        bool(paired_cfg.get("enabled", False)),
+                    ),
+                    style={"display": "none"},
+                ),
                 _check(
-                    "paired-whole-enabled",
-                    "Save a corresponding pad-first whole-breast image with every crop basename",
-                    bool(paired_cfg.get("enabled", False)),
+                    "paired-whole-original",
+                    "Save original-size processed whole image without padding",
+                    _paired_original_enabled(paired_cfg),
+                ),
+                _check(
+                    "paired-whole-resized",
+                    "Save square-padded whole images at the configured sizes",
+                    _paired_resized_enabled(paired_cfg),
+                ),
+                _check(
+                    "paired-whole-high-resolution",
+                    "Also save a high-resolution whole image without resizing",
+                    _paired_high_resolution_enabled(paired_cfg),
+                ),
+                _check(
+                    "paired-whole-common-canvas",
+                    "Pad every high-resolution whole image to the same canvas size",
+                    paired_common_canvas,
                 ),
                 _field(
-                    "Paired whole target size",
-                    _number("paired-whole-size", int(paired_cfg.get("target_width", paired_cfg.get("size", 1024)) or 1024), min_=128, max_=4096, step=128),
+                    "Resized whole-image sizes",
+                    dcc.Input(
+                        id="paired-whole-sizes",
+                        value=resized_sizes_text(paired_cfg),
+                        type="text",
+                        debounce=True,
+                        placeholder="1024, 640",
+                    ),
                     "crop_size",
                 ),
-                _check(
-                    "paired-whole-hardlink",
-                    "Deduplicate repeated whole images with hard links when supported",
-                    str(paired_cfg.get("storage_mode", "hardlink")).casefold() in {"hardlink", "link", "deduplicate"},
+                html.Div(
+                    _number("paired-whole-size", int(paired_cfg.get("target_width", paired_cfg.get("size", 1024)) or 1024), min_=128, max_=4096, step=128),
+                    style={"display": "none"},
                 ),
-                html.Div("The breast is padded to a square first and only then resized. Every companion is written under square_crops/whole_images/<split>/ using the crop's filename.", className="note"),
+                _field(
+                    "High-resolution canvas width",
+                    _number(
+                        "paired-whole-canvas-width",
+                        (
+                            int(high_geometry_cfg.get("canvas_width"))
+                            if high_geometry_cfg.get("canvas_width") is not None
+                            else None
+                        ),
+                        min_=16,
+                        max_=8192,
+                        step=16,
+                    ),
+                    "crop_size",
+                ),
+                _field(
+                    "High-resolution canvas height",
+                    _number(
+                        "paired-whole-canvas-height",
+                        (
+                            int(high_geometry_cfg.get("canvas_height"))
+                            if high_geometry_cfg.get("canvas_height") is not None
+                            else None
+                        ),
+                        min_=16,
+                        max_=8192,
+                        step=16,
+                    ),
+                    "crop_size",
+                ),
+                dcc.Checklist(
+                    id="paired-whole-hardlink",
+                    options=[{"label": "One canonical file per source", "value": "on"}],
+                    value=["on"],
+                    style={"display": "none"},
+                ),
+                html.Div(
+                    "Enter comma-separated square sizes (for example 1024, 640), or WIDTHxHEIGHT. "
+                    "Each resized whole is independently padded to its own square first and then resized. The "
+                    "high-resolution output is padded independently after breast preprocessing "
+                    "and mirroring. New-layout datasets store pixels below images/ and every "
+                    "matched label/annotation below annotations/.",
+                    className="note",
+                ),
             ]),
             html.Details(open=True, children=[
                 html.Summary("Dataset train / validation / test assignment"),
@@ -2621,6 +3704,7 @@ def _export_controls_dash(cfg: dict[str, Any]) -> Any:
                     dcc.Dropdown(
                         id="export-balance-mode",
                         options=[
+                            {"label": "Crop-level Mass/empty ratio; empty crops from Mass-negative breasts (both views)", "value": "crop_label_ratio"},
                             {"label": "All mass + sampled empty", "value": "positive_ratio"},
                             {"label": "All positive + fraction of negative candidates (training)", "value": "negative_fraction"},
                             {"label": "50/50 crops by source breast status (training)", "value": "source_breast_ratio"},
@@ -2645,7 +3729,12 @@ def _export_controls_dash(cfg: dict[str, Any]) -> Any:
                     "negative_keep_fraction",
                 ),
                 html.Div(
-                    "Target-ratio mode keeps all positive crops and samples empty crops toward the requested final ratio. "
+                    "Crop-level ratio mode keeps every Mass-containing crop and streams randomly ordered empty crops only "
+                    "from breasts with no Mass in either view, avoiding the global planning pass. Source scheduling computes a compact cadence "
+                    "from the selected ratio using ceil(1 / minority fraction); for example, 50/50 gives one positive and one negative source, while 80/20 gives four positive and one negative. "
+                    "The achieved crop ratio remains approximate because source images can yield different numbers of valid windows. "
+                    "After the cadence pass, additional seeded negative breasts are consumed only if needed to remove any remaining negative-crop deficit. "
+                    "The legacy target-ratio mode can draw empty crops from any source image. "
                     "Negative-fraction mode instead keeps all positive training patches plus the requested fraction of "
                     "eligible negative candidates. Source-breast mode defines a breast as patient/study + laterality, "
                     "expands only selected training patients to all views, applies the visible breast-mask threshold "
@@ -2662,6 +3751,75 @@ def _export_controls_dash(cfg: dict[str, Any]) -> Any:
                 html.Summary("Vendor filter"),
                 _field("Vendor export filter", dcc.RadioItems(id="export-vendor-mode", options=["all vendors", "selected vendors only"], value="selected vendors only" if bool((cfg.get("vendor_filter", {}) or {}).get("enabled", False)) else "all vendors", inline=True), None),
                 _field("Vendors/devices to include", dcc.Dropdown(id="export-vendors", options=[], value=[], multi=True), None),
+            ]),
+            html.Details(open=bool(annotation_report_cfg.get("enabled", False)), children=[
+                html.Summary("Annotation geometry data and visualizations"),
+                html.Div(
+                    "Writes one row per fixed-preprocessed source Mass annotation, box-size histograms, "
+                    "a width-versus-height plot, and fit/cannot-fit counts for the configured crop size. "
+                    "The fit test uses box dimensions only; annotation and crop locations are ignored.",
+                    className="note",
+                ),
+                _check(
+                    "annotation-report-enabled",
+                    "Create annotation size and geometric crop-fit report",
+                    bool(annotation_report_cfg.get("enabled", False)),
+                ),
+                _field(
+                    "Histogram bins",
+                    _number(
+                        "annotation-report-bins",
+                        max(5, int(annotation_report_cfg.get("histogram_bins", 40) or 40)),
+                        min_=5,
+                        max_=200,
+                        step=5,
+                    ),
+                    None,
+                ),
+                html.Div(
+                    "Outputs are saved under visualizations/annotation_geometry/ and included in the dataset README.",
+                    className="note",
+                ),
+            ]),
+            html.Details(open=bool(reproducibility_cfg.get("enabled", False)), children=[
+                html.Summary("Exact reproducibility metadata"),
+                html.Div(
+                    "Records exact source-image membership, saved crop order and coordinates, edge padding, "
+                    "exported annotations, output paths, resolved settings, seeds, software provenance, and "
+                    "checksums for the compact metadata bundle. Replay uses the recorded windows and does not resample.",
+                    className="note",
+                ),
+                _check(
+                    "reproducibility-enabled",
+                    "Create exact reproducibility metadata bundle",
+                    bool(reproducibility_cfg.get("enabled", False)),
+                ),
+                _check(
+                    "reproducibility-checksums",
+                    "Write SHA-256 checksums for reproducibility metadata",
+                    bool(reproducibility_cfg.get("write_metadata_sha256", True)),
+                ),
+                html.Div(
+                    "Outputs are saved under reproducibility/. Source-DICOM and exported-PNG hashing remain disabled "
+                    "by default to avoid another very large disk pass.",
+                    className="note",
+                ),
+            ]),
+            html.Details(children=[
+                html.Summary("Debug review bundle"),
+                html.Div(
+                    "Save every debug artifact type for a bounded sample of source images that actually contribute crops, then build random "
+                    "full-image/crop and full-image/mask audit GIFs for train, validation, and test. The saved viewer "
+                    "uses these files without reopening DICOMs.",
+                    className="note",
+                ),
+                _check("export-review-enabled", "Create saved dataset review bundle", bool(review_cfg.get("enabled", False))),
+                _field("Debug source/crop samples per split", _number("export-review-samples", max(1, int(review_cfg.get("samples_per_split", 100) or 100)), min_=1, max_=1000, step=1), None),
+                _field("Saved full-image/mask maximum side", _number("export-review-max-side", max(256, int(review_cfg.get("source_preview_max_side", 1200) or 1200)), min_=256, max_=4096, step=64), None),
+                _field("Review sample seed", _number("export-review-seed", int(review_cfg.get("seed", 123) or 123), min_=0, step=1), None),
+                _check("export-review-crop-gifs", "Create original + full-image + crop GIFs", bool(review_cfg.get("create_crop_gifs", True))),
+                _check("export-review-save-masks", "Save resized masks and red overlays", bool(review_cfg.get("save_masks", True))),
+                _check("export-review-mask-gifs", "Create original + full-image + red-mask GIFs", bool(review_cfg.get("create_mask_gifs", True))),
             ]),
             html.Details(children=[
                 html.Summary("Run export"),
@@ -2731,6 +3889,465 @@ def _saved_controls_dash(cfg: dict[str, Any]) -> Any:
             _check("saved-existing-only", "Only existing image files", True),
             _check("saved-show-boxes", "Draw annotations", True),
             _field("Saved crop index", _number("saved-index", 0, min_=0, step=1), None),
+        ]
+    )
+
+
+def _feature_controls_dash(cfg: dict[str, Any]) -> Any:
+    default_root = str(default_feature_dataset_root(cfg))
+    default_model = DEFAULT_DINO_V3_MODEL_ID
+    default_mean = ",".join(str(value) for value in DINO_V3_LVD_MEAN)
+    default_std = ",".join(str(value) for value in DINO_V3_LVD_STD)
+    model_options = [
+        {"label": str(info["label"]), "value": model_id}
+        for model_id, info in DINO_V3_MODELS.items()
+    ]
+    return html.Div(
+        [
+            html.Details(open=True, children=[
+                html.Summary("Existing dataset"),
+                _field(
+                    "Dataset root or square_crops folder",
+                    dcc.Input(
+                        id="feature-dataset-root",
+                        value=default_root,
+                        type="text",
+                        debounce=True,
+                    ),
+                    None,
+                ),
+                html.Button(
+                    "Scan existing dataset",
+                    id="feature-scan-button",
+                    n_clicks=0,
+                ),
+                html.Div(id="feature-scan-summary", className="summary-box"),
+                _field(
+                    "Image types to extract",
+                    dcc.Checklist(
+                        id="feature-variants",
+                        options=[
+                            {"label": spec["label"], "value": key}
+                            for key, spec in VARIANT_SPECS.items()
+                        ],
+                        value=["crops", "resized_whole"],
+                    ),
+                    None,
+                ),
+                html.Div(
+                    "Every detected type is selected by default. For "
+                    f"`{DEFAULT_RESEARCH_DATASET_PRESET_KEY}`, original-size wholes are deliberately left off.",
+                    className="note",
+                ),
+                _field(
+                    "Splits",
+                    dcc.Checklist(
+                        id="feature-splits",
+                        options=[{"label": "All", "value": "all"}],
+                        value=["all"],
+                    ),
+                    None,
+                ),
+            ]),
+            html.Details(open=True, children=[
+                html.Summary("Trained network"),
+                _field(
+                    "Network",
+                    dcc.Dropdown(
+                        id="feature-network",
+                        options=[{"label": "DINOv3 (pretrained, frozen)", "value": "dinov3"}],
+                        value="dinov3",
+                        clearable=False,
+                    ),
+                    None,
+                ),
+                _field(
+                    "DINOv3 checkpoint",
+                    dcc.Dropdown(
+                        id="feature-model-id",
+                        options=model_options,
+                        value=default_model,
+                        clearable=False,
+                    ),
+                    None,
+                ),
+                _field(
+                    "Optional local model directory",
+                    dcc.Input(
+                        id="feature-model-path",
+                        value="",
+                        type="text",
+                        debounce=True,
+                        placeholder="Leave empty to use the selected Hugging Face checkpoint",
+                    ),
+                    None,
+                ),
+                _check("feature-local-only", "Use local cached/model files only", False),
+                html.Div(
+                    "Meta's official DINOv3 weights are gated. Accept the selected model's license "
+                    "on Hugging Face, then authenticate the same environment that launches this "
+                    "app with `hf auth login` (or set HF_TOKEN) and restart the app. Verify the "
+                    "login with `hf auth whoami`. No token is stored in this GUI.",
+                    className="warning note",
+                ),
+                _field(
+                    "Device",
+                    dcc.Dropdown(
+                        id="feature-device",
+                        options=["auto", "cuda", "cpu", "mps"],
+                        value="auto",
+                        clearable=False,
+                    ),
+                    None,
+                ),
+                _field(
+                    "Compute precision",
+                    dcc.Dropdown(
+                        id="feature-compute-dtype",
+                        options=["float32", "float16", "bfloat16"],
+                        value=DEFAULT_DINO_V3_COMPUTE_DTYPE,
+                        clearable=False,
+                    ),
+                    None,
+                ),
+            ]),
+            html.Details(open=True, children=[
+                html.Summary("DINOv3 input and outputs"),
+                _field(
+                    "Resize policy",
+                    dcc.Dropdown(
+                        id="feature-resize-mode",
+                        options=[
+                            {"label": "Exact H × W", "value": "exact"},
+                            {"label": "Fit + top-left pad", "value": "fit_pad"},
+                            {"label": "Keep native size", "value": "none"},
+                        ],
+                        value="exact",
+                        clearable=False,
+                    ),
+                    None,
+                ),
+                _field(
+                    "Input width",
+                    _number(
+                        "feature-input-width",
+                        DEFAULT_DINO_V3_INPUT_SIZE,
+                        min_=16,
+                        max_=8192,
+                        step=16,
+                    ),
+                    None,
+                ),
+                _field(
+                    "Input height",
+                    _number(
+                        "feature-input-height",
+                        DEFAULT_DINO_V3_INPUT_SIZE,
+                        min_=16,
+                        max_=8192,
+                        step=16,
+                    ),
+                    None,
+                ),
+                _field("Fit-pad value", _number("feature-pad-value", 0.0, min_=0.0, max_=1.0, step=0.01), None),
+                html.Div(
+                    className="grid-2",
+                    children=[
+                        _field(
+                            "Input mean (R,G,B)",
+                            dcc.Input(
+                                id="feature-mean",
+                                value=default_mean,
+                                type="text",
+                                debounce=True,
+                            ),
+                            None,
+                        ),
+                        _field(
+                            "Input std (R,G,B)",
+                            dcc.Input(
+                                id="feature-std",
+                                value=default_std,
+                                type="text",
+                                debounce=True,
+                            ),
+                            None,
+                        ),
+                    ],
+                ),
+                html.Div(
+                    className="feature-stat-controls",
+                    children=[
+                        _field(
+                            "Images sampled for statistics",
+                            _number(
+                                "feature-stat-sample-size",
+                                256,
+                                min_=2,
+                                max_=512,
+                                step=1,
+                            ),
+                            None,
+                        ),
+                        html.Div(
+                            className="feature-stat-buttons",
+                            children=[
+                                html.Button(
+                                    "Estimate grayscale mean/std",
+                                    id="feature-estimate-stats-button",
+                                    n_clicks=0,
+                                ),
+                                html.Button(
+                                    "Restore official DINOv3 values",
+                                    id="feature-restore-stats-button",
+                                    n_clicks=0,
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+                html.Div(id="feature-normalization-status"),
+                html.Div(
+                    "The saved mammograms remain lossless float32 values in [0,1], with the "
+                    "grayscale signal copied identically into R, G, and B. These mean/std "
+                    "values are applied only in memory before DINOv3 inference. The estimate "
+                    "button uses the train split when All is selected, calculates pixel-weighted "
+                    "moments, and repeats one grayscale mean/std across all channels. This makes "
+                    "the sampled normalized channels identical with mean 0 and std 1, matching "
+                    "the first two moments of a standardized input—not its full natural-image "
+                    "distribution. Compare this experimental moment matching against the official "
+                    "LVD/ImageNet baseline on downstream validation data.",
+                    className="note",
+                ),
+                _field("Transformer layer (-1 = last)", _number("feature-layer", -1, min_=-41, max_=40, step=1), None),
+                _field(
+                    "Feature tensors",
+                    dcc.Checklist(
+                        id="feature-outputs",
+                        options=[
+                            {"label": "Dense patch tokens", "value": "patch_tokens"},
+                            {"label": "CLS token", "value": "cls_token"},
+                            {"label": "Mean patch token", "value": "mean_patch_token"},
+                            {"label": "Register tokens", "value": "register_tokens"},
+                        ],
+                        value=["patch_tokens", "cls_token"],
+                    ),
+                    None,
+                ),
+                _field("Batch size", _number("feature-batch-size", 1, min_=1, max_=256, step=1), None),
+                _field(
+                    "Saved feature dtype",
+                    dcc.Dropdown(
+                        id="feature-save-dtype",
+                        options=["float32", "float16", "bfloat16"],
+                        value="float32",
+                        clearable=False,
+                    ),
+                    None,
+                ),
+                _check("feature-prefer-float", "Prefer non-quantized float32 image tensors", True),
+                _check("feature-overwrite", "Overwrite existing feature files", False),
+                html.Div(id="feature-shape-summary", className="summary-box"),
+            ]),
+            html.Details(open=True, children=[
+                html.Summary("Run feature extraction"),
+                html.Button(
+                    "Start feature extraction",
+                    id="feature-start-button",
+                    n_clicks=0,
+                    className="primary",
+                ),
+                html.Div(id="feature-start-status"),
+                html.Div(id="feature-progress-status"),
+                html.Div(id="feature-queue-table"),
+            ]),
+        ]
+    )
+
+
+def _lazy_crop_controls_dash(cfg: dict[str, Any]) -> Any:
+    dataset_root = Path(str(default_feature_dataset_root(cfg)))
+    research_cfg = apply_study_preset(cfg or {}, DEFAULT_RESEARCH_DATASET_PRESET_KEY)
+    crop_cfg = dict(research_cfg.get("square_crops", {}) or {})
+    policy_cfg = dict(research_cfg.get("crop_annotation_policy", {}) or {})
+    window_size = int(crop_cfg.get("crop_size", 1024))
+    stride = int(crop_cfg.get("stride", 128))
+    grids_text = window_grids_text(research_cfg)
+    output_root = (
+        dataset_root
+        / "annotations"
+        / "windows"
+        / f"window_{window_size}_stride_{stride}"
+    )
+    return html.Div(
+        [
+            html.Details(open=True, children=[
+                html.Summary("Existing whole-image dataset"),
+                _field(
+                    "Dataset root or square_crops folder",
+                    dcc.Input(
+                        id="lazy-crop-dataset-root",
+                        value=str(dataset_root),
+                        type="text",
+                        debounce=True,
+                    ),
+                    None,
+                ),
+                html.Button(
+                    "Scan metadata only",
+                    id="lazy-crop-scan-button",
+                    n_clicks=0,
+                ),
+                html.Div(id="lazy-crop-scan-summary", className="summary-box"),
+                html.Div(
+                    "The source must contain metadata/whole_image_manifest.csv and "
+                    "whole_image_annotations.csv (or the legacy square_crops/metadata paths). "
+                    "Scanning reads those CSVs only; it does "
+                    "not open a PNG or torch tensor.",
+                    className="note",
+                ),
+            ]),
+            html.Details(open=True, children=[
+                html.Summary("Virtual crop geometry and labels"),
+                _field(
+                    "Window size : stride pairs",
+                    dcc.Input(
+                        id="lazy-crop-grids",
+                        value=grids_text,
+                        type="text",
+                        debounce=True,
+                        placeholder="1024:128, 1024:256, 640:160",
+                    ),
+                    None,
+                ),
+                html.Div(
+                    "Enter one or more comma-separated window:stride pairs. Estimate and create actions process the complete family.",
+                    className="note",
+                ),
+                html.Div(className="grid-2", children=[
+                    _field(
+                        "Window size",
+                        _number("lazy-crop-window-size", window_size, min_=16, max_=8192, step=16),
+                        None,
+                    ),
+                    _field(
+                        "Stride",
+                        _number("lazy-crop-stride", stride, min_=1, max_=8192, step=1),
+                        None,
+                    ),
+                ]),
+                _field(
+                    "Minimum visible Mass-box fraction",
+                    _number(
+                        "lazy-crop-min-box-visibility",
+                        float(policy_cfg.get("min_box_visibility", 0.05)),
+                        min_=0.0,
+                        max_=1.0,
+                        step=0.01,
+                    ),
+                    None,
+                ),
+                html.Div(
+                    "The grid uses regular stride origins and zero-padded right/bottom edge "
+                    "windows. Visible Mass boxes are intersected, clipped, translated to crop "
+                    "coordinates, and retained at or above this fraction.",
+                    className="note",
+                ),
+            ]),
+            html.Details(open=True, children=[
+                html.Summary("Metadata-only source/breast filter"),
+                html.Div(className="grid-2", children=[
+                    _field(
+                        "Train minimum source extent",
+                        _number("lazy-crop-train-min-extent", 0.10, min_=0.0, max_=1.0, step=0.01),
+                        None,
+                    ),
+                    _field(
+                        "Validation/test minimum source extent",
+                        _number("lazy-crop-eval-min-extent", 0.05, min_=0.0, max_=1.0, step=0.01),
+                        None,
+                    ),
+                ]),
+                _check(
+                    "lazy-crop-preserve-positives",
+                    "Keep eligible Mass-positive windows below the extent threshold",
+                    True,
+                ),
+                html.Div(
+                    "Because a full-resolution breast mask was not saved for every whole image, "
+                    "a zero-pixel-read extractor cannot reproduce the pixel-derived retained-mask "
+                    "fraction. It records and filters on exact in-bounds source extent instead. "
+                    "The source wholes are already breast-cropped and background-masked, but this "
+                    "geometry value remains an explicitly labeled proxy/upper bound.",
+                    className="warning note",
+                ),
+            ]),
+            html.Details(open=True, children=[
+                html.Summary("Train Mass/empty balance"),
+                _field(
+                    "Target Mass-positive crop fraction",
+                    _number("lazy-crop-positive-fraction", 0.50, min_=0.01, max_=1.0, step=0.01),
+                    None,
+                ),
+                _check(
+                    "lazy-crop-clean-negative-breasts",
+                    "Draw empty train crops only from Mass-negative breasts",
+                    True,
+                ),
+                _field(
+                    "Sampling seed",
+                    _number("lazy-crop-seed", int(crop_cfg.get("seed", 123)), min_=0, step=1),
+                    None,
+                ),
+                html.Div(
+                    "All eligible positive train windows are retained. Empty train windows are "
+                    "sampled without replacement toward the requested ratio. Validation and test "
+                    "remain unbalanced complete inference grids after the extent filter.",
+                    className="note",
+                ),
+            ]),
+            html.Details(open=True, children=[
+                html.Summary("Output and run"),
+                _field(
+                    "Manifest output folder",
+                    dcc.Input(
+                        id="lazy-crop-output-root",
+                        value=str(output_root),
+                        type="text",
+                        debounce=True,
+                        readOnly=True,
+                    ),
+                    None,
+                ),
+                _check(
+                    "lazy-crop-overwrite",
+                    "Replace existing known manifest files in this folder",
+                    False,
+                ),
+                html.Div(className="config-actions", children=[
+                    html.Button(
+                        "Estimate manifest rows",
+                        id="lazy-crop-estimate-button",
+                        n_clicks=0,
+                    ),
+                    html.Button(
+                        "Create lazy crop manifests",
+                        id="lazy-crop-start-button",
+                        n_clicks=0,
+                        className="primary",
+                    ),
+                ]),
+                html.Div(id="lazy-crop-estimate-status"),
+                html.Div(id="lazy-crop-start-status"),
+                html.Div(id="lazy-crop-progress-status"),
+                html.Div(id="lazy-crop-queue-table"),
+                html.Div(
+                    "Output files are named lazy_crop_manifest_<split>.csv and "
+                    "lazy_crop_annotations_<split>.csv, with a resolved YAML, JSON summary, "
+                    "and README containing a training-loader example. No image file is written.",
+                    className="note",
+                ),
+            ]),
         ]
     )
 
@@ -2812,10 +4429,13 @@ def _all_preview_states() -> list[State]:
         State({"type": "stage-pectoral-height", "stage": ALL, "idx": ALL}, "value"),
         State({"type": "stage-pectoral-fill", "stage": ALL, "idx": ALL}, "value"),
         State("whole-resize-mode", "value"), State("whole-resize-width", "value"), State("whole-resize-height", "value"), State("whole-pad-value", "value"), State("whole-pad-anchor", "value"),
-        State("export-parent", "value"), State("export-name", "value"), State("clean-output", "value"), State("save-square-crops", "value"), State("save-baseline", "value"),
-        State("paired-whole-enabled", "value"), State("paired-whole-size", "value"), State("paired-whole-hardlink", "value"),
+        State("export-parent", "value"), State("export-name", "value"), State("clean-output", "value"), State("grouped-dataset-layout", "value"), State("save-square-crops", "value"), State("save-baseline", "value"), State("save-float32", "value"), State("save-float32-variants", "value"),
+        State("paired-whole-enabled", "value"), State("paired-whole-original", "value"), State("paired-whole-resized", "value"), State("paired-whole-high-resolution", "value"), State("paired-whole-common-canvas", "value"), State("paired-whole-sizes", "value"), State("paired-whole-size", "value"), State("paired-whole-canvas-width", "value"), State("paired-whole-canvas-height", "value"), State("paired-whole-hardlink", "value"),
         State("split-strategy", "value"), State("split-val-fraction", "value"), State("split-validation-study-count", "value"), State("split-validation-image-count", "value"), State("split-seed", "value"), State("split-stratify-birads", "value"),
         State("train-crop-mode", "value"), State("val-crop-mode", "value"), State("test-crop-mode", "value"), State("export-balance-mode", "value"), State("export-target-positive-ratio", "value"), State("export-negative-keep-fraction", "value"), State("export-vendor-mode", "value"), State("export-vendors", "value"), State("export-confirm", "value"),
+        State("annotation-report-enabled", "value"), State("annotation-report-bins", "value"),
+        State("reproducibility-enabled", "value"), State("reproducibility-checksums", "value"),
+        State("export-review-enabled", "value"), State("export-review-samples", "value"), State("export-review-max-side", "value"), State("export-review-seed", "value"), State("export-review-crop-gifs", "value"), State("export-review-save-masks", "value"), State("export-review-mask-gifs", "value"),
         State("saved-root", "value"), State("saved-split", "value"), State("saved-positive", "value"), State("saved-search", "value"), State("saved-existing-only", "value"), State("saved-show-boxes", "value"), State("saved-index", "value"),
         State("manifest-paths", "value"),
     ]
@@ -2842,11 +4462,11 @@ def _config_control_outputs() -> list[Output]:
         "alignment-score-margin", "alignment-projection-smooth",
         "alignment-boundary-smooth", "whole-resize-mode", "whole-resize-width",
         "whole-resize-height", "whole-pad-value", "whole-pad-anchor",
-        "export-parent", "export-name", "clean-output",
-        "save-square-crops", "save-baseline", "paired-whole-enabled", "paired-whole-size", "paired-whole-hardlink",
+        "export-parent", "export-name", "clean-output", "grouped-dataset-layout",
+        "save-square-crops", "save-baseline", "save-float32", "save-float32-variants", "paired-whole-enabled", "paired-whole-original", "paired-whole-resized", "paired-whole-high-resolution", "paired-whole-common-canvas", "paired-whole-sizes", "paired-whole-size", "paired-whole-canvas-width", "paired-whole-canvas-height", "paired-whole-hardlink",
         "split-strategy", "split-val-fraction", "split-validation-study-count", "split-validation-image-count", "split-seed", "split-stratify-birads", "train-crop-mode", "val-crop-mode",
         "test-crop-mode", "export-balance-mode", "export-target-positive-ratio", "export-negative-keep-fraction",
-        "export-vendor-mode", "saved-root",
+        "export-vendor-mode", "annotation-report-enabled", "annotation-report-bins", "reproducibility-enabled", "reproducibility-checksums", "export-review-enabled", "export-review-samples", "export-review-max-side", "export-review-seed", "export-review-crop-gifs", "export-review-save-masks", "export-review-mask-gifs", "saved-root",
     ]
     return [Output(component_id, "value") for component_id in ids]
 
@@ -2863,6 +4483,10 @@ def _config_control_values(cfg: dict[str, Any]) -> tuple[Any, ...]:
     export_cfg = cfg.get("export", {}) or {}
     baseline_cfg = cfg.get("baseline_uncropped", {}) or {}
     paired_cfg = cfg.get("paired_whole_images", {}) or {}
+    review_cfg = cfg.get("dataset_review", {}) or {}
+    annotation_report_cfg = cfg.get("annotation_geometry_report", {}) or {}
+    reproducibility_cfg = cfg.get("reproducibility_bundle", {}) or {}
+    float32_cfg = cfg.get("float32_export", {}) or {}
     split_cfg = cfg.get("splits", {}) or {}
     align = ((cfg.get("image_export", {}) or {}).get("contralateral_source_alignment", {}) or {})
     current_output = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/vindr-data/preprocessed-vindr-gui")))
@@ -2960,11 +4584,35 @@ def _config_control_values(cfg: dict[str, Any]) -> tuple[Any, ...]:
         str(current_output.parent),
         current_output.name or "preprocessed-vindr-gui",
         _on_value(export_cfg.get("clean_output_root", False)),
+        _on_value(
+            str((cfg.get("dataset_layout", {}) or {}).get("kind", ""))
+            == "images_annotations_v1"
+        ),
         _on_value(export_cfg.get("save_square_crops", True)),
         _on_value(export_cfg.get("save_baseline_uncropped", False)),
+        _on_value(float32_cfg.get("enabled", False)),
+        [
+            variant
+            for variant in FLOAT32_EXPORT_VARIANTS
+            if float32_export_variant_selected(cfg, variant)
+        ],
         _on_value(paired_cfg.get("enabled", False)),
+        _on_value(_paired_original_enabled(paired_cfg)),
+        _on_value(_paired_resized_enabled(paired_cfg)),
+        _on_value(_paired_high_resolution_enabled(paired_cfg)),
+        _on_value(
+            str(
+                _paired_high_resolution_geometry_config(paired_cfg).get(
+                    "canvas_mode", "per_image_square"
+                )
+            ).casefold().strip()
+            in {"fixed", "fixed_canvas", "dataset_fixed"}
+        ),
+        resized_sizes_text(paired_cfg),
         int(paired_cfg.get("target_width", paired_cfg.get("size", 1024)) or 1024),
-        _on_value(str(paired_cfg.get("storage_mode", "hardlink")).casefold() in {"hardlink", "link", "deduplicate"}),
+        _paired_high_resolution_geometry_config(paired_cfg).get("canvas_width"),
+        _paired_high_resolution_geometry_config(paired_cfg).get("canvas_height"),
+        ["on"],
         _split_strategy_from_config(split_cfg),
         float(split_cfg.get("val_fraction_from_training", 0.15) or 0.0),
         int(split_cfg.get("validation_study_count", 0) or 0),
@@ -2978,6 +4626,17 @@ def _config_control_values(cfg: dict[str, Any]) -> tuple[Any, ...]:
         float(crop.get("train_deterministic_target_positive_ratio", crop.get("deterministic_target_positive_ratio", crop.get("positive_fraction", 0.50)))),
         float(crop.get("train_deterministic_negative_keep_fraction", crop.get("deterministic_negative_keep_fraction", 0.20))),
         "selected vendors only" if bool(vendor_cfg.get("enabled", False)) else "all vendors",
+        _on_value(annotation_report_cfg.get("enabled", False)),
+        max(5, int(annotation_report_cfg.get("histogram_bins", 40) or 40)),
+        _on_value(reproducibility_cfg.get("enabled", False)),
+        _on_value(reproducibility_cfg.get("write_metadata_sha256", True)),
+        _on_value(review_cfg.get("enabled", False)),
+        max(1, int(review_cfg.get("samples_per_split", 100) or 100)),
+        max(256, int(review_cfg.get("source_preview_max_side", 1200) or 1200)),
+        int(review_cfg.get("seed", 123) or 123),
+        _on_value(review_cfg.get("create_crop_gifs", True)),
+        _on_value(review_cfg.get("save_masks", True)),
+        _on_value(review_cfg.get("create_mask_gifs", True)),
         str(cfg.get("paths", {}).get("output_root", "/mnt/t9/vindr-data/preprocessed-vindr-gui")),
     )
 
@@ -3005,9 +4664,12 @@ def _state_to_params(values: tuple[Any, ...]) -> dict[str, Any]:
         "stage_wiener_kernels", "stage_wiener_noises", "stage_sharpen_amounts", "stage_pectoral_sides",
         "stage_pectoral_widths", "stage_pectoral_heights", "stage_pectoral_fills",
         "whole_resize_mode", "whole_resize_width", "whole_resize_height", "whole_pad_value", "whole_pad_anchor",
-        "export_parent", "export_name", "clean_output", "save_square_crops", "save_baseline", "paired_whole_enabled", "paired_whole_size", "paired_whole_hardlink",
+        "export_parent", "export_name", "clean_output", "grouped_dataset_layout", "save_square_crops", "save_baseline", "save_float32", "save_float32_variants", "paired_whole_enabled", "paired_whole_original", "paired_whole_resized", "paired_whole_high_resolution", "paired_whole_common_canvas", "paired_whole_sizes", "paired_whole_size", "paired_whole_canvas_width", "paired_whole_canvas_height", "paired_whole_hardlink",
         "split_strategy", "split_val_fraction", "split_validation_study_count", "split_validation_image_count", "split_seed", "split_stratify_birads",
         "train_crop_mode", "val_crop_mode", "test_crop_mode", "export_balance_mode", "export_target_positive_ratio", "export_negative_keep_fraction", "export_vendor_mode", "export_vendors", "export_confirm",
+        "annotation_report_enabled", "annotation_report_bins",
+        "reproducibility_enabled", "reproducibility_checksums",
+        "export_review_enabled", "export_review_samples", "export_review_max_side", "export_review_seed", "export_review_crop_gifs", "export_review_save_masks", "export_review_mask_gifs",
         "saved_root", "saved_split", "saved_positive", "saved_search", "saved_existing_only", "saved_show_boxes", "saved_index", "manifest_paths",
     ]
     return dict(zip(keys, values, strict=False))
@@ -3622,6 +5284,19 @@ def _dataset_from_cfg(
     return dataset
 
 
+def _preview_read_max_side(params: dict[str, Any]) -> int:
+    """Return the safe pre-crop resize cap for an interactive preview.
+
+    Resizing a mammogram before crop generation changes the crop coordinate
+    system. When that resize is the same size as the requested crop, the crop
+    also looks like the whole mammogram. Crop mode must therefore read the
+    source-resolution pixels; the speed cap is only safe in whole-image mode.
+    """
+    if str(params.get("view_geometry") or "crop") == "crop":
+        return 0
+    return max(0, int(params.get("preview_max_side") or 0))
+
+
 def _filter_records(records: pd.DataFrame, params: dict[str, Any]) -> pd.DataFrame:
     if records.empty:
         return records
@@ -3806,13 +5481,16 @@ def _sample_view(result: dict[str, Any], pipeline: dict[str, Any], params: dict[
     full_boxes = result["mass_boxes"] if show_annotations else None
     selected = result.get("selected_crop") or {}
     window = selected.get("window")
+    preview_whole_stage_cache: dict[str, tuple[np.ndarray, np.ndarray | None]] = {}
+    preview_cache_namespace = f"preview:{result.get('record_index', 0)}"
     processed_rgb, processing_meta = apply_channel_pipeline(
         crop,
         pipeline,
         source_crops=_source_crops_from_result(result),
         source_full_images=_source_full_images_from_result(result),
         crop_window=window,
-        cache_namespace=f"preview:{result.get('record_index', 0)}",
+        whole_stage_cache=preview_whole_stage_cache,
+        cache_namespace=preview_cache_namespace,
     )
     visible = params.get("visible_channels") or CHANNELS
     processed_display = _mask_rgb_channels(processed_rgb, visible)
@@ -3824,21 +5502,181 @@ def _sample_view(result: dict[str, Any], pipeline: dict[str, Any], params: dict[
     crop_draw = _draw_boxes(_gray_to_rgb(crop_gray), crop_boxes)
     proc_draw = _draw_boxes(processed_display.copy(), crop_boxes)
     whole_mode = str(params.get("view_geometry") or "crop") == "whole"
+    crop_height, crop_width = int(crop.shape[0]), int(crop.shape[1])
     pieces = [
         html.Div(result.get("title", title), className="note"),
         html.Div(className="image-grid", children=[
-            _image_card("Source after shared preprocessing", full_draw, "Whole working image." if whole_mode else "Green box is the selected crop window."),
-            _image_card("Model working view", crop_draw, "Whole image resized preview." if whole_mode else f"Window: {tuple(int(v) for v in window) if window is not None else 'n/a'}"),
-            _image_card("Processed RGB output", proc_draw, f"Visible channels: {''.join(visible) or 'none'}"),
+            _image_card(
+                "Whole-image working view" if whole_mode else f"Selected crop — {crop_width} × {crop_height}",
+                crop_draw,
+                "Whole image resized preview."
+                if whole_mode
+                else f"Exact source-resolution window: {tuple(int(v) for v in window) if window is not None else 'n/a'}",
+            ),
+            _image_card(
+                "Processed RGB output",
+                proc_draw,
+                f"{'Whole image' if whole_mode else 'Selected crop'} after the channel pipeline. Visible channels: {''.join(visible) or 'none'}",
+            ),
+            _image_card(
+                "Source after shared preprocessing",
+                full_draw,
+                "Whole working image."
+                if whole_mode
+                else "Full mammogram context; green box is the selected crop window.",
+            ),
         ]),
     ]
+    if any(
+        _is_on(params.get(key))
+        for key in [
+            "paired_whole_original",
+            "paired_whole_resized",
+            "paired_whole_high_resolution",
+            "paired_whole_enabled",
+        ]
+    ):
+        whole_sources = _source_full_images_from_result(result)
+        processed_whole, _whole_processing_meta = apply_channel_pipeline(
+            full,
+            pipeline,
+            source_crops=whole_sources,
+            source_full_images=whole_sources,
+            crop_window=(0, 0, int(full.shape[1]), int(full.shape[0])),
+            whole_stage_cache=preview_whole_stage_cache,
+            cache_namespace=preview_cache_namespace,
+        )
+        paired_cfg = copy.deepcopy(params.get("_paired_whole_config", {}) or {})
+        try:
+            preview_resized_variants = parse_resized_sizes(
+                params.get("paired_whole_sizes")
+                or params.get("paired_whole_size")
+                or "1024"
+            )
+        except ValueError:
+            preview_resized_variants = resized_variant_configs(paired_cfg) or parse_resized_sizes("1024")
+        paired_cfg["resized_variants"] = preview_resized_variants
+        paired_cfg["target_width"] = int(preview_resized_variants[0]["width"])
+        paired_cfg["target_height"] = int(preview_resized_variants[0]["height"])
+        original_preview_raw = params.get("paired_whole_original")
+        resized_preview_raw = params.get("paired_whole_resized")
+        high_preview_raw = params.get("paired_whole_high_resolution")
+        paired_cfg["save_original"] = (
+            _paired_original_enabled(paired_cfg)
+            if original_preview_raw is None
+            else _is_on(original_preview_raw)
+        )
+        paired_cfg["save_resized"] = (
+            (
+                _paired_resized_enabled(paired_cfg)
+                or _is_on(params.get("paired_whole_enabled"))
+            )
+            if resized_preview_raw is None
+            else _is_on(resized_preview_raw)
+        )
+        paired_cfg["save_high_resolution"] = (
+            _paired_high_resolution_enabled(paired_cfg)
+            if high_preview_raw is None
+            else _is_on(high_preview_raw)
+        )
+        paired_cfg["resized_canvas_mode"] = "per_image_square"
+        paired_cfg["high_resolution_canvas_mode"] = (
+            "fixed"
+            if _is_on(params.get("paired_whole_common_canvas"))
+            else "per_image_square"
+        )
+        paired_cfg["high_resolution_canvas_width"] = max(
+            16, int(params.get("paired_whole_canvas_width") or 3584)
+        )
+        paired_cfg["high_resolution_canvas_height"] = max(
+            16, int(params.get("paired_whole_canvas_height") or 3584)
+        )
+        paired_cfg.setdefault("pad_value", 0.0)
+        paired_cfg.setdefault("pad_anchor", "left_top")
+        whole_cards = []
+        if _paired_original_enabled(paired_cfg):
+            whole_cards.append(_image_card(
+                "Whole mammogram — original-size processed",
+                _draw_boxes(processed_whole.copy(), full_boxes),
+                "No square/common-canvas padding and no resize; red Mass boxes remain in fixed-preprocessed source coordinates.",
+            ))
+        if _paired_resized_enabled(paired_cfg):
+            for resized_variant in preview_resized_variants:
+                current_cfg = {
+                    **paired_cfg,
+                    **resized_variant,
+                    "target_width": int(resized_variant["width"]),
+                    "target_height": int(resized_variant["height"]),
+                }
+                resized_whole, resized_meta = _pad_then_resize_rgb(
+                    processed_whole, _paired_resized_geometry_config(current_cfg)
+                )
+                resized_boxes = np.asarray(
+                    full_boxes if full_boxes is not None else [], dtype=np.float32
+                ).reshape(-1, 4).copy()
+                if resized_boxes.size:
+                    resized_boxes[:, [0, 2]] = (
+                        resized_boxes[:, [0, 2]]
+                        + float(resized_meta.get("paired_whole_pad_left", 0) or 0)
+                    ) * float(resized_meta.get("paired_whole_scale_x", 1.0) or 1.0)
+                    resized_boxes[:, [1, 3]] = (
+                        resized_boxes[:, [1, 3]]
+                        + float(resized_meta.get("paired_whole_pad_top", 0) or 0)
+                    ) * float(resized_meta.get("paired_whole_scale_y", 1.0) or 1.0)
+                whole_cards.append(_image_card(
+                    f"Whole mammogram — resized {resized_variant['name']}",
+                    _draw_boxes(resized_whole, resized_boxes),
+                    "Aspect-preserving compact companion: padded to this image's own square, then resized. Red Mass boxes use that exact transform.",
+                ))
+        if _paired_high_resolution_enabled(paired_cfg):
+            high_whole, high_meta = _pad_rgb_to_canvas(
+                processed_whole,
+                _paired_high_resolution_geometry_config(paired_cfg),
+            )
+            high_canvas_caption = (
+                f"shared {high_meta['paired_whole_canvas_width']} × "
+                f"{high_meta['paired_whole_canvas_height']} canvas"
+                if bool(high_meta.get("paired_whole_common_canvas", False))
+                else "per-image square canvas"
+            )
+            high_boxes = np.asarray(
+                full_boxes if full_boxes is not None else [], dtype=np.float32
+            ).reshape(-1, 4).copy()
+            if high_boxes.size:
+                high_boxes[:, [0, 2]] += float(
+                    high_meta.get("paired_whole_pad_left", 0) or 0
+                )
+                high_boxes[:, [1, 3]] += float(
+                    high_meta.get("paired_whole_pad_top", 0) or 0
+                )
+            whole_cards.append(_image_card(
+                "Whole mammogram — high-resolution padded",
+                _draw_boxes(high_whole, high_boxes),
+                f"Bottom/right-padded independently to the {high_canvas_caption} without resizing; red Mass boxes use the matching padding transform. Interactive preview resolution may be capped for speed.",
+            ))
+        pieces.append(html.Div(className="image-grid", children=whole_cards))
     if _is_on(params.get("show_channel_panels")):
         pieces.append(html.Div(className="image-grid", children=[
             _image_card(f"{ch} channel", _draw_boxes(_gray_to_rgb(processed_rgb[..., idx]), crop_boxes), OP_HELP.get(_channel_steps(pipeline, ch)[-1]["op"], "") if _channel_steps(pipeline, ch) else "")
             for idx, ch in enumerate(CHANNELS)
         ]))
     if result.get("foreground_mask_crop") is not None and result.get("show_foreground_mask_preview"):
-        pieces.append(_image_card("Foreground mask", result["foreground_mask_crop"].astype(np.uint8) * 255, f"Foreground fraction: {selected.get('foreground_fraction')}"))
+        debug_cards = [
+            _image_card(
+                "Retained breast mask",
+                result["foreground_mask_crop"].astype(np.uint8) * 255,
+                f"Foreground fraction: {selected.get('foreground_fraction')}",
+            )
+        ]
+        if result.get("padding_mask_crop") is not None:
+            debug_cards.append(
+                _image_card(
+                    "Out-of-image padding map",
+                    result["padding_mask_crop"].astype(np.uint8) * 255,
+                    json.dumps(result.get("crop_padding_info") or {}),
+                )
+            )
+        pieces.append(html.Div(className="image-grid", children=debug_cards))
     if not compact:
         stats = _stats_table(full, crop, processed_rgb)
         meta = _compact_metadata(result["target_summary"], processing_meta)
@@ -3878,6 +5716,10 @@ def _render_saved_dataset(params: dict[str, Any], cfg: dict[str, Any]) -> Any:
         _metric("Empty", int((~rows["positive"]).sum())),
         _metric("Images found", int(rows["image_exists"].sum())),
         _metric("Filtered", len(view)),
+        _metric("Full previews", int(rows["source_preview_exists"].sum())),
+        _metric("Original whole found", int(rows.get("paired_whole_original_exists", pd.Series(dtype=bool)).sum())),
+        _metric("1024 whole found", int(rows.get("paired_whole_exists", pd.Series(dtype=bool)).sum())),
+        _metric("High-resolution whole found", int(rows.get("paired_whole_high_resolution_exists", pd.Series(dtype=bool)).sum())),
     ])
     if view.empty:
         return html.Div([metrics, html.Div("No saved crops match current filters.", className="warning note")])
@@ -3890,9 +5732,62 @@ def _render_saved_dataset(params: dict[str, Any], cfg: dict[str, Any]) -> Any:
         return html.Div([metrics, html.Div(f"Could not read image: {image_path}", className="error note")])
     boxes = _load_yolo_boxes_for_saved_image(label_path, width=int(image.shape[1]), height=int(image.shape[0]))
     display = _prepare_saved_viewer_display_image(image, boxes if _is_on(params.get("saved_show_boxes")) else np.zeros((0, 4)), row, idx, len(view))
-    metadata_fields = ["split", "viewer_row", "source_index", "source_image_id", "file_name", "has_mass", "is_positive_window", "num_mass_boxes", "crop_mode", "crop_window_xyxy", "image_path", "label_path"]
+    source_display = None
+    if bool(row.get("source_preview_exists", False)):
+        source_image = _load_saved_viewer_image(Path(str(row.get("source_preview_path", ""))))
+        if source_image is not None:
+            source_display = _prepare_saved_source_display_image(source_image, row)
+    mask_display = None
+    if bool(row.get("mask_overlay_exists", False)):
+        mask_display = _load_saved_viewer_image(Path(str(row.get("mask_overlay_path", ""))))
+    paired_whole_original = None
+    if bool(row.get("paired_whole_original_exists", False)):
+        paired_whole_original = _load_saved_viewer_image(
+            Path(str(row.get("paired_whole_original_path", "")))
+        )
+    paired_whole = None
+    if bool(row.get("paired_whole_exists", False)):
+        paired_whole = _load_saved_viewer_image(Path(str(row.get("paired_whole_path", ""))))
+    paired_whole_high_resolution = None
+    if bool(row.get("paired_whole_high_resolution_exists", False)):
+        paired_whole_high_resolution = _load_saved_viewer_image(
+            Path(str(row.get("paired_whole_high_resolution_path", "")))
+        )
+    metadata_fields = ["split", "viewer_row", "source_index", "source_image_id", "file_name", "has_mass", "is_positive_window", "num_mass_boxes", "crop_mode", "crop_window_xyxy", "source_preprocessing_mirrored", "source_processed_width", "source_processed_height", "source_preview_path", "mask_path", "image_path", "label_path", "paired_whole_original_path", "paired_whole_path", "paired_whole_high_resolution_path"]
     shown = {k: _streamlit_json_safe(row.get(k)) for k in metadata_fields if k in row.index}
-    return html.Div([metrics, html.Div(className="image-grid", children=[_image_card("Saved crop", display, _saved_viewer_caption(row, idx, len(view))), html.Div(className="image-card", children=[html.H3("Metadata"), html.Pre(json.dumps(_jsonable(shown), indent=2))])])])
+    cards = [
+        _image_card(
+            "Saved 1024 crop (red Mass)",
+            display,
+            _saved_viewer_caption(row, idx, len(view)),
+        )
+    ]
+    if paired_whole_original is not None:
+        cards.append(_image_card(
+            "Paired whole mammogram — original-size processed",
+            paired_whole_original,
+            str(row.get("paired_whole_original_path", "")),
+        ))
+    if paired_whole is not None:
+        cards.append(_image_card(
+            "Paired whole mammogram — resized",
+            paired_whole,
+            str(row.get("paired_whole_path", "")),
+        ))
+    if paired_whole_high_resolution is not None:
+        cards.append(_image_card(
+            "Paired whole mammogram — high-resolution padded",
+            paired_whole_high_resolution,
+            str(row.get("paired_whole_high_resolution_path", "")),
+        ))
+    if source_display is not None:
+        cards.append(_image_card("Debug full source (red Mass; cyan crop)", source_display, str(row.get("source_preview_path", ""))))
+    else:
+        cards.append(html.Div("No saved full preview. Re-export with Debug review bundle enabled.", className="warning note"))
+    if mask_display is not None:
+        cards.append(_image_card("Exact retained breast mask (red)", mask_display, str(row.get("mask_overlay_path", ""))))
+    cards.append(html.Div(className="image-card", children=[html.H3("Metadata"), html.Pre(json.dumps(_jsonable(shown), indent=2))]))
+    return html.Div([metrics, html.Div(className="image-grid", children=cards)])
 
 
 def _render_visualizations(cfg: dict[str, Any]) -> Any:
@@ -3943,7 +5838,7 @@ def _build_export_cfg_from_params(cfg: dict[str, Any], records: pd.DataFrame, pa
     }
     balance_mode = str(params.get("export_balance_mode") or "positive_ratio")
     if balance_mode not in {
-        "positive_ratio", "negative_fraction", "source_breast_ratio", "mass_only", "all"
+        "positive_ratio", "crop_label_ratio", "negative_fraction", "source_breast_ratio", "mass_only", "all"
     }:
         balance_mode = "positive_ratio"
     if balance_mode == "source_breast_ratio":
@@ -3964,7 +5859,7 @@ def _build_export_cfg_from_params(cfg: dict[str, Any], records: pd.DataFrame, pa
                 if preset_key == SIMPLE_PRESET_KEY and split in {"val", "test"}
                 else (
                     (balance_mode if split == "train" else "all")
-                    if balance_mode in {"negative_fraction", "source_breast_ratio"}
+                    if balance_mode in {"crop_label_ratio", "negative_fraction", "source_breast_ratio"}
                     else balance_mode
                 )
             ),
@@ -3980,13 +5875,44 @@ def _build_export_cfg_from_params(cfg: dict[str, Any], records: pd.DataFrame, pa
         selected_vendors=selected_vendors if params.get("export_vendor_mode") == "selected vendors only" else [],
         deterministic_selection=deterministic_selection,
         split_crop_modes=split_modes,
-        save_square=str(params.get("view_geometry") or "crop") != "whole",
+        save_square=(
+            _is_on(params.get("save_square_crops"))
+            if params.get("save_square_crops") is not None
+            else str(params.get("view_geometry") or "crop") != "whole"
+        ),
         save_baseline=str(params.get("view_geometry") or "crop") == "whole",
         crop_controls=crop_controls,
         pipeline=_pipeline_from_params(params),
         simple_profiler_enabled=True,
         simple_profiler_emit_every=10,
+        review_options={
+            **dict(cfg.get("dataset_review", {}) or {}),
+            "enabled": _is_on(params.get("export_review_enabled")),
+            "save_source_previews": True,
+            "save_masks": _is_on(params.get("export_review_save_masks")),
+            "source_preview_max_side": max(256, int(params.get("export_review_max_side") or 1200)),
+            "samples_per_split": max(1, int(params.get("export_review_samples") or 100)),
+            "source_assets_per_split": max(1, int(params.get("export_review_samples") or 100)),
+            "seed": int(params.get("export_review_seed") or 123),
+            "create_crop_gifs": _is_on(params.get("export_review_crop_gifs")),
+            "create_mask_gifs": (
+                _is_on(params.get("export_review_mask_gifs"))
+                and _is_on(params.get("export_review_save_masks"))
+            ),
+        },
     )
+    grouped_layout_raw = params.get("grouped_dataset_layout")
+    if grouped_layout_raw is not None:
+        if _is_on(grouped_layout_raw):
+            out["dataset_layout"] = {
+                "kind": "images_annotations_v1",
+                "schema_version": 1,
+                "images_directory": "images",
+                "annotations_directory": "annotations",
+                "metadata_directory": "metadata",
+            }
+        else:
+            out.pop("dataset_layout", None)
     configured_scheme = str(((cfg.get("image_export", {}) or {}).get("rgb_scheme", ""))).casefold().strip()
     selected_splits = _split_config_from_params(params)
     original_splits = dict(cfg.get("splits", {}) or {})
@@ -4032,15 +5958,157 @@ def _build_export_cfg_from_params(cfg: dict[str, Any], records: pd.DataFrame, pa
     baseline["target_height"] = int(params.get("whole_resize_height") or 1024)
     baseline["pad_value"] = float(params.get("whole_pad_value") or 0.0)
     baseline["pad_anchor"] = str(params.get("whole_pad_anchor") or "left_top")
+    float32_export = out.setdefault("float32_export", {})
+    selected_float32_variants_raw = params.get("save_float32_variants")
+    selected_float32_variants = (
+        {
+            variant
+            for variant in FLOAT32_EXPORT_VARIANTS
+            if float32_export_variant_selected(out, variant)
+        }
+        if selected_float32_variants_raw is None
+        else set(selected_float32_variants_raw or [])
+    )
+    float32_export.update(
+        {
+            "enabled": _is_on(params.get("save_float32")),
+            "format": "pytorch_tensor",
+            "dtype": "float32",
+            "layout": "CHW",
+            "value_range": [0.0, 1.0],
+            "mirror_png_paths": True,
+            "variants": {
+                variant: variant in selected_float32_variants
+                for variant in FLOAT32_EXPORT_VARIANTS
+            },
+        }
+    )
     paired = out.setdefault("paired_whole_images", {})
-    paired_size = max(1, int(params.get("paired_whole_size") or 1024))
-    paired["enabled"] = _is_on(params.get("paired_whole_enabled"))
+    resized_sizes_raw = params.get("paired_whole_sizes")
+    if resized_sizes_raw is None:
+        resized_variants = resized_variant_configs(paired)
+    else:
+        resized_variants = parse_resized_sizes(resized_sizes_raw)
+    paired_size = (
+        int(resized_variants[0]["width"])
+        if resized_variants
+        else max(1, int(params.get("paired_whole_size") or 1024))
+    )
+    original_raw = params.get("paired_whole_original")
+    resized_raw = params.get("paired_whole_resized")
+    paired["save_original"] = (
+        _paired_original_enabled(paired)
+        if original_raw is None
+        else _is_on(original_raw)
+    )
+    paired["save_resized"] = (
+        _paired_resized_enabled(paired)
+        if resized_raw is None
+        else _is_on(resized_raw)
+    )
+    paired_high_resolution = params.get("paired_whole_high_resolution")
+    if paired_high_resolution is None:
+        paired_high_resolution = params.get("paired_whole_native")
+    paired["save_high_resolution"] = (
+        _paired_high_resolution_enabled(paired)
+        if paired_high_resolution is None
+        else _is_on(paired_high_resolution)
+    )
+    paired["enabled"] = bool(
+        paired["save_original"]
+        or paired["save_resized"]
+        or paired["save_high_resolution"]
+    )
+    paired.pop("save_native_resolution", None)
     paired["target_width"] = paired_size
-    paired["target_height"] = paired_size
-    paired["canvas_mode"] = "per_image_square"
-    paired["pad_value"] = 0.0
-    paired["pad_anchor"] = "left_top"
-    paired["storage_mode"] = "hardlink" if _is_on(params.get("paired_whole_hardlink")) else "copy"
+    paired["target_height"] = (
+        int(resized_variants[0]["height"])
+        if resized_variants else paired_size
+    )
+    paired["resized_variants"] = resized_variants
+    # The compact 1024 companion deliberately retains the legacy per-image
+    # square geometry. Common-canvas padding applies only to high resolution.
+    paired["resized_canvas_mode"] = "per_image_square"
+    common_canvas_raw = params.get("paired_whole_common_canvas")
+    if common_canvas_raw is None:
+        existing_high_mode = str(
+            _paired_high_resolution_geometry_config(paired).get(
+                "canvas_mode", "per_image_square"
+            )
+        ).casefold().strip()
+        common_canvas = existing_high_mode in {
+            "fixed", "fixed_canvas", "dataset_fixed"
+        }
+    else:
+        common_canvas = _is_on(common_canvas_raw)
+    paired["high_resolution_canvas_mode"] = (
+        "fixed" if common_canvas else "per_image_square"
+    )
+    if common_canvas and paired["save_high_resolution"]:
+        paired["high_resolution_canvas_width"] = max(
+            16,
+            int(
+                params.get("paired_whole_canvas_width")
+                or paired.get("high_resolution_canvas_width")
+                or paired.get("canvas_width")
+                or 3584
+            ),
+        )
+        paired["high_resolution_canvas_height"] = max(
+            16,
+            int(
+                params.get("paired_whole_canvas_height")
+                or paired.get("high_resolution_canvas_height")
+                or paired.get("canvas_height")
+                or 3584
+            ),
+        )
+    else:
+        paired.pop("high_resolution_canvas_width", None)
+        paired.pop("high_resolution_canvas_height", None)
+    paired.pop("canvas_mode", None)
+    paired.pop("canvas_width", None)
+    paired.pop("canvas_height", None)
+    paired.setdefault("pad_value", 0.0)
+    paired.setdefault("pad_anchor", "left_top")
+    paired["storage_mode"] = "single_file_per_source"
+    annotation_report = out.setdefault("annotation_geometry_report", {})
+    annotation_enabled_raw = params.get("annotation_report_enabled")
+    annotation_report["enabled"] = (
+        bool(annotation_report.get("enabled", False))
+        if annotation_enabled_raw is None
+        else _is_on(annotation_enabled_raw)
+    )
+    annotation_bins_raw = params.get("annotation_report_bins")
+    annotation_report["histogram_bins"] = max(
+        5,
+        int(
+            annotation_report.get("histogram_bins", 40)
+            if annotation_bins_raw is None
+            else annotation_bins_raw
+        ),
+    )
+    annotation_report["output_subdir"] = "annotation_geometry"
+    annotation_report["fit_definition"] = (
+        "geometry_only_ignore_annotation_and_crop_locations"
+    )
+    reproducibility = out.setdefault("reproducibility_bundle", {})
+    reproducibility_enabled_raw = params.get("reproducibility_enabled")
+    reproducibility["enabled"] = (
+        bool(reproducibility.get("enabled", False))
+        if reproducibility_enabled_raw is None
+        else _is_on(reproducibility_enabled_raw)
+    )
+    reproducibility_checksums_raw = params.get("reproducibility_checksums")
+    reproducibility["write_metadata_sha256"] = (
+        bool(reproducibility.get("write_metadata_sha256", True))
+        if reproducibility_checksums_raw is None
+        else _is_on(reproducibility_checksums_raw)
+    )
+    reproducibility["output_subdir"] = "reproducibility"
+    reproducibility["schema_version"] = 1
+    reproducibility.setdefault("include_source_dicom_sha256", False)
+    reproducibility.setdefault("include_exported_image_sha256", False)
     square = out.setdefault("square_crops", {})
     square["positive_fraction"] = float(target_ratio)
     square["deterministic_target_positive_ratio"] = float(target_ratio)
@@ -4055,7 +6123,7 @@ def _build_export_cfg_from_params(cfg: dict[str, Any], records: pd.DataFrame, pa
             if preset_key == SIMPLE_PRESET_KEY and split in {"val", "test"}
             else (
                 (balance_mode if split == "train" else "all")
-                if balance_mode in {"negative_fraction", "source_breast_ratio"}
+                if balance_mode in {"crop_label_ratio", "negative_fraction", "source_breast_ratio"}
                 else balance_mode
             )
         )
@@ -4103,6 +6171,23 @@ def _build_export_cfg_from_params(cfg: dict[str, Any], records: pd.DataFrame, pa
             square[f"{split}_require_clean_negative_windows"] = False
         contract = out.setdefault("replication_contract", {})
         if bool(contract.get("enabled", False)):
+            contract["expected_train_selection_mode"] = "source_breast_ratio"
+            contract["expected_train_mass_breast_crop_fraction"] = float(
+                square.get(
+                    "train_deterministic_target_source_breast_mass_ratio",
+                    0.50,
+                )
+            )
+            contract.pop("expected_train_crop_positive_fraction", None)
+            contract.pop("train_crop_positive_fraction_tolerance", None)
+            contract.pop(
+                "require_training_negative_crops_from_mass_negative_images",
+                None,
+            )
+            contract.pop(
+                "require_training_negative_crops_from_mass_negative_breasts",
+                None,
+            )
             contract["min_breast_fraction_strictly_greater_than_by_split"] = {
                 split: minimum
                 for split, (enabled, minimum) in split_breast_filters.items()
@@ -4113,6 +6198,42 @@ def _build_export_cfg_from_params(cfg: dict[str, Any], records: pd.DataFrame, pa
             out["replication_contract"]["disabled_reason"] = (
                 "Source-breast GUI mode was enabled outside the audited improved Paper 22 preset."
             )
+    if balance_mode == "crop_label_ratio":
+        # Single-pass crop-label balancing: every positive window is written;
+        # empty windows are admitted only from breasts with no Mass in either
+        # the current or paired view.
+        square["train_online_positive_ratio_selection_for_deterministic"] = True
+        square["train_balance_execution"] = "streaming_one_pass"
+        square["train_keep_all_positive_windows"] = True
+        square["train_online_balance_shuffle_source_records"] = True
+        square["train_online_balance_shuffle_windows"] = True
+        square["val_online_positive_ratio_selection_for_deterministic"] = False
+        square["test_online_positive_ratio_selection_for_deterministic"] = False
+        contract = out.setdefault("replication_contract", {})
+        if bool(contract.get("enabled", False)):
+            contract["expected_train_selection_mode"] = "crop_label_ratio"
+            contract["expected_train_crop_positive_fraction"] = float(
+                square.get("train_deterministic_target_positive_ratio", 0.50)
+            )
+            contract["train_crop_positive_fraction_tolerance"] = float(
+                contract.get(
+                    "train_crop_positive_fraction_tolerance",
+                    0.05,
+                )
+                or 0.05
+            )
+            contract[
+                "require_training_negative_crops_from_mass_negative_images"
+            ] = True
+            contract[
+                "require_training_negative_crops_from_mass_negative_breasts"
+            ] = True
+            contract.pop("expected_train_mass_breast_crop_fraction", None)
+            contract["min_breast_fraction_strictly_greater_than_by_split"] = {
+                split: minimum
+                for split, (enabled, minimum) in split_breast_filters.items()
+                if enabled
+            }
     if preset_key == SIMPLE_PRESET_KEY:
         square["train_online_positive_ratio_selection_for_deterministic"] = True
         square["val_online_positive_ratio_selection_for_deterministic"] = False
@@ -4140,14 +6261,23 @@ def _image_card(title: str, image: np.ndarray, caption: str = "") -> html.Div:
     )
 
 
-def _image_src(image: np.ndarray) -> str:
+def _image_src(image: np.ndarray, *, display_max_side: int = 1600) -> str:
     arr = np.asarray(image)
     if arr.ndim == 2:
         arr = np.stack([arr, arr, arr], axis=-1)
     if arr.dtype != np.uint8:
         arr = np.clip(arr, 0, 255).astype(np.uint8)
+    height, width = arr.shape[:2]
+    max_side = max(height, width)
+    pil_image = Image.fromarray(arr)
+    if display_max_side > 0 and max_side > display_max_side:
+        scale = float(display_max_side) / float(max_side)
+        pil_image = pil_image.resize(
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            resample=Image.Resampling.LANCZOS,
+        )
     bio = io.BytesIO()
-    Image.fromarray(arr).save(bio, format="PNG")
+    pil_image.save(bio, format="PNG")
     return "data:image/png;base64," + base64.b64encode(bio.getvalue()).decode("ascii")
 
 
@@ -4223,6 +6353,54 @@ def _queue_progress_text(job: dict[str, Any]) -> str:
     return " · ".join(parts) or "Waiting for progress details"
 
 
+def _lazy_crop_config_from_controls(
+    *,
+    dataset_root: str,
+    output_root: str,
+    window_size: int,
+    stride: int,
+    min_box_visibility: float,
+    train_min_extent: float,
+    eval_min_extent: float,
+    preserve_positives: list[str],
+    positive_fraction: float,
+    clean_negative_breasts: list[str],
+    seed: int,
+    overwrite: list[str],
+) -> dict[str, Any]:
+    cfg = default_lazy_crop_config(
+        str(dataset_root or ""),
+        window_size=int(window_size or 1024),
+        stride=int(stride or 128),
+        min_box_visibility=float(
+            0.05 if min_box_visibility is None else min_box_visibility
+        ),
+        train_positive_fraction=float(
+            0.50 if positive_fraction is None else positive_fraction
+        ),
+        train_min_source_extent_fraction=float(
+            0.10 if train_min_extent is None else train_min_extent
+        ),
+        eval_min_source_extent_fraction=float(
+            0.05 if eval_min_extent is None else eval_min_extent
+        ),
+        seed=int(seed if seed is not None else 123),
+        overwrite=_is_on(overwrite),
+    )
+    selected_output = str(output_root or "").strip()
+    if selected_output:
+        cfg["paths"]["output_root"] = str(
+            Path(selected_output).expanduser().resolve(strict=False)
+        )
+    cfg["filters"]["preserve_positive_windows_below_threshold"] = _is_on(
+        preserve_positives
+    )
+    cfg["sampling"]["train_require_mass_negative_breasts"] = _is_on(
+        clean_negative_breasts
+    )
+    return cfg
+
+
 def _queue_table_children(snapshot: dict[str, Any]) -> Any:
     jobs = list(snapshot.get("jobs", []) or [])
     if not jobs:
@@ -4258,6 +6436,87 @@ def _queue_table_children(snapshot: dict[str, Any]) -> Any:
             ],
         ),
     ])
+
+
+def _feature_queue_children(snapshot: dict[str, Any]) -> Any:
+    jobs = list(snapshot.get("jobs", []) or [])
+    if not jobs:
+        return html.Div("No feature extraction has been started in this session.", className="note")
+    rows = []
+    for job in jobs:
+        status = str(job.get("status", ""))
+        rows.append(
+            html.Tr(
+                [
+                    html.Td(str(job.get("name") or "")),
+                    html.Td(status),
+                    html.Td(str(job.get("output_root") or "")),
+                    html.Td(
+                        str(job.get("error") or "")
+                        if status == "failed"
+                        else _queue_progress_text(job)
+                    ),
+                ]
+            )
+        )
+    return html.Table(
+        className="queue-table",
+        children=[
+            html.Thead(
+                html.Tr(
+                    [
+                        html.Th("DINOv3 extraction"),
+                        html.Th("Status"),
+                        html.Th("Output"),
+                        html.Th("Progress / error"),
+                    ]
+                )
+            ),
+            html.Tbody(rows),
+        ],
+    )
+
+
+def _lazy_crop_queue_children(snapshot: dict[str, Any]) -> Any:
+    jobs = list(snapshot.get("jobs", []) or [])
+    if not jobs:
+        return html.Div(
+            "No lazy-crop manifest extraction has been started in this session.",
+            className="note",
+        )
+    rows = []
+    for job in jobs:
+        status = str(job.get("status", ""))
+        rows.append(
+            html.Tr(
+                [
+                    html.Td(str(job.get("name") or "")),
+                    html.Td(status),
+                    html.Td(str(job.get("output_root") or "")),
+                    html.Td(
+                        str(job.get("error") or "")
+                        if status == "failed"
+                        else _queue_progress_text(job)
+                    ),
+                ]
+            )
+        )
+    return html.Table(
+        className="queue-table",
+        children=[
+            html.Thead(
+                html.Tr(
+                    [
+                        html.Th("Lazy-crop manifest"),
+                        html.Th("Status"),
+                        html.Th("Output"),
+                        html.Th("Progress / error"),
+                    ]
+                )
+            ),
+            html.Tbody(rows),
+        ],
+    )
 
 
 def _initial_pipeline(cfg: dict[str, Any]) -> dict[str, Any]:

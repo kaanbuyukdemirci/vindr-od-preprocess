@@ -39,6 +39,273 @@ class VisualizationResult:
     summary: dict[str, Any]
 
 
+def create_annotation_geometry_report(
+    annotations: pd.DataFrame | list[dict[str, Any]],
+    *,
+    output_dir: str | Path,
+    crop_width: int,
+    crop_height: int,
+    histogram_bins: int = 40,
+) -> VisualizationResult:
+    """Write source-annotation size data and crop-fit visualizations.
+
+    Fit is deliberately geometry-only: a box can fit when its width is no
+    greater than ``crop_width`` and its height is no greater than
+    ``crop_height``. Existing annotation position and actual sliding-window
+    origins are ignored, as they should be for this diagnostic.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    data = pd.DataFrame(annotations).copy()
+    required = ["bbox_width_px", "bbox_height_px"]
+    for column in required:
+        if column not in data.columns:
+            data[column] = pd.Series(dtype=float)
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    data = data[
+        data["bbox_width_px"].notna()
+        & data["bbox_height_px"].notna()
+        & (data["bbox_width_px"] > 0)
+        & (data["bbox_height_px"] > 0)
+    ].copy()
+    crop_width = max(1, int(crop_width))
+    crop_height = max(1, int(crop_height))
+    histogram_bins = max(5, int(histogram_bins))
+    data["bbox_area_px2"] = data["bbox_width_px"] * data["bbox_height_px"]
+    data["bbox_max_side_px"] = data[["bbox_width_px", "bbox_height_px"]].max(axis=1)
+    data["crop_width_px"] = crop_width
+    data["crop_height_px"] = crop_height
+    data["can_fit_fully_by_size"] = (
+        (data["bbox_width_px"] <= crop_width)
+        & (data["bbox_height_px"] <= crop_height)
+    )
+    data["cannot_fit_reason"] = np.select(
+        [
+            (data["bbox_width_px"] > crop_width) & (data["bbox_height_px"] > crop_height),
+            data["bbox_width_px"] > crop_width,
+            data["bbox_height_px"] > crop_height,
+        ],
+        ["too_wide_and_too_tall", "too_wide", "too_tall"],
+        default="fits",
+    )
+
+    created: list[Path] = []
+    detail_path = output_dir / "mass_box_geometry.csv"
+    data.to_csv(detail_path, index=False)
+    created.append(detail_path)
+
+    summary_rows = [_annotation_fit_summary_row(data, "all", crop_width, crop_height)]
+    if "split" in data.columns:
+        for split in SPLIT_ORDER:
+            summary_rows.append(
+                _annotation_fit_summary_row(
+                    data[data["split"].astype(str) == split],
+                    split,
+                    crop_width,
+                    crop_height,
+                )
+            )
+    summary_df = pd.DataFrame(summary_rows)
+    summary_csv = output_dir / "mass_box_fit_summary.csv"
+    summary_df.to_csv(summary_csv, index=False)
+    created.append(summary_csv)
+
+    overall = summary_rows[0]
+    summary_payload = {
+        "definition": (
+            "geometry_only; annotation location and generated crop locations are ignored; "
+            "fits iff bbox_width_px <= crop_width_px and bbox_height_px <= crop_height_px"
+        ),
+        "coordinate_space": "fixed_preprocessed_source",
+        "crop_width_px": crop_width,
+        "crop_height_px": crop_height,
+        "histogram_bins": histogram_bins,
+        "overall": overall,
+        "by_split": summary_rows[1:],
+    }
+    summary_json = output_dir / "mass_box_fit_summary.json"
+    summary_json.write_text(
+        json.dumps(_json_safe(summary_payload), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    created.append(summary_json)
+
+    if not data.empty:
+        created.extend(
+            _plot_annotation_geometry_figures(
+                data,
+                output_dir,
+                crop_width=crop_width,
+                crop_height=crop_height,
+                histogram_bins=histogram_bins,
+            )
+        )
+
+    readme_path = output_dir / "README.md"
+    readme_path.write_text(
+        _annotation_geometry_readme(summary_payload),
+        encoding="utf-8",
+    )
+    created.append(readme_path)
+    html_path = _write_annotation_geometry_html(output_dir, created, summary_payload)
+    created.append(html_path)
+    return VisualizationResult(
+        output_dir=output_dir,
+        created_files=created,
+        summary=summary_payload,
+    )
+
+
+def _annotation_fit_summary_row(
+    data: pd.DataFrame,
+    scope: str,
+    crop_width: int,
+    crop_height: int,
+) -> dict[str, Any]:
+    total = int(len(data))
+    fit = int(data.get("can_fit_fully_by_size", pd.Series(dtype=bool)).astype(bool).sum())
+    reasons = data.get("cannot_fit_reason", pd.Series(dtype=str)).value_counts().to_dict()
+    return {
+        "scope": scope,
+        "crop_width_px": int(crop_width),
+        "crop_height_px": int(crop_height),
+        "total_mass_annotations": total,
+        "can_fit_fully_by_size": fit,
+        "cannot_fit_fully_by_size": total - fit,
+        "can_fit_percent": (100.0 * fit / total) if total else 0.0,
+        "cannot_fit_percent": (100.0 * (total - fit) / total) if total else 0.0,
+        "too_wide": int(reasons.get("too_wide", 0)),
+        "too_tall": int(reasons.get("too_tall", 0)),
+        "too_wide_and_too_tall": int(reasons.get("too_wide_and_too_tall", 0)),
+        "median_width_px": float(data["bbox_width_px"].median()) if total else None,
+        "median_height_px": float(data["bbox_height_px"].median()) if total else None,
+        "p95_max_side_px": float(data["bbox_max_side_px"].quantile(0.95)) if total else None,
+        "maximum_width_px": float(data["bbox_width_px"].max()) if total else None,
+        "maximum_height_px": float(data["bbox_height_px"].max()) if total else None,
+    }
+
+
+def _plot_annotation_geometry_figures(
+    data: pd.DataFrame,
+    output_dir: Path,
+    *,
+    crop_width: int,
+    crop_height: int,
+    histogram_bins: int,
+) -> list[Path]:
+    created: list[Path] = []
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    plots = [
+        ("bbox_width_px", "Mass box widths", "width (pixels)", crop_width),
+        ("bbox_height_px", "Mass box heights", "height (pixels)", crop_height),
+        ("bbox_max_side_px", "Mass box maximum side", "max(width, height) (pixels)", max(crop_width, crop_height)),
+        ("bbox_area_px2", "Mass box areas", "area (pixels²)", crop_width * crop_height),
+    ]
+    for ax, (column, title, xlabel, threshold) in zip(axes.ravel(), plots, strict=True):
+        ax.hist(data[column], bins=histogram_bins, color="#3974b9", alpha=0.82)
+        ax.axvline(float(threshold), color="#c83f49", linestyle="--", linewidth=2, label="crop bound")
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Mass annotations")
+        ax.legend(loc="best")
+    p = output_dir / "mass_box_size_histograms.png"
+    _savefig(fig, p)
+    created.append(p)
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    fit_mask = data["can_fit_fully_by_size"].astype(bool)
+    ax.scatter(
+        data.loc[fit_mask, "bbox_width_px"],
+        data.loc[fit_mask, "bbox_height_px"],
+        s=18,
+        alpha=0.45,
+        label="can fit by size",
+        color="#2d8a57",
+    )
+    ax.scatter(
+        data.loc[~fit_mask, "bbox_width_px"],
+        data.loc[~fit_mask, "bbox_height_px"],
+        s=24,
+        alpha=0.65,
+        label="cannot fit by size",
+        color="#c83f49",
+    )
+    ax.axvline(crop_width, color="#333333", linestyle="--", linewidth=1.5)
+    ax.axhline(crop_height, color="#333333", linestyle="--", linewidth=1.5)
+    ax.set_title(f"Mass box width vs height for a {crop_width} × {crop_height} crop")
+    ax.set_xlabel("box width (pixels)")
+    ax.set_ylabel("box height (pixels)")
+    ax.legend(loc="best")
+    p = output_dir / "mass_box_width_height_crop_fit.png"
+    _savefig(fig, p)
+    created.append(p)
+
+    scopes = [("all", data)]
+    if "split" in data.columns:
+        scopes.extend((split, data[data["split"].astype(str) == split]) for split in SPLIT_ORDER)
+    labels = [scope for scope, _group in scopes]
+    fit_counts = [int(group["can_fit_fully_by_size"].astype(bool).sum()) for _scope, group in scopes]
+    no_fit_counts = [int(len(group) - fit) for fit, (_scope, group) in zip(fit_counts, scopes, strict=True)]
+    x = np.arange(len(labels))
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.bar(x, fit_counts, label="can fit fully by size", color="#2d8a57")
+    ax.bar(x, no_fit_counts, bottom=fit_counts, label="cannot fit fully by size", color="#c83f49")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Mass annotations")
+    ax.set_title("Geometric crop-fit counts (annotation location ignored)")
+    ax.legend(loc="best")
+    p = output_dir / "mass_box_crop_fit_counts.png"
+    _savefig(fig, p)
+    created.append(p)
+    return created
+
+
+def _annotation_geometry_readme(summary: dict[str, Any]) -> str:
+    overall = dict(summary.get("overall", {}) or {})
+    return f"""# Annotation geometry report
+
+This report analyzes source Mass bounding-box dimensions in the fixed-preprocessed coordinate space.
+
+The test is deliberately independent of crop placement. For the configured `{summary.get('crop_width_px')} x {summary.get('crop_height_px')}` crop, an annotation can fit fully by size when both its width and height are within those crop bounds. It does **not** claim that a particular generated sliding window contains the annotation.
+
+- Total Mass annotations: {int(overall.get('total_mass_annotations', 0))}
+- Can fit fully by size: {int(overall.get('can_fit_fully_by_size', 0))} ({float(overall.get('can_fit_percent', 0.0)):.2f}%)
+- Cannot fit fully by size: {int(overall.get('cannot_fit_fully_by_size', 0))} ({float(overall.get('cannot_fit_percent', 0.0)):.2f}%)
+
+Files:
+
+- `mass_box_geometry.csv`: one row per source Mass annotation with dimensions, area, fit flag, and failure reason.
+- `mass_box_fit_summary.csv` and `.json`: overall and split-level counts and size statistics.
+- `mass_box_size_histograms.png`: width, height, maximum-side, and area histograms.
+- `mass_box_width_height_crop_fit.png`: width/height scatter with crop bounds.
+- `mass_box_crop_fit_counts.png`: fit versus cannot-fit counts.
+"""
+
+
+def _write_annotation_geometry_html(
+    output_dir: Path,
+    created_files: list[Path],
+    summary: dict[str, Any],
+) -> Path:
+    images = [path for path in created_files if path.suffix.lower() == ".png"]
+    html = [
+        "<!doctype html>",
+        "<html><head><meta charset='utf-8'><title>Annotation Geometry Report</title>",
+        "<style>body{font-family:Arial,sans-serif;margin:24px;max-width:1200px;} img{max-width:100%;border:1px solid #ddd;margin-bottom:28px;} pre{background:#f4f4f4;padding:12px;overflow:auto;}</style>",
+        "</head><body><h1>Annotation geometry and crop-fit report</h1>",
+        "<p>Fit is based only on annotation width and height; annotation and crop locations are ignored.</p>",
+        f"<pre>{_html_escape(json.dumps(_json_safe(summary), indent=2, ensure_ascii=False))}</pre>",
+    ]
+    for path in images:
+        html.append(f"<h2>{_html_escape(path.stem.replace('_', ' '))}</h2>")
+        html.append(f"<img src='{_html_escape(path.name)}' alt='{_html_escape(path.name)}'>")
+    html.append("</body></html>")
+    path = output_dir / "index.html"
+    path.write_text("\n".join(html), encoding="utf-8")
+    return path
+
+
 def visualize_export_from_config(config: dict[str, Any]) -> VisualizationResult:
     """Create plots from already-exported CSV/JSON files.
 

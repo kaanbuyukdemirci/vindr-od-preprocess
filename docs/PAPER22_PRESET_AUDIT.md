@@ -2,11 +2,16 @@
 
 > This audit applies to the original paper-like preset alias `paper22` and its
 > `preprocessed-vindr-paper22-v2` output. A second GUI/CLI preset,
-> `Custom Paper 22 — improved breast-balanced foreground crops (v4)` (CLI alias
+> `Custom Paper 22 — CLAHE, canonical orientation, crop-balanced (v8)` (CLI alias
 > `custom-paper22`) is a deliberately custom subset: patient-safe breast
 > expansion, strict `>10%` breast-mask coverage for train/validation/test crops,
-> and exact 50/50 training-crop balance by `(study_id, laterality)` breast
-> status. Validation/test retain every grid candidate that passes the same mask
+> whole-image CLAHE before tiling, chest-wall-left orientation, and streaming
+> approximate 50/50 balance between Mass-containing and empty training crops.
+> A clipped Mass box is labeled at `>=5%` visibility in this custom preset.
+> Every Mass crop is mandatory; empty crops come only from breasts with no Mass
+> in either the current or paired view. The earlier exact source-breast-status
+> balance remains a GUI option.
+> Validation/test retain every grid candidate that passes the same mask
 > rule. See
 > [`PAPER22_MODEL_DATA_HANDOFF.md`](PAPER22_MODEL_DATA_HANDOFF.md) before choosing
 > a dataset; the two versions must not be mixed or described as equivalent.

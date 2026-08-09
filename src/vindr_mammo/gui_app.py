@@ -44,6 +44,7 @@ from .crops import (
     sliding_square_windows,
 )
 from .dataset import VindrMammoDataset
+from .dataset_layout import parse_resized_sizes, resized_sizes_text
 from .export import (
     _apply_custom_channel_operation as _export_apply_channel_operation,
     _custom_operation_should_preserve_background as _export_operation_should_preserve_background,
@@ -51,12 +52,13 @@ from .export import (
     _foreground_mask as _export_foreground_mask,
     _expand_training_to_patient_breast_views,
     _records_for_source_cohort,
+    _whole_image_filename_from_crop_filename,
     export_from_config,
     load_export_config,
     make_train_val_test_split,
     normalize_split_strategy_kwargs,
 )
-from .pipeline_scope import apply_scoped_steps
+from .pipeline_scope import apply_scoped_steps, crop_array_to_window
 from .preprocessing import _breast_chest_wall_side, _robust_tissue_threshold, align_contralateral_image_to_reference
 from .visualize import create_visualizations_from_export
 
@@ -301,10 +303,156 @@ def _load_saved_dataset_viewer_index(dataset_root_text: str, refresh_token: int 
         lambda r: str(crop_root / "labels" / str(r.get("split", "")) / f"{Path(str(r.get('file_name', ''))).stem}.txt"),
         axis=1,
     )
+
+    def paired_path(row: pd.Series, *, metadata_column: str, directory: str) -> str:
+        explicit_value = row.get(metadata_column, "")
+        explicit = "" if pd.isna(explicit_value) else str(explicit_value).strip()
+        if explicit:
+            explicit_path = Path(explicit)
+            return str(explicit_path if explicit_path.is_absolute() else crop_root / explicit_path)
+
+        # Keep old same-basename exports viewable, then fall back to the new
+        # one-file-per-source naming contract.
+        split_name = str(row.get("split", ""))
+        crop_filename = str(row.get("file_name", ""))
+        legacy_path = crop_root / directory / split_name / crop_filename
+        if legacy_path.exists():
+            return str(legacy_path)
+        whole_filename = _whole_image_filename_from_crop_filename(
+            crop_filename,
+            source_image_id=str(row.get("source_image_id", "")),
+        )
+        return str(crop_root / directory / split_name / whole_filename)
+
+    rows_df["paired_whole_path"] = rows_df.apply(
+        lambda r: paired_path(
+            r,
+            metadata_column="paired_whole_image_path",
+            directory="whole_images",
+        ),
+        axis=1,
+    )
+    rows_df["paired_whole_original_path"] = rows_df.apply(
+        lambda r: paired_path(
+            r,
+            metadata_column="paired_whole_original_image_path",
+            directory="whole_images_original",
+        ),
+        axis=1,
+    )
+    def high_resolution_paired_path(row: pd.Series) -> str:
+        for metadata_column in [
+            "paired_whole_high_resolution_image_path",
+            "paired_whole_high_resolution_image",
+            "paired_whole_native_image_path",
+            "paired_whole_native_image",
+        ]:
+            explicit_value = row.get(metadata_column, "")
+            explicit = "" if pd.isna(explicit_value) else str(explicit_value).strip()
+            if explicit:
+                explicit_path = Path(explicit)
+                return str(
+                    explicit_path if explicit_path.is_absolute() else crop_root / explicit_path
+                )
+
+        split_name = str(row.get("split", ""))
+        crop_filename = str(row.get("file_name", ""))
+        whole_filename = _whole_image_filename_from_crop_filename(
+            crop_filename,
+            source_image_id=str(row.get("source_image_id", "")),
+        )
+        for directory in ["whole_images_high_resolution", "whole_images_native"]:
+            legacy_path = crop_root / directory / split_name / crop_filename
+            if legacy_path.exists():
+                return str(legacy_path)
+            canonical_path = crop_root / directory / split_name / whole_filename
+            if canonical_path.exists():
+                return str(canonical_path)
+        return str(
+            crop_root
+            / "whole_images_high_resolution"
+            / split_name
+            / whole_filename
+        )
+
+    rows_df["paired_whole_high_resolution_path"] = rows_df.apply(
+        high_resolution_paired_path,
+        axis=1,
+    )
+    rows_df["paired_whole_high_resolution_exists"] = rows_df[
+        "paired_whole_high_resolution_path"
+    ].map(lambda x: Path(str(x)).exists())
+    # Backward-compatible dataframe aliases for existing viewer integrations.
+    rows_df["paired_whole_native_path"] = rows_df[
+        "paired_whole_high_resolution_path"
+    ]
     rows_df["image_exists"] = rows_df["image_path"].map(lambda x: Path(str(x)).exists())
     rows_df["label_exists"] = rows_df["label_path"].map(lambda x: Path(str(x)).exists())
+    rows_df["paired_whole_exists"] = rows_df["paired_whole_path"].map(lambda x: Path(str(x)).exists())
+    rows_df["paired_whole_original_exists"] = rows_df[
+        "paired_whole_original_path"
+    ].map(lambda x: Path(str(x)).exists())
+    rows_df["paired_whole_native_exists"] = rows_df[
+        "paired_whole_high_resolution_exists"
+    ]
     rows_df["positive"] = pd.to_numeric(rows_df["is_positive_window"], errors="coerce").fillna(0).astype(int) > 0
     rows_df["viewer_row"] = np.arange(len(rows_df), dtype=int)
+
+    review_index_path = crop_root / "review" / "index.json"
+    review_index: dict[str, Any] = {}
+    if review_index_path.exists():
+        try:
+            review_index = json.loads(review_index_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            review_index = {"load_error": str(exc)}
+    source_review_lookup = {
+        (str(item.get("split", "")), str(item.get("source_image_id", ""))): item
+        for item in (review_index.get("sources", []) or [])
+        if isinstance(item, dict)
+    }
+    sampled_review_lookup = {
+        (str(item.get("split", "")), str(item.get("file_name", ""))): item
+        for item in (review_index.get("sampled_crops", []) or [])
+        if isinstance(item, dict)
+    }
+
+    def review_value(row: pd.Series, key: str, default: Any = "") -> Any:
+        source = source_review_lookup.get(
+            (str(row.get("split", "")), str(row.get("source_image_id", ""))),
+            {},
+        )
+        return source.get(key, default)
+
+    def review_path(row: pd.Series, key: str) -> str:
+        value = str(review_value(row, key, "") or "")
+        return str(crop_root / value) if value else ""
+
+    rows_df["source_preview_path"] = rows_df.apply(lambda row: review_path(row, "source_preview_path"), axis=1)
+    rows_df["mask_path"] = rows_df.apply(lambda row: review_path(row, "mask_path"), axis=1)
+    rows_df["mask_overlay_path"] = rows_df.apply(lambda row: review_path(row, "mask_overlay_path"), axis=1)
+    rows_df["source_processed_width"] = rows_df.apply(lambda row: review_value(row, "source_width", 0), axis=1)
+    rows_df["source_processed_height"] = rows_df.apply(lambda row: review_value(row, "source_height", 0), axis=1)
+    rows_df["source_preprocessing_mirrored"] = rows_df.apply(lambda row: bool(review_value(row, "mirrored", False)), axis=1)
+    rows_df["source_preview_exists"] = rows_df["source_preview_path"].map(lambda value: bool(value) and Path(str(value)).exists())
+    rows_df["mask_exists"] = rows_df["mask_path"].map(lambda value: bool(value) and Path(str(value)).exists())
+    rows_df["mask_overlay_exists"] = rows_df["mask_overlay_path"].map(lambda value: bool(value) and Path(str(value)).exists())
+    rows_df["review_crop_frame_path"] = rows_df.apply(
+        lambda row: str(
+            crop_root
+            / str(
+                sampled_review_lookup.get(
+                    (str(row.get("split", "")), str(row.get("file_name", ""))),
+                    {},
+                ).get("crop_frame_path", "")
+            )
+        )
+        if sampled_review_lookup.get(
+            (str(row.get("split", "")), str(row.get("file_name", ""))),
+            {},
+        ).get("crop_frame_path")
+        else "",
+        axis=1,
+    )
 
     settings_paths = [
         crop_root.parent / "metadata" / "export_config_resolved.yaml",
@@ -373,6 +521,8 @@ def _load_saved_dataset_viewer_index(dataset_root_text: str, refresh_token: int 
         "source_count": source_count,
         "source_images_with_no_saved_crops": no_saved_count,
         "crops_per_source_histogram": crops_per_source_hist,
+        "review_index": review_index,
+        "review_index_path": str(review_index_path) if review_index_path.exists() else "",
     }
 
 
@@ -380,8 +530,9 @@ def _render_saved_dataset_viewer_mode(cfg: dict[str, Any]) -> None:
     """Inspect already saved square crops with annotation overlays."""
     st.subheader("Saved dataset viewer")
     st.caption(
-        "Open an exported square_crops dataset, inspect saved images and labels, and play crops one after another. "
-        "This reads PNG, YOLO label, CSV, and YAML files only. It does not load the original DICOMs."
+        "Open an exported square_crops dataset and inspect every crop beside its saved full fixed-preprocessed "
+        "mammogram. Red rectangles are Mass annotations and the cyan rectangle is the selected crop. "
+        "This reads saved review PNG/GIF, label, CSV, and YAML files only; it does not load original DICOMs."
     )
 
     default_root = Path(str(cfg.get("paths", {}).get("output_root", "/mnt/t9/vindr-data/preprocessed-vindr-v19")))
@@ -412,13 +563,14 @@ def _render_saved_dataset_viewer_mode(cfg: dict[str, Any]) -> None:
         st.warning("The saved dataset table is empty.")
         return
 
-    stat_cols = st.columns(5)
+    stat_cols = st.columns(6)
     stat_cols[0].metric("Crops", f"{len(rows):,}")
     stat_cols[1].metric("Positive", f"{int(rows['positive'].sum()):,}")
     stat_cols[2].metric("Empty", f"{int((~rows['positive']).sum()):,}")
     stat_cols[3].metric("Images found", f"{int(rows['image_exists'].sum()):,}")
     no_saved = loaded.get("source_images_with_no_saved_crops")
     stat_cols[4].metric("Source images with no crops", "n/a" if no_saved is None else f"{int(no_saved):,}")
+    stat_cols[5].metric("Full previews found", f"{int(rows['source_preview_exists'].sum()):,}")
 
     with st.expander("Loaded dataset settings and debug files", expanded=False):
         st.write(f"Crop root: `{loaded.get('crop_root')}`")
@@ -431,12 +583,21 @@ def _render_saved_dataset_viewer_mode(cfg: dict[str, Any]) -> None:
         if loaded.get("summary_path"):
             st.write(f"Debug summary: `{loaded.get('summary_path')}`")
             st.json(loaded.get("summary") or {})
+        review_index = loaded.get("review_index") or {}
+        if loaded.get("review_index_path"):
+            st.write(f"Review bundle: `{loaded.get('review_index_path')}`")
+            gifs = review_index.get("gifs", {}) or {}
+            for split_name in ["train", "val", "test"]:
+                for gif_kind, relative_path in (gifs.get(split_name, {}) or {}).items():
+                    gif_path = Path(str(loaded.get("crop_root"))) / str(relative_path)
+                    if gif_path.exists():
+                        st.write(f"{split_name} {gif_kind}: `{gif_path}`")
         hist = pd.DataFrame(loaded.get("crops_per_source_histogram", []))
         if not hist.empty:
             st.write("Crops per source image histogram")
             st.dataframe(hist, hide_index=True, use_container_width=True)
 
-    filter_cols = st.columns([1.1, 1.2, 1.2, 1.3, 1.0])
+    filter_cols = st.columns([1.1, 1.2, 1.2, 1.3, 1.0, 1.0])
     split_values = [s for s in ["train", "val", "test"] if s in set(rows["split"].astype(str))]
     split_choice = filter_cols[0].selectbox("Split", ["all"] + split_values, key="saved_viewer_split")
     pos_choice = filter_cols[1].selectbox("Crop type", ["all", "positive only", "empty only"], key="saved_viewer_positive_filter")
@@ -448,6 +609,7 @@ def _render_saved_dataset_viewer_mode(cfg: dict[str, Any]) -> None:
     )
     only_existing = filter_cols[3].checkbox("Only existing image files", value=True, key="saved_viewer_only_existing")
     show_boxes = filter_cols[4].checkbox("Draw annotations", value=True, key="saved_viewer_show_boxes")
+    show_mask = filter_cols[5].checkbox("Show red mask", value=False, key="saved_viewer_show_mask")
 
     view_df = rows.copy()
     if split_choice != "all":
@@ -523,10 +685,33 @@ def _render_saved_dataset_viewer_mode(cfg: dict[str, Any]) -> None:
     boxes = _load_yolo_boxes_for_saved_image(label_path, width=int(image.shape[1]), height=int(image.shape[0]))
     display_image = _prepare_saved_viewer_display_image(image, boxes if show_boxes else np.zeros((0, 4)), row, int(st.session_state["saved_viewer_index"]), len(view_df))
 
-    main_cols = st.columns([2.4, 1.0])
+    source_display = None
+    source_preview_path = Path(str(row.get("source_preview_path", "")))
+    if bool(row.get("source_preview_exists", False)):
+        source_image = _load_saved_viewer_image(source_preview_path)
+        if source_image is not None:
+            source_display = _prepare_saved_source_display_image(source_image, row)
+    mask_display = None
+    if show_mask and bool(row.get("mask_overlay_exists", False)):
+        mask_display = _load_saved_viewer_image(Path(str(row.get("mask_overlay_path", ""))))
+
+    main_cols = st.columns([2.0, 2.0, 1.0])
     with main_cols[0]:
-        st.image(display_image, caption=_saved_viewer_caption(row, int(st.session_state["saved_viewer_index"]), len(view_df)), use_container_width=True)
+        if source_display is not None:
+            st.image(
+                source_display,
+                caption="Full fixed-preprocessed source: red=Mass, cyan=selected crop",
+                use_container_width=True,
+            )
+        else:
+            st.warning(
+                "No saved full-image preview for this crop. Re-export with Debug review bundle enabled."
+            )
+        if mask_display is not None:
+            st.image(mask_display, caption="Exact retained breast mask overlaid in red", use_container_width=True)
     with main_cols[1]:
+        st.image(display_image, caption=_saved_viewer_caption(row, int(st.session_state["saved_viewer_index"]), len(view_df)), use_container_width=True)
+    with main_cols[2]:
         st.write("Selected crop metadata")
         metadata_fields = [
             "split",
@@ -540,6 +725,11 @@ def _render_saved_dataset_viewer_mode(cfg: dict[str, Any]) -> None:
             "num_mass_boxes",
             "crop_mode",
             "crop_window_xyxy",
+            "source_preprocessing_mirrored",
+            "source_processed_width",
+            "source_processed_height",
+            "source_preview_path",
+            "mask_path",
             "negative_foreground_fraction",
             "bbox_safe_foreground_fraction",
             "bbox_safe_margin_ok",
@@ -662,6 +852,35 @@ def _saved_viewer_caption(row: pd.Series, idx: int, total: int) -> str:
         f"source_index={row.get('source_index', '')} | source_image_id={row.get('source_image_id', '')} | "
         f"positive={int(bool(row.get('positive', False)))} | file={row.get('file_name', '')}"
     )
+
+
+def _parse_saved_viewer_xyxy(value: Any) -> tuple[int, int, int, int] | None:
+    if isinstance(value, (list, tuple, np.ndarray)) and len(value) == 4:
+        try:
+            return tuple(int(round(float(v))) for v in value)  # type: ignore[return-value]
+        except Exception:
+            return None
+    text = str(value or "").strip().strip("[]()")
+    if not text:
+        return None
+    try:
+        values = [int(round(float(part.strip()))) for part in text.split(",")]
+    except Exception:
+        return None
+    return tuple(values) if len(values) == 4 else None  # type: ignore[return-value]
+
+
+def _prepare_saved_source_display_image(image: np.ndarray, row: pd.Series) -> np.ndarray:
+    """Draw the crop window in saved fixed-preprocessed source coordinates."""
+    window = _parse_saved_viewer_xyxy(row.get("crop_window_xyxy"))
+    source_width = int(float(row.get("source_processed_width", 0) or 0))
+    source_height = int(float(row.get("source_processed_height", 0) or 0))
+    if window is None or source_width <= 0 or source_height <= 0:
+        return image.copy()
+    sx = float(image.shape[1]) / float(source_width)
+    sy = float(image.shape[0]) / float(source_height)
+    scaled = tuple(int(round(value * (sx if index % 2 == 0 else sy))) for index, value in enumerate(window))
+    return _draw_rect(image.copy(), scaled, color=(0, 220, 255), thickness=3)
 
 
 # -----------------------------------------------------------------------------
@@ -829,8 +1048,25 @@ def _show_visualization_outputs(output_dir: Path, *, result: Any | None = None) 
     else:
         st.info("No COCO-size plot PNGs found yet. Click Calculate / refresh visualizations.")
 
+    annotation_dir = output_dir / "annotation_geometry"
+    if annotation_dir.exists():
+        st.markdown("### Source annotation geometry and crop fit")
+        st.caption(
+            "This section checks whether each source Mass can fit by width and height. "
+            "Annotation and crop locations are ignored."
+        )
+        summary_path = annotation_dir / "mass_box_fit_summary.csv"
+        if summary_path.exists():
+            st.dataframe(pd.read_csv(summary_path), use_container_width=True, hide_index=True)
+        annotation_plots = sorted(annotation_dir.glob("*.png"))
+        if annotation_plots:
+            cols = st.columns(2)
+            for i, path in enumerate(annotation_plots):
+                with cols[i % 2]:
+                    st.image(str(path), caption=path.name, use_container_width=True)
+
     with st.expander("All generated PNG plots", expanded=False):
-        pngs = sorted(output_dir.glob("*.png"))
+        pngs = sorted(output_dir.rglob("*.png"))
         if not pngs:
             st.write("No PNG plots found.")
         else:
@@ -1840,7 +2076,7 @@ def _global_preprocess_controls(cfg: dict[str, Any]) -> dict[str, Any]:
             key=_widget_key("fixed_preprocess_breast_mask_keep_largest_component"),
         )
         pp["min_box_visibility_after_crop"] = st.slider(
-            "Minimum box visibility after breast crop",
+            "SOURCE ANNOTATIONS: retain after breast crop at visible fraction ≥",
             min_value=0.0,
             max_value=1.0,
             value=float(pp.get("min_box_visibility_after_crop", 0.30)),
@@ -2012,7 +2248,7 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
         ),
     )
     positivity_threshold = st.sidebar.slider(
-        "PREVIEW ONLY, positive crop threshold",
+        "PREVIEW ONLY: crop counts positive at visible Mass fraction ≥",
         min_value=0.0,
         max_value=1.0,
         value=float(policy.get("min_box_visibility", 0.30)),
@@ -2030,21 +2266,25 @@ def _crop_controls(cfg: dict[str, Any]) -> dict[str, Any]:
     if partial_key not in st.session_state:
         st.session_state[partial_key] = bool(policy.get("allow_partial_annotations", True)) if _is_loaded_config_active() else True
     allow_partial = st.sidebar.checkbox(
-        "Display partial boxes after clipping",
+        "SAVED LABELS: allow clipped partial annotations",
         key=partial_key,
         help=(
-            "GUI-only debugging default. When enabled, boxes that intersect the crop boundary "
-            "are clipped and drawn if they satisfy the visibility threshold. This does not "
-            "change config/export_config.yaml unless you explicitly export and apply the GUI YAML."
+            "When enabled, boxes intersecting the crop boundary are clipped and drawn if they "
+            "meet the saved-label threshold below. Exporting/applying the GUI YAML makes this the "
+            "actual YOLO/COCO label policy; the preview-only threshold above does not."
         ),
     )
     min_box_visibility = st.sidebar.slider(
-        "Minimum box visibility to draw/keep",
+        "SAVED LABELS: include annotation at visible area fraction ≥",
         0.0,
         1.0,
         float(policy.get("min_box_visibility", 0.30)),
         0.05,
         key=_widget_key("crop_min_box_visibility"),
+        help=(
+            "Actual square-crop annotation inclusion rule. 0.05 writes and draws a clipped Mass "
+            "annotation when at least 5% of its original area is visible in the crop."
+        ),
     )
 
     random_preview_count = int(crop_cfg.get("random_crops_per_annotation", 20) or 20)
@@ -3030,6 +3270,9 @@ def _selection_mode_from_config(crop_cfg: dict[str, Any], split: str) -> str:
         "positive_ratio": "positive_ratio",
         "all mass + sampled non-mass": "positive_ratio",
         "all_mass_plus_sampled_non_mass": "positive_ratio",
+        "crop_label_ratio": "crop_label_ratio",
+        "crop mass/empty ratio": "crop_label_ratio",
+        "mass crops + negative-image empty crops": "crop_label_ratio",
         "negative_fraction": "negative_fraction",
         "negative fraction": "negative_fraction",
         "all positive + fraction of negatives": "negative_fraction",
@@ -3072,6 +3315,7 @@ def _split_target_positive_ratio_from_config(crop_cfg: dict[str, Any], split: st
 def _deterministic_selection_controls(crop_cfg: dict[str, Any], split_crop_modes: dict[str, str] | None = None) -> dict[str, dict[str, Any]]:
     split_crop_modes = dict(split_crop_modes or {})
     options = [
+        "crop-level mass/empty ratio; empty crops from mass-negative breasts (both views)",
         "all mass + sampled non-mass",
         "all positive + fraction of negatives",
         "mass only",
@@ -3082,6 +3326,7 @@ def _deterministic_selection_controls(crop_cfg: dict[str, Any], split_crop_modes
         "mass_only": "mass only",
         "all": "all",
         "positive_ratio": "all mass + sampled non-mass",
+        "crop_label_ratio": "crop-level mass/empty ratio; empty crops from mass-negative breasts (both views)",
         "negative_fraction": "all positive + fraction of negatives",
         "source_breast_ratio": "50/50 crops by source breast status",
         "finding_images_all_windows": "finding images only, all crops",
@@ -3116,6 +3361,7 @@ def _deterministic_selection_controls(crop_cfg: dict[str, Any], split_crop_modes
             )
             target_ratio = _split_target_positive_ratio_from_config(crop_cfg, split)
             if selected_label in {
+                "crop-level mass/empty ratio; empty crops from mass-negative breasts (both views)",
                 "all mass + sampled non-mass",
                 "50/50 crops by source breast status",
             }:
@@ -3149,6 +3395,7 @@ def _deterministic_selection_controls(crop_cfg: dict[str, Any], split_crop_modes
                 "mode": {
                     "mass only": "mass_only",
                     "all": "all",
+                    "crop-level mass/empty ratio; empty crops from mass-negative breasts (both views)": "crop_label_ratio",
                     "all mass + sampled non-mass": "positive_ratio",
                     "all positive + fraction of negatives": "negative_fraction",
                     "50/50 crops by source breast status": "source_breast_ratio",
@@ -3165,7 +3412,7 @@ def _apply_deterministic_selection_to_config(square: dict[str, Any], payload: di
         split_payload = payload.get(split, {})
         mode = str(split_payload.get("mode", "all")).strip().casefold()
         if mode not in {
-            "mass_only", "all", "positive_ratio", "negative_fraction",
+            "mass_only", "all", "positive_ratio", "crop_label_ratio", "negative_fraction",
             "source_breast_ratio", "finding_images_all_windows"
         }:
             mode = "all"
@@ -3173,6 +3420,12 @@ def _apply_deterministic_selection_to_config(square: dict[str, Any], payload: di
         ratio = min(max(ratio, 0.01), 1.0)
         square[f"{split}_deterministic_selection_mode"] = mode
         square[f"{split}_deterministic_target_positive_ratio"] = ratio
+        if mode == "crop_label_ratio":
+            square[f"{split}_online_positive_ratio_selection_for_deterministic"] = True
+            square[f"{split}_balance_execution"] = "streaming_one_pass"
+            square[f"{split}_keep_all_positive_windows"] = True
+            square[f"{split}_online_balance_shuffle_source_records"] = True
+            square[f"{split}_online_balance_shuffle_windows"] = True
         if mode == "source_breast_ratio":
             square[f"{split}_deterministic_target_source_breast_mass_ratio"] = ratio
         negative_fraction = float(split_payload.get(
@@ -3299,6 +3552,118 @@ def _export_dataset_from_gui_panel(
             key=_widget_key("gui_export_baseline"),
             help="Creates one preprocessed image per mammogram without the final sliding square crop stage.",
         )
+        paired_defaults = dict(cfg.get("paired_whole_images", {}) or {})
+        with st.expander(
+            "Whole-image resolutions and grouped dataset layout",
+            expanded=bool(paired_defaults.get("enabled", False)),
+        ):
+            paired_save_original = st.checkbox(
+                "Save original-size processed whole images",
+                value=bool(paired_defaults.get("save_original", False)),
+                key=_widget_key("gui_export_paired_save_original"),
+            )
+            paired_save_resized = st.checkbox(
+                "Save square-padded resized whole images",
+                value=bool(paired_defaults.get("save_resized", paired_defaults.get("enabled", False))),
+                key=_widget_key("gui_export_paired_save_resized"),
+            )
+            paired_resized_sizes = st.text_input(
+                "Resized sizes (comma separated)",
+                value=resized_sizes_text(paired_defaults) or "1024",
+                placeholder="1024, 640",
+                key=_widget_key("gui_export_paired_resized_sizes"),
+                help="Use square sizes such as 1024, 640 or explicit WIDTHxHEIGHT values.",
+            )
+            paired_grouped_layout = st.checkbox(
+                "Use images/ and annotations/ top-level folders",
+                value=str((cfg.get("dataset_layout", {}) or {}).get("kind", ""))
+                == "images_annotations_v1",
+                key=_widget_key("gui_export_grouped_layout"),
+            )
+            st.caption(
+                "Every resolution receives matched YOLO, JSON, and COCO annotations. "
+                "The grouped layout also supports multiple metadata-only window grids."
+            )
+        try:
+            parsed_resized_variants = parse_resized_sizes(paired_resized_sizes)
+            paired_sizes_error = ""
+        except ValueError as exc:
+            parsed_resized_variants = []
+            paired_sizes_error = str(exc)
+            st.error(paired_sizes_error)
+        paired_whole_options = {
+            "save_original": bool(paired_save_original),
+            "save_resized": bool(paired_save_resized),
+            "resized_variants": parsed_resized_variants,
+            "grouped_layout": bool(paired_grouped_layout),
+        }
+
+        annotation_report_defaults = dict(cfg.get("annotation_geometry_report", {}) or {})
+        with st.expander("Annotation geometry data and visualizations", expanded=bool(annotation_report_defaults.get("enabled", False))):
+            st.caption(
+                "Writes per-Mass box dimensions, size histograms, width-versus-height plots, and "
+                "fit/cannot-fit counts for the configured square crop. Fit uses box width and height "
+                "only; annotation and crop locations are intentionally ignored."
+            )
+            annotation_report_enabled = st.checkbox(
+                "Create annotation size and geometric crop-fit report",
+                value=bool(annotation_report_defaults.get("enabled", False)),
+                key=_widget_key("gui_export_annotation_report_enabled"),
+            )
+            annotation_report_bins = int(st.number_input(
+                "Histogram bins",
+                min_value=5,
+                max_value=200,
+                value=max(5, int(annotation_report_defaults.get("histogram_bins", 40) or 40)),
+                step=5,
+                key=_widget_key("gui_export_annotation_report_bins"),
+            ))
+            st.caption("Outputs are saved under visualizations/annotation_geometry/.")
+        annotation_report_options = {
+            **annotation_report_defaults,
+            "enabled": bool(annotation_report_enabled),
+            "histogram_bins": int(annotation_report_bins),
+            "output_subdir": "annotation_geometry",
+            "fit_definition": "geometry_only_ignore_annotation_and_crop_locations",
+        }
+
+        reproducibility_defaults = dict(cfg.get("reproducibility_bundle", {}) or {})
+        with st.expander(
+            "Exact reproducibility metadata",
+            expanded=bool(reproducibility_defaults.get("enabled", False)),
+        ):
+            st.caption(
+                "Records exact source membership, saved crop order and coordinates, edge padding, "
+                "exported annotations, output paths, resolved settings, seeds, software provenance, "
+                "and compact metadata checksums. Replay uses the recorded windows instead of resampling."
+            )
+            reproducibility_enabled = st.checkbox(
+                "Create exact reproducibility metadata bundle",
+                value=bool(reproducibility_defaults.get("enabled", False)),
+                key=_widget_key("gui_export_reproducibility_enabled"),
+            )
+            reproducibility_checksums = st.checkbox(
+                "Write SHA-256 checksums for reproducibility metadata",
+                value=bool(reproducibility_defaults.get("write_metadata_sha256", True)),
+                key=_widget_key("gui_export_reproducibility_checksums"),
+            )
+            st.caption(
+                "Outputs are saved under reproducibility/. Whole DICOM/PNG hashing stays off by default "
+                "because it would add another very large disk pass."
+            )
+        reproducibility_options = {
+            **reproducibility_defaults,
+            "enabled": bool(reproducibility_enabled),
+            "write_metadata_sha256": bool(reproducibility_checksums),
+            "output_subdir": "reproducibility",
+            "schema_version": 1,
+            "include_source_dicom_sha256": bool(
+                reproducibility_defaults.get("include_source_dicom_sha256", False)
+            ),
+            "include_exported_image_sha256": bool(
+                reproducibility_defaults.get("include_exported_image_sha256", False)
+            ),
+        }
 
         vendors = _available_vendors(records_df)
         vendor_cfg = dict(cfg.get("vendor_filter", {}) or {})
@@ -3357,8 +3722,17 @@ def _export_dataset_from_gui_panel(
             "uses an online approximate balance by default: it saves mass crops immediately, keeps running counts, and saves "
             "empty crops when the current split needs more empty crops. Empty crops can come from any source image, including "
             "images with no mass. Deterministic sliding also supports online balance when "
-            "square_crops.<split>_online_positive_ratio_selection_for_deterministic is enabled; Simple Dataset v1 enables it "
+            "square_crops.<split>_online_positive_ratio_selection_for_deterministic is enabled; Default Research Dataset v1 enables it "
             "for training only and keeps complete deterministic grids for validation/test."
+        )
+        st.caption(
+            "Crop-label mode computes a compact source cadence from the target using ceil(1 / minority fraction): "
+            "50/50 is one positive then one negative; 80/20 is four positive then one negative. Crop counts can remain approximate "
+            "because one source can produce several valid windows."
+        )
+        st.caption(
+            "At the end of the cadence pass, the exporter checks the saved crop counts and consumes additional seeded "
+            "Mass-negative breasts only while a negative deficit remains. The export summary reports whether top-up met the target."
         )
         selection_payload = _deterministic_selection_controls(crop_cfg, split_crop_modes)
         with st.expander("Online balance behavior", expanded=False):
@@ -3401,6 +3775,70 @@ def _export_dataset_from_gui_panel(
             help="Updates the timing table every N progress updates. Example: 10 gives lower GUI overhead than updating every crop.",
         ))
 
+        review_defaults = dict(cfg.get("dataset_review", {}) or {})
+        with st.expander("Debug review bundle (original + full image + crops + masks + GIFs)", expanded=False):
+            st.caption(
+                "For source images that actually contribute crops, save a bounded sample of raw-original and fixed-preprocessed full mammograms plus the "
+                "exact retained breast mask. Crop and mask GIFs show the raw original as their leftmost panel, and every "
+                "composite GIF frame is also retained as a PNG. GIFs use a random per-split sample."
+            )
+            review_enabled = st.checkbox(
+                "Create saved dataset review bundle",
+                value=bool(review_defaults.get("enabled", False)),
+                key=_widget_key("gui_export_review_enabled"),
+            )
+            review_samples_per_split = int(st.number_input(
+                "Debug source/crop samples per split",
+                min_value=1,
+                max_value=1000,
+                value=max(1, int(review_defaults.get("samples_per_split", 100) or 100)),
+                step=1,
+                key=_widget_key("gui_export_review_samples_per_split"),
+            ))
+            review_source_max_side = int(st.number_input(
+                "Saved full-image/mask maximum side (px)",
+                min_value=256,
+                max_value=4096,
+                value=max(256, int(review_defaults.get("source_preview_max_side", 1200) or 1200)),
+                step=64,
+                key=_widget_key("gui_export_review_source_max_side"),
+            ))
+            review_seed = int(st.number_input(
+                "Review sample seed",
+                min_value=0,
+                max_value=2_147_483_647,
+                value=int(review_defaults.get("seed", 123) or 123),
+                step=1,
+                key=_widget_key("gui_export_review_seed"),
+            ))
+            review_create_crop_gifs = st.checkbox(
+                "Create original + full-image + crop GIFs",
+                value=bool(review_defaults.get("create_crop_gifs", True)),
+                key=_widget_key("gui_export_review_crop_gifs"),
+            )
+            review_save_masks = st.checkbox(
+                "Save resized breast masks and red overlays",
+                value=bool(review_defaults.get("save_masks", True)),
+                key=_widget_key("gui_export_review_save_masks"),
+            )
+            review_create_mask_gifs = st.checkbox(
+                "Create original + full-image + red-mask GIFs",
+                value=bool(review_defaults.get("create_mask_gifs", True)),
+                key=_widget_key("gui_export_review_mask_gifs"),
+            )
+        review_options = {
+            **review_defaults,
+            "enabled": bool(review_enabled),
+            "save_source_previews": True,
+            "save_masks": bool(review_save_masks),
+            "source_preview_max_side": int(review_source_max_side),
+            "samples_per_split": int(review_samples_per_split),
+            "source_assets_per_split": int(review_samples_per_split),
+            "seed": int(review_seed),
+            "create_crop_gifs": bool(review_create_crop_gifs),
+            "create_mask_gifs": bool(review_create_mask_gifs and review_save_masks),
+        }
+
         confirm = st.checkbox("I checked the output path and want to start export", value=False, key=_widget_key("gui_export_confirm"))
 
         with st.expander("Effective loaded/export settings preview", expanded=False):
@@ -3420,6 +3858,10 @@ def _export_dataset_from_gui_panel(
                     pipeline=pipeline,
                     simple_profiler_enabled=simple_profiler_enabled,
                     simple_profiler_emit_every=simple_profiler_emit_every,
+                    review_options=review_options,
+                    annotation_report_options=annotation_report_options,
+                    reproducibility_options=reproducibility_options,
+                    paired_whole_options=paired_whole_options,
                 )
             st.code(yaml.safe_dump(_make_yaml_safe(preview_cfg), sort_keys=False, allow_unicode=True, width=120), language="yaml")
 
@@ -3427,8 +3869,13 @@ def _export_dataset_from_gui_panel(
             if vendor_mode == "selected vendors only" and not selected_vendors:
                 st.error("No vendors selected. Select at least one vendor before exporting.")
                 return
-            if not save_square and not save_baseline:
-                st.error("Nothing selected to export. Enable square_crops and/or baseline_uncropped.")
+            if paired_sizes_error:
+                st.error("Fix the resized whole-image sizes before exporting.")
+                return
+            if not save_square and not save_baseline and not (
+                paired_save_original or paired_save_resized
+            ):
+                st.error("Nothing selected to export. Enable crops, a baseline, or a whole-image variant.")
                 return
             if strict_replay_loaded:
                 export_cfg = _strict_replay_export_config(output_root=output_root, clean_output=clean_output)
@@ -3446,6 +3893,10 @@ def _export_dataset_from_gui_panel(
                     pipeline=pipeline,
                     simple_profiler_enabled=simple_profiler_enabled,
                     simple_profiler_emit_every=simple_profiler_emit_every,
+                    review_options=review_options,
+                    annotation_report_options=annotation_report_options,
+                    reproducibility_options=reproducibility_options,
+                    paired_whole_options=paired_whole_options,
                 )
             _run_export_with_streamlit_progress(export_cfg)
 
@@ -3483,6 +3934,10 @@ def _build_gui_export_config(
     pipeline: dict[str, Any],
     simple_profiler_enabled: bool = True,
     simple_profiler_emit_every: int = 10,
+    review_options: dict[str, Any] | None = None,
+    annotation_report_options: dict[str, Any] | None = None,
+    reproducibility_options: dict[str, Any] | None = None,
+    paired_whole_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     out = copy.deepcopy(cfg)
     out.setdefault("paths", {})["output_root"] = str(output_root)
@@ -3492,6 +3947,38 @@ def _build_gui_export_config(
     out.setdefault("export", {})["save_empty_label_files"] = bool(out.get("export", {}).get("save_empty_label_files", True))
     out.setdefault("runtime", {})["simple_profiler_enabled"] = bool(simple_profiler_enabled)
     out.setdefault("runtime", {})["simple_profiler_emit_every"] = int(simple_profiler_emit_every)
+    if review_options is not None:
+        out["dataset_review"] = copy.deepcopy(review_options)
+    if annotation_report_options is not None:
+        out["annotation_geometry_report"] = copy.deepcopy(annotation_report_options)
+    if reproducibility_options is not None:
+        out["reproducibility_bundle"] = copy.deepcopy(reproducibility_options)
+    if paired_whole_options is not None:
+        paired = out.setdefault("paired_whole_images", {})
+        paired["save_original"] = bool(paired_whole_options.get("save_original", False))
+        paired["save_resized"] = bool(paired_whole_options.get("save_resized", False))
+        paired["resized_variants"] = copy.deepcopy(
+            paired_whole_options.get("resized_variants", []) or []
+        )
+        paired["enabled"] = bool(
+            paired["save_original"]
+            or paired["save_resized"]
+            or paired.get("save_high_resolution", False)
+        )
+        if paired["resized_variants"]:
+            primary = paired["resized_variants"][0]
+            paired["target_width"] = int(primary["width"])
+            paired["target_height"] = int(primary["height"])
+        if bool(paired_whole_options.get("grouped_layout", False)):
+            out["dataset_layout"] = {
+                "kind": "images_annotations_v1",
+                "schema_version": 1,
+                "images_directory": "images",
+                "annotations_directory": "annotations",
+                "metadata_directory": "metadata",
+            }
+        else:
+            out.pop("dataset_layout", None)
 
     out["vendor_filter"] = {
         "enabled": bool(selected_vendors),
@@ -3546,6 +4033,32 @@ def _build_gui_export_config(
             square[f"{eval_split}_require_clean_negative_windows"] = False
         contract = out.setdefault("replication_contract", {})
         if bool(contract.get("enabled", False)):
+            contract["expected_train_selection_mode"] = "source_breast_ratio"
+            contract["expected_train_mass_breast_crop_fraction"] = float(
+                square.get("train_deterministic_target_source_breast_mass_ratio", 0.50)
+            )
+            contract.pop("expected_train_crop_positive_fraction", None)
+            contract.pop("train_crop_positive_fraction_tolerance", None)
+            contract.pop("require_training_negative_crops_from_mass_negative_images", None)
+            contract.pop("require_training_negative_crops_from_mass_negative_breasts", None)
+            contract["min_breast_fraction_strictly_greater_than_by_split"] = {
+                split: minimum
+                for split, (enabled, minimum) in split_breast_filters.items()
+                if enabled
+            }
+    if str(square.get("train_deterministic_selection_mode", "")) == "crop_label_ratio":
+        contract = out.setdefault("replication_contract", {})
+        if bool(contract.get("enabled", False)):
+            contract["expected_train_selection_mode"] = "crop_label_ratio"
+            contract["expected_train_crop_positive_fraction"] = float(
+                square.get("train_deterministic_target_positive_ratio", 0.50)
+            )
+            contract["train_crop_positive_fraction_tolerance"] = float(
+                contract.get("train_crop_positive_fraction_tolerance", 0.05) or 0.05
+            )
+            contract["require_training_negative_crops_from_mass_negative_images"] = True
+            contract["require_training_negative_crops_from_mass_negative_breasts"] = True
+            contract.pop("expected_train_mass_breast_crop_fraction", None)
             contract["min_breast_fraction_strictly_greater_than_by_split"] = {
                 split: minimum
                 for split, (enabled, minimum) in split_breast_filters.items()
@@ -3555,7 +4068,7 @@ def _build_gui_export_config(
     square["deterministic_require_foreground"] = bool(crop_controls.get("require_foreground", False))
     square["deterministic_min_foreground_fraction"] = float(crop_controls.get("min_foreground_fraction", 0.05))
     square["deterministic_foreground_threshold"] = crop_controls.get("foreground_threshold", None)
-    # Simple Dataset v1 turns the foreground control into a hard all-crop
+    # Presets that define the all-crop foreground contract keep the visible
     # breast-mask contract. Keep that explicit policy synchronized with the
     # visible GUI checkbox/value so an exported config never claims one
     # threshold in the interface while silently enforcing another.
@@ -3609,6 +4122,11 @@ def _build_gui_export_config(
         "reject_partial_windows": bool(crop_options.get("reject_partial_windows", True)),
         "negative_max_box_visibility": float(crop_options.get("negative_max_box_visibility", 0.0)),
     }
+    contract = out.setdefault("replication_contract", {})
+    if contract.get("expected_min_box_visibility") is not None:
+        contract["expected_min_box_visibility"] = float(
+            out["crop_annotation_policy"]["min_box_visibility"]
+        )
     out["image_export"] = dict(out.get("image_export", {}) or {})
     out["image_export"]["rgb_scheme"] = "custom_channel_pipeline"
     out["image_export"]["contralateral_source_alignment"] = dict(crop_controls.get("contralateral_source_alignment", {}) or {})
@@ -4378,6 +4896,11 @@ def _read_preprocessed_cached(dataset: VindrMammoDataset, dataset_cache_key: str
     meta_first = meta_records[0] if meta_records else {}
     return {
         "image": image_np,
+        "foreground_mask": (
+            None
+            if target.get("_foreground_mask") is None
+            else np.asarray(target["_foreground_mask"], dtype=bool)
+        ),
         "mass_boxes": mass_boxes,
         "all_boxes": all_boxes,
         "record": record,
@@ -4417,6 +4940,14 @@ def _prepare_sample(
 ) -> dict[str, Any]:
     loaded = _read_preprocessed_cached(dataset, _dataset_cache_key(dataset), int(record_index))
     image = loaded["image"]
+    retained_foreground_mask = loaded.get("foreground_mask")
+    if retained_foreground_mask is not None:
+        retained_foreground_mask = np.asarray(retained_foreground_mask, dtype=bool)
+        if retained_foreground_mask.shape != image.shape:
+            raise ValueError(
+                "Retained preprocessing mask does not match the preprocessed image: "
+                f"mask={retained_foreground_mask.shape}, image={image.shape}."
+            )
     boxes = torch.as_tensor(loaded["all_boxes"], dtype=torch.float32)
     mass_boxes = torch.as_tensor(loaded["mass_boxes"], dtype=torch.float32)
     height, width = image.shape
@@ -4512,14 +5043,24 @@ def _prepare_sample(
             continue
         foreground_fraction = None
         if bool(crop_controls.get("require_foreground", False)):
-            foreground_fraction = _foreground_fraction_in_window(
-                image,
-                w,
-                crop_size=int(crop_controls["crop_size"]),
-                threshold=crop_controls.get("foreground_threshold"),
-                pad_value=float(crop_controls["crop_options"].get("pad_value", 0.0)),
-            )
-            if foreground_fraction < float(crop_controls.get("min_foreground_fraction", 0.05)):
+            if retained_foreground_mask is not None:
+                mask_crop = crop_array_to_window(
+                    retained_foreground_mask,
+                    w,
+                    output_height=int(crop_controls["crop_size"]),
+                    output_width=int(crop_controls["crop_size"]),
+                    pad_value=False,
+                )
+                foreground_fraction = float(mask_crop.mean()) if mask_crop.size else 0.0
+            else:
+                foreground_fraction = _foreground_fraction_in_window(
+                    image,
+                    w,
+                    crop_size=int(crop_controls["crop_size"]),
+                    threshold=crop_controls.get("foreground_threshold"),
+                    pad_value=float(crop_controls["crop_options"].get("pad_value", 0.0)),
+                )
+            if foreground_fraction <= float(crop_controls.get("min_foreground_fraction", 0.05)):
                 failed_crops.append({
                     "window": w,
                     "max_visibility": max_vis,
@@ -4541,6 +5082,8 @@ def _prepare_sample(
     crop_boxes = np.zeros((0, 4), dtype=np.float32)
     crop_mass_boxes = np.zeros((0, 4), dtype=np.float32)
     foreground_mask_crop = None
+    padding_mask_crop = None
+    crop_padding_info: dict[str, Any] | None = None
     if crops:
         selected = crops[int(crop_index or 0) % len(crops)]
     elif failed_crops:
@@ -4557,11 +5100,33 @@ def _prepare_sample(
         crop_image = crop_result.image.detach().cpu().squeeze(0).numpy().astype(np.float32, copy=False)
         crop_boxes = crop_result.boxes.detach().cpu().numpy().astype(np.float32, copy=False)
         crop_mass_boxes = crop_result.mass_boxes.detach().cpu().numpy().astype(np.float32, copy=False)
+        crop_padding_info = {
+            key: int(crop_result.info.get(key, 0) or 0)
+            for key in ["pad_left", "pad_top", "pad_right", "pad_bottom"]
+        }
         if bool(crop_controls.get("foreground_mask_preview", False)):
-            foreground_mask_crop = _foreground_mask_for_crop(
-                crop_image,
-                threshold=crop_controls.get("foreground_threshold"),
+            if retained_foreground_mask is not None:
+                foreground_mask_crop = crop_array_to_window(
+                    retained_foreground_mask,
+                    selected["window"],
+                    output_height=int(crop_controls["crop_size"]),
+                    output_width=int(crop_controls["crop_size"]),
+                    pad_value=False,
+                ).astype(bool, copy=False)
+            else:
+                foreground_mask_crop = _foreground_mask_for_crop(
+                    crop_image,
+                    threshold=crop_controls.get("foreground_threshold"),
+                )
+            valid_source = np.ones(image.shape, dtype=bool)
+            valid_crop = crop_array_to_window(
+                valid_source,
+                selected["window"],
+                output_height=int(crop_controls["crop_size"]),
+                output_width=int(crop_controls["crop_size"]),
+                pad_value=False,
             )
+            padding_mask_crop = ~valid_crop.astype(bool, copy=False)
 
     contralateral_crop_image = None
     contralateral_full_image = None
@@ -4619,6 +5184,8 @@ def _prepare_sample(
         "crop_boxes": crop_boxes,
         "crop_mass_boxes": crop_mass_boxes,
         "foreground_mask_crop": foreground_mask_crop,
+        "padding_mask_crop": padding_mask_crop,
+        "crop_padding_info": crop_padding_info,
         "show_foreground_mask_preview": bool(crop_controls.get("foreground_mask_preview", False)),
         "contralateral_crop_image": contralateral_crop_image,
         "contralateral_full_image": contralateral_full_image,
@@ -4707,9 +5274,14 @@ def _show_sample(
             )
 
     if (result.get("foreground_mask_crop") is not None) and result.get("show_foreground_mask_preview", False):
-        fg_cols = st.columns(2)
-        fg_cols[0].image(result["foreground_mask_crop"].astype(np.uint8) * 255, caption="Foreground mask used for crop filtering", use_container_width=True, clamp=True)
-        fg_cols[1].write({"foreground_fraction": result.get("selected_crop", {}).get("foreground_fraction")})
+        fg_cols = st.columns(3)
+        fg_cols[0].image(result["foreground_mask_crop"].astype(np.uint8) * 255, caption="Retained full-image mask used for crop filtering", use_container_width=True, clamp=True)
+        if result.get("padding_mask_crop") is not None:
+            fg_cols[1].image(result["padding_mask_crop"].astype(np.uint8) * 255, caption="Out-of-image padding map", use_container_width=True, clamp=True)
+        fg_cols[2].write({
+            "foreground_fraction": result.get("selected_crop", {}).get("foreground_fraction"),
+            "padding": result.get("crop_padding_info") or {},
+        })
 
     with st.expander("Metadata and statistics", expanded=not compact):
         stat_df = _stats_table(full, crop, processed_rgb)

@@ -20,8 +20,24 @@ The exported structure is:
 
 ```text
 G:/preprocessed-vindr/
+  README.md                         # generated guide for this resolved run
   split_assignments.csv
   export_summary.json
+
+  reproducibility/                  # when reproducibility_bundle.enabled
+    README.md
+    source_images.csv               # exact included source membership/order
+    source_processing.csv           # processed/contributing source audit
+    crops.csv                       # exact saved crop order/windows/transforms
+    crop_records.jsonl              # lossless per-crop preprocessing metadata
+    crop_annotations.csv            # crop/source/original-DICOM boxes
+    resolved_config.yaml
+    software_environment.json
+    software_source_files.csv
+    software_source_snapshot.zip
+    source_metadata_provenance.json
+    bundle_manifest.json
+    checksums.sha256
 
   square_crops/
     images/
@@ -33,12 +49,21 @@ G:/preprocessed-vindr/
       val/
       test/
     whole_images/                    # present when paired_whole_images.enabled
-      train/                         # same basename as each crop
+      train/                         # one <source-key>.png per source mammogram
+      val/
+      test/
+    whole_images_original/           # optional unpadded, unresized processed wholes
+      train/
+      val/
+      test/
+    whole_images_high_resolution/    # optional padded, unresized companions
+      train/
       val/
       test/
     metadata/
       samples_metadata.jsonl
       samples_metadata_flat.csv
+      crop_locations.csv             # numeric crop/source/whole coordinates
     vindr_mass.yaml                  # recommended portable Ultralytics YAML
     ultralytics/
       vindr_mass.yaml                # compatibility copy, also portable
@@ -140,19 +165,75 @@ Enable a whole-breast context input for every crop with:
 ```yaml
 paired_whole_images:
   enabled: true
+  save_original: true
+  save_resized: true
+  save_high_resolution: false
   target_width: 1024
   target_height: 1024
-  canvas_mode: per_image_square
+  resized_canvas_mode: per_image_square
+  high_resolution_canvas_mode: per_image_square
+  size_divisor: 16
   pad_value: 0.0
   pad_anchor: left_top
-  storage_mode: hardlink
+  storage_mode: single_file_per_source
 ```
 
-Each companion is written to `whole_images/<split>/<same crop basename>.png`.
-The breast image is padded to a square before resizing, so its aspect ratio is
-not warped. Repeated companions from one source mammogram are hard-linked when
-the filesystem supports it. The complete loader contract is in
+Each source mammogram is written once to
+`whole_images/<split>/<source-key>.png`. Every crop metadata row from that
+source references the shared path. These are also the defaults used by Default
+Research Dataset v1. The compact image is padded to its own
+square before resizing, preserving aspect ratio without inheriting black space
+from the high-resolution canvas. If enabled manually, fixed high-resolution mode
+top-left anchors every breast on the same canvas and adds padding only at the
+right/bottom. The exporter rejects a source larger than that canvas and
+validates the canvas/target against `size_divisor`. Use
+`high_resolution_canvas_mode: per_image_square` when a common high-resolution
+shape is not required. The complete loader
+contract is in
 [`PAIRED_CROP_DATA_CONTRACT.md`](PAIRED_CROP_DATA_CONTRACT.md).
+
+With `save_high_resolution: true`, one second source-level file is written to
+`whole_images_high_resolution/<split>/<source-key>.png`. It uses the separately
+configured high-resolution canvas and is not resized. Exact crop coordinates,
+shared paths, and transforms into all whole-image coordinate spaces are written to
+`metadata/crop_locations.csv`.
+
+Each variant receives separate per-image YOLO and JSON annotations plus an
+aggregate COCO dataset:
+
+```text
+whole_labels_original/          whole_annotations_original/
+whole_labels_resized/           whole_annotations_resized/
+whole_labels_high_resolution/   whole_annotations_high_resolution/
+mmdetection/whole_original/annotations/
+mmdetection/whole_resized/annotations/
+mmdetection/whole_high_resolution/annotations/
+```
+
+The annotation transform uses the same padding and scaling as the corresponding
+pixels. Cross-variant manifests and box audits are written to
+`metadata/whole_image_manifest.csv` and `metadata/whole_image_annotations.csv`.
+
+## Exact reproducibility metadata
+
+```yaml
+reproducibility_bundle:
+  enabled: true
+  output_subdir: reproducibility
+  schema_version: 1
+  write_metadata_sha256: true
+  include_software_source_snapshot: true
+  include_source_dicom_sha256: false
+  include_exported_image_sha256: false
+```
+
+The bundle records which mammograms were included, the saved crop order and
+exact `(x0, y0, x1, y1)` windows, padding and coordinate transforms, every
+exported annotation, the resolved config and seeds, and software/source-table
+provenance. The source snapshot preserves the actual exporter code even when
+the Git worktree was dirty. Reproduce an exact crop dataset by replaying `crops.csv` in its
+recorded order rather than running the sampler again. Source-DICOM and output
+PNG hashes are optional because enabling them adds another full image I/O pass.
 
 ## Partial annotation policy
 
@@ -635,7 +716,7 @@ threshold itself must be rejected (for example, Paper 22 improved requires
 `breast_fraction > 0.10`, not `>= 0.10`). All of these keys support a
 `train_`, `val_`, or `test_` prefix.
 
-### Patient/breast-aware training subset
+### Custom Paper 22 crop-label balance
 
 The custom Paper 22 improved preset first selects train and validation at
 `study_id` level from the mass-positive cohort. It then expands only the
@@ -649,9 +730,16 @@ source_cohort:
   train_expand_to_all_patient_breast_views: true
   train_breast_status_unit: study_laterality
 
+crop_annotation_policy:
+  allow_partial_annotations: true
+  min_box_visibility: 0.05
+
 square_crops:
-  train_deterministic_selection_mode: source_breast_ratio
-  train_deterministic_target_source_breast_mass_ratio: 0.50
+  train_deterministic_selection_mode: crop_label_ratio
+  train_deterministic_target_positive_ratio: 0.50
+  train_online_positive_ratio_selection_for_deterministic: true
+  train_online_balance_shuffle_source_records: true
+  train_online_balance_shuffle_windows: true
   train_require_min_breast_fraction_for_all_crops: true
   train_min_breast_fraction_for_all_crops: 0.10
   train_breast_fraction_comparison_for_all_crops: strictly_greater_than
@@ -673,22 +761,40 @@ square_crops:
   test_negative_require_foreground: false
 ```
 
-The selector balances the final training crop count by source-breast status, not by
-whether an individual tile contains a box. Thus the mass-breast half includes
-both lesion tiles and clean tiles from breasts known to contain a Mass in at
-least one view. Every eligible lesion-containing window is mandatory; remaining
-windows are sampled without replacement to the largest feasible exact ratio.
-COCO image records and CSV metadata include `source_breast_key`,
-`source_breast_has_mass`, and achieved balance fields.
+The default v8 selector balances actual crop labels. Every eligible crop with a
+retained Mass box is mandatory. Empty candidates are admitted only when neither
+the source image nor the paired view of the same `(study_id, laterality)`
+breast contains a Mass annotation. Source images and windows are shuffled, and
+eligible empty crops are admitted while the running ratio needs them. This
+avoids a global planning pass, so the achieved ratio is approximate. COCO
+image records and CSV metadata include `source_image_has_mass`,
+`source_breast_has_mass`, and `negative_crop_source_policy`.
+
+Streaming source order computes a compact cadence from the target ratio. The
+minority interval is rounded up as `ceil(1 / minority_fraction)`, with one
+minority source in each interval. Thus 50/50 alternates one positive and one
+negative, while an 80/20 five-source block contains four positives and one negative.
+The final crop ratio can still be approximate because mammograms can yield
+different numbers of valid crop windows. After the cadence pass, the exporter
+checks the actual saved counts and consumes additional seeded Mass-negative
+breasts one at a time until the negative deficit is removed or the complete
+eligible reserve is exhausted. `export_summary.json` records the desired count,
+remaining deficit, reserve usage, and whether the top-up target was met.
+
+The previous exact source-breast-status selector remains available as
+`train_deterministic_selection_mode: source_breast_ratio` with
+`train_deterministic_target_source_breast_mass_ratio: 0.50`. It includes clean
+tiles from mass-positive breasts in the positive-source half and requires a
+global candidate planning pass.
 
 Validation and test are not class-balanced. They retain every grid candidate
 whose fixed full-image breast-mask fraction is strictly greater than 10%, which
 removes background-only marker/label windows while preserving source IDs and
 source-coordinate labels for Maximum Box Fusion evaluation.
 
-### Online deterministic training balance with complete validation/test grids
+### Online deterministic training balance with protected validation/test positives
 
-Simple Dataset v1 uses deterministic sliding windows without collecting the
+Default Research Dataset v1 uses deterministic sliding windows without collecting the
 entire training candidate pool first. Every positive training window is written;
 eligible negative windows are admitted online while the running counts need
 another negative toward the configured target ratio. Sources and candidate
@@ -696,6 +802,8 @@ windows are shuffled with the configured seed to reduce order bias:
 
 ```yaml
 square_crops:
+  crop_size: 1024
+  stride: 128
   train_crop_mode: deterministic
   train_deterministic_selection_mode: positive_ratio
   train_deterministic_target_positive_ratio: 0.50
@@ -705,24 +813,27 @@ square_crops:
 
   train_require_clean_negative_windows: true
   train_deterministic_require_foreground: true
-  train_deterministic_min_foreground_fraction: 0.80
+  train_deterministic_min_foreground_fraction: 0.10
   train_negative_require_foreground: true
-  train_negative_min_foreground_fraction: 0.80
+  train_negative_min_foreground_fraction: 0.10
 
   val_deterministic_selection_mode: all
   test_deterministic_selection_mode: all
   val_online_positive_ratio_selection_for_deterministic: false
   test_online_positive_ratio_selection_for_deterministic: false
-  val_deterministic_require_foreground: false
-  test_deterministic_require_foreground: false
-  val_negative_require_foreground: false
-  test_negative_require_foreground: false
+  preserve_positive_windows_below_min_breast_fraction: true
+  val_require_min_breast_fraction_for_all_crops: true
+  test_require_min_breast_fraction_for_all_crops: true
+  val_min_breast_fraction_for_all_crops: 0.05
+  test_min_breast_fraction_for_all_crops: 0.05
 ```
 
 Online training balance is approximate because negatives encountered before the
 running stream needs them can be skipped. It never drops a positive window to
-force the target. Validation and test take the normal non-balancing path and save
-their complete generated stride grids.
+force the target. Validation and test take the normal non-balancing path. Their
+5% retained-mask filter rejects nearly blank negative windows, but the explicit
+positive-window safeguard keeps an eligible Mass window even below 5% breast
+occupancy.
 
 ## COCO size statistics in visualization reports
 

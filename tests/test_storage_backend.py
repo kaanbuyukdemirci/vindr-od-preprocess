@@ -54,7 +54,7 @@ def test_conservative_deterministic_estimate_includes_padded_edge_grid_and_pairs
         },
         "paired_whole_images": {
             "enabled": True,
-            "one_per_crop": True,
+            "storage_mode": "single_file_per_source",
             "target_width": 1024,
             "target_height": 1024,
         },
@@ -84,11 +84,46 @@ def test_conservative_deterministic_estimate_includes_padded_edge_grid_and_pairs
     # crop already covers the far edge.
     assert estimate.source_image_count == 1
     assert estimate.crop_image_count == 2
-    assert estimate.paired_whole_image_count == 2
-    assert estimate.model_image_count == 4
-    assert estimate.model_pixel_count == 4 * 1024 * 1024
-    assert estimate.raw_estimated_bytes == 4 * 1024 * 1024 * 3
+    assert estimate.paired_whole_image_count == 1
+    assert estimate.model_image_count == 3
+    assert estimate.model_pixel_count == 3 * 1024 * 1024
+    assert estimate.raw_estimated_bytes == 3 * 1024 * 1024 * 3
     assert estimate.conservative_bytes == estimate.raw_estimated_bytes
+
+
+def test_whole_only_estimate_counts_every_resized_resolution() -> None:
+    config = {
+        "export": {"save_square_crops": False, "save_baseline_uncropped": False},
+        "paired_whole_images": {
+            "enabled": True,
+            "save_original": True,
+            "save_resized": True,
+            "resized_variants": [
+                {"name": "16x16", "width": 16, "height": 16},
+                {"name": "8x8", "width": 8, "height": 8},
+            ],
+        },
+        "preserved_16bit": {"save": False},
+        "float32_export": {"enabled": False},
+        "storage_estimate": {
+            "rgb_bytes_per_pixel": 1.0,
+            "metadata_bytes_per_sample": 0,
+            "metadata_bytes_per_source": 0,
+            "fixed_metadata_bytes": 0,
+            "safety_factor": 1.0,
+        },
+    }
+
+    estimate = estimate_export_space(
+        config,
+        [{"width": 16, "height": 32, "export_split": "train"}],
+    )
+
+    assert estimate.crop_image_count == 0
+    assert estimate.paired_whole_image_count == 3
+    assert estimate.model_image_count == 3
+    assert estimate.model_pixel_count == 16 * 32 + 16 * 16 + 8 * 8
+    assert estimate.conservative_bytes == estimate.model_pixel_count
 
 
 def test_random_estimate_uses_annotations_and_one_to_one_target() -> None:
@@ -158,6 +193,47 @@ def test_aggregate_baseline_estimate_uses_target_canvas_and_preserved_copy() -> 
     assert estimate.breakdown_bytes["preserved_16bit_images"] == 4 * 1024 * 1024
     assert estimate.conservative_bytes == 6 * 1024 * 1024
     assert any("aggregate" in assumption.casefold() for assumption in estimate.assumptions)
+
+
+def test_native_paired_estimate_uses_fixed_common_canvas() -> None:
+    config = {
+        "export": {"save_square_crops": True, "save_baseline_uncropped": False},
+        "square_crops": {
+            "crop_size": 16,
+            "stride": 16,
+            "train_crop_mode": "random",
+            "random_crops_per_annotation": 1,
+            "random_crops_per_negative_image": 1,
+        },
+        "paired_whole_images": {
+            "enabled": True,
+            "save_native_resolution": True,
+            "target_width": 16,
+            "target_height": 16,
+            "canvas_mode": "fixed",
+            "canvas_width": 32,
+            "canvas_height": 48,
+        },
+        "preserved_16bit": {"save": False},
+        "storage_estimate": {
+            "rgb_bytes_per_pixel": 1.0,
+            "metadata_bytes_per_sample": 0,
+            "metadata_bytes_per_source": 0,
+            "fixed_metadata_bytes": 0,
+            "safety_factor": 1.0,
+        },
+    }
+    records = [{"export_split": "train", "width": 10, "height": 20, "num_masses": 1}]
+
+    estimate = estimate_export_space(config, records)
+
+    expected_crop = estimate.crop_image_count * 16 * 16
+    expected_resized_whole = 16 * 16
+    expected_native_whole = 32 * 48
+    assert estimate.model_pixel_count == (
+        expected_crop + expected_resized_whole + expected_native_whole
+    )
+    assert any("fixed 32 x 48" in item for item in estimate.assumptions)
 
 
 def test_estimate_applies_explicit_positive_cohort_and_vendor_filters() -> None:

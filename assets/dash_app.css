@@ -77,6 +77,23 @@ body {
   gap: 10px;
 }
 
+.feature-stat-controls {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.42fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: end;
+}
+
+.feature-stat-controls .field {
+  margin-bottom: 0;
+}
+
+.feature-stat-buttons {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
 .workspace {
   display: grid;
   grid-template-columns: minmax(480px, 36vw) minmax(0, 1fr);
@@ -624,7 +641,9 @@ label input[type="radio"] {
 
   .grid-2,
   .grid-3,
-  .image-grid {
+  .image-grid,
+  .feature-stat-controls,
+  .feature-stat-buttons {
     grid-template-columns: 1fr;
   }
 }

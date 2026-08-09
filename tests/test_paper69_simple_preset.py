@@ -280,7 +280,7 @@ def test_whole_scoped_operation_is_crop_of_full_transform_and_preview_matches_ex
     assert np.all(exported[:, -4:, :] == 0)  # out-of-image right padding stays background
 
 
-def test_paired_whole_image_uses_crop_basename_and_pad_then_resize(tmp_path: Path) -> None:
+def test_paired_whole_image_is_written_once_per_source_and_pad_then_resize(tmp_path: Path) -> None:
     source = torch.zeros((1, 12, 20), dtype=torch.float32)
     source[:, 2:10, 2:18] = torch.linspace(0.1, 1.0, 8 * 16).reshape(1, 8, 16)
     pipeline = {
@@ -302,14 +302,14 @@ def test_paired_whole_image_uses_crop_basename_and_pad_then_resize(tmp_path: Pat
         "canvas_mode": "per_image_square",
         "pad_value": 0.0,
         "pad_anchor": "left_top",
-        "storage_mode": "hardlink",
+        "storage_mode": "single_file_per_source",
     }
-    cache: dict[tuple[str, str], Path] = {}
+    cache: dict[tuple[str, ...], Path] = {}
     first = _save_paired_whole_image_for_crop(
         source_image=source,
         crop_root=tmp_path,
         split_name="train",
-        filename="crop-a.png",
+        filename="study-1__source-1__crop__train_0000_x0_y0_w12_h12.png",
         source_image_id="source-1",
         config=config,
         paired_cfg=paired_cfg,
@@ -319,7 +319,7 @@ def test_paired_whole_image_uses_crop_basename_and_pad_then_resize(tmp_path: Pat
         source_image=source,
         crop_root=tmp_path,
         split_name="train",
-        filename="crop-b.png",
+        filename="study-1__source-1__crop__train_0001_x8_y0_w12_h12.png",
         source_image_id="source-1",
         config=config,
         paired_cfg=paired_cfg,
@@ -328,11 +328,14 @@ def test_paired_whole_image_uses_crop_basename_and_pad_then_resize(tmp_path: Pat
 
     first_path = tmp_path / first["paired_whole_image_path"]
     second_path = tmp_path / second["paired_whole_image_path"]
-    assert first_path.name == "crop-a.png"
-    assert second_path.name == "crop-b.png"
+    assert first_path.name == "study-1__source-1.png"
+    assert second_path == first_path
     assert Image.open(first_path).size == (32, 32)
     assert Image.open(second_path).size == (32, 32)
-    assert second["paired_whole_storage"] in {"hardlink", "copy_fallback"}
+    assert first["paired_whole_storage"] == "single_file_per_source"
+    assert first["paired_whole_write_status"] == "written"
+    assert second["paired_whole_write_status"] == "reused"
+    assert len(list((tmp_path / "whole_images" / "train").glob("*.png"))) == 1
     geometry_keys = {
         "paired_whole_canvas_mode",
         "paired_whole_canvas_width",

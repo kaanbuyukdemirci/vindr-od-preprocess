@@ -109,7 +109,8 @@ vindr-mammo-gui --config config/export_config.yaml
 ```
 
 It organizes the workflow into Preview, Preprocess, Crops, Pipeline, Export,
-Saved Data, Storage & Queue, Manifests, and Guide tabs. Pipeline operations have
+Saved Data, Storage & Queue, Saved Viewer, Feature Extraction, Lazy Crop
+Manifests, Manifests, and Guide tabs. Pipeline operations have
 an `Apply before crop` switch, and Storage & Queue shows available output-disk
 space, conservative size estimates, and a FIFO list of frozen extraction
 pipelines. The queue can also be opened in a separate browser window. Each
@@ -119,6 +120,77 @@ legacy Streamlit inspector is still available for comparison:
 ```bash
 vindr-mammo-streamlit-gui --config config/export_config.yaml
 ```
+
+Save Data has a global float32 switch plus a separate image-type checklist for
+crops, resized wholes, original-size wholes, high-resolution wholes, and
+baseline wholes. The files are contiguous CHW `torch.float32` tensors
+normalized to `[0, 1]` and mirror PNG stems under `float32/`. Their preprocessing
+branch never converts pixels through uint8 or uint16; only the independent PNG
+branch is quantized to 0–255. The Default Research Dataset preset enables
+float32 for crops and resized wholes only.
+
+The Feature Extraction window scans an already exported dataset, detects every
+available crop/whole-image type, and extracts frozen pretrained DINOv3 features.
+It opens on `/mnt/t9/vindr-data/preprocessed-vindr-default-research-dataset-v1`
+by default and selects its 1024 crops and resized 1024 whole images while
+leaving variable-size original wholes unselected. The high-accuracy defaults
+are DINOv3 ViT-L/16, 1024 x 1024 input, batch size 1, and float32 model compute,
+source tensors, and saved features. It prefers the float32 images and displays a
+warning/count when it must fall back to PNG. Feature files retain the source
+split and stem, and each feature folder includes a JSONL source index, resolved
+YAML, summary, and README.
+
+The float32 mammograms stay in `[0,1]` and use identical R/G/B copies of the
+grayscale signal. Frozen LVD-1689M DINOv3 extraction then applies the checkpoint's
+official ImageNet input normalization in memory: mean
+`(0.485, 0.456, 0.406)` and standard deviation `(0.229, 0.224, 0.225)`. Do not
+replace these with mammography-dataset statistics unless training or fine-tuning
+a model whose input pipeline is deliberately configured around those statistics.
+Feature extraction never rewrites the saved dataset tensors.
+
+The **Lazy Crop Manifests** tab is the storage-light alternative to exporting a
+denser crop dataset. It defaults to the Default Research Dataset v1 root, a
+1024 x 1024 window, and stride 128. It reads the existing original-whole image
+manifest and whole-image Mass annotations, but decodes no PNG or float32 image
+pixels and writes no crop images. Its output folder is named
+`lazy_crop_manifests/window1024_stride128/` and contains one virtual-crop CSV
+and one crop-annotation CSV per split, an exact resolved YAML, a JSON summary,
+and a self-contained README with a PyTorch loading example.
+
+Every crop row records the original-whole source path, optional same-geometry
+float32 path, window/intersection coordinates, zero padding, source dimensions,
+stride, label count, source/breast Mass status, and the filter/sampling settings
+that selected it. Annotation rows contain the source box, clipped visible box,
+crop-local box, source annotation ID, and visible fraction. Training keeps every
+eligible Mass-positive window and samples empty windows without replacement
+from Mass-negative breasts toward the selected crop ratio. Validation and test
+remain unbalanced inference grids. See
+[`docs/LAZY_CROP_MANIFESTS.md`](docs/LAZY_CROP_MANIFESTS.md) for the complete
+contract.
+
+The metadata-only occupancy filter uses the exact fraction of the crop covered
+by the in-bounds fixed-preprocessed source image. The wholes are already
+breast-cropped and background-masked, but this value is an explicitly labeled
+geometry proxy/upper bound—not the retained breast-mask pixel fraction. A
+full-resolution mask was not saved for every source, so reproducing that mask
+fraction would require reading pixels or regenerating masks. Eligible positive
+windows bypass the proxy threshold by default so a Mass is not silently lost.
+
+An **Estimate grayscale mean/std** button can instead calculate deterministic,
+pixel-weighted moments from a configurable image sample. When **All** splits is
+selected, it samples only `train` to avoid validation/test leakage. If the
+sampled R/G/B channels are identical, one estimated mean and standard deviation
+are repeated across all channels; the normalized grayscale channels therefore
+remain identical with sampled mean approximately zero and standard deviation
+approximately one. This is experimental first-two-moment matching, not a match
+of the complete natural-image pretraining distribution. The adjacent restore
+button returns to the official DINOv3 baseline for controlled comparison.
+
+Official Hugging Face DINOv3 checkpoints require accepting Meta's model license
+and authenticating the same environment that launches the GUI. Run
+`hf auth login` (or set `HF_TOKEN` before launch), confirm with
+`hf auth whoami`, and restart the GUI. A local model directory can be selected
+for offline extraction.
 
 ## Basic usage
 
@@ -903,6 +975,14 @@ If `allow_partial_annotations=True`, boxes are clipped to the crop window and ke
 "min_box_visibility": 0.30,
 ```
 
+These similarly named visibility settings act at different stages:
+
+- `crop_annotation_policy.min_box_visibility` is the actual saved-label inclusion threshold for square crops. It controls which clipped Mass annotations are written to YOLO and COCO labels.
+- `preprocess.min_box_visibility_after_crop` is an earlier source-level safeguard used only if the initial breast bounding-box crop clips an annotation.
+- The GUI's **PREVIEW ONLY: crop counts positive** threshold only filters/classifies interactive preview crops. It does not decide which annotations are saved.
+
+For example, `crop_annotation_policy.min_box_visibility: 0.05` with partial annotations enabled writes a clipped annotation when at least 5% of its original area is inside the square crop.
+
 ### Crop tests and crop-size recommendations
 
 To visualize one selected crop and the final crop-coordinate boxes:
@@ -1267,26 +1347,34 @@ replication assumptions. It does not claim that the count-matched split is
 author-identical. Model architecture, training augmentation, source-coordinate
 inference, and Maximum Box Fusion remain in the model repository.
 
-A second adjacent preset, **Custom Paper 22 — improved breast-balanced
-foreground crops (v4)**, keeps the v2 validation image IDs and
+A second adjacent preset, **Custom Paper 22 — CLAHE, canonical orientation,
+crop-balanced (v8)**, keeps the v2 validation image IDs and
 official test cohort unchanged but changes the training subset deliberately:
 
+- CLAHE (`clip_limit=2.0`, `tile_grid_size=8`) is applied once to the whole
+  fixed-preprocessed mammogram before the 640 px windows are extracted, then
+  the same enhanced grayscale signal is replicated into R/G/B;
+- right-facing breasts, boxes, and retained masks are mirrored together so
+  every exported image has its chest wall on the left;
 - train/validation/test isolation remains at `study_id` (patient/exam) level;
 - training expands the 398 selected training patients to all 1,592 views;
-- a breast is defined as `(study_id, laterality)`, so the other view of a
-  mass-positive breast cannot be mislabeled as a negative breast;
+- a breast is still tracked as `(study_id, laterality)` for provenance;
 - every train, validation, and test crop must contain strictly more than 10% of the retained
   fixed-preprocessing breast mask (the equality case is rejected);
-- the final training crop set is exactly 50% from negative breasts and 50% from
-  breasts with at least one valid Mass, while retaining all eligible
-  lesion-containing windows; and
+- a clipped Mass box is labeled when at least 5% of its original area is
+  visible in the crop (the equality case is included);
+- every eligible Mass-containing training crop is mandatory, while shuffled
+  empty crops are streamed only from breasts with no Mass in either the
+  current or paired view toward an approximate 50/50 crop-label ratio; the
+  legacy exact source-breast-status balance remains available as a separate
+  GUI option; and
 - validation and test keep every otherwise eligible `640/512` grid window only
   when its retained breast-mask fraction is also strictly greater than 10%; this
   removes background-only marker/label regions such as LCC without changing
   source-image membership or source-coordinate ground truth.
 
 The improved dataset is written to
-`/mnt/t9/vindr-data/preprocessed-vindr-paper22-improved-v4`. It is a custom
+`/mnt/t9/vindr-data/preprocessed-vindr-paper22-improved-v8`. It is a custom
 controlled experiment inspired by the paper, not a claim about an undisclosed
 author subset. Both Paper 22 choices are visible separately in the GUI.
 
@@ -1298,11 +1386,11 @@ vindr-mammo-export --config config/export_config.yaml --preset paper22
 # Or without installing the console script:
 python main.py --config config/export_config.yaml --preset paper22
 
-# Custom patient/breast-balanced subset with >10% breast coverage in every split:
+# Custom crop-label-balanced subset with >10% breast coverage in every split:
 python main.py --config config/export_config.yaml --preset custom-paper22
 ```
 
-Two additional presets are available:
+Three additional presets are available:
 
 - **Paper 69 — closest available reproduction (v3; not exact)** (`paper69`)
   preserves the official VinDr test cohort, crops only excess breast
@@ -1322,17 +1410,115 @@ Two additional presets are available:
   the crop is breast according to the retained mask; positives bypass that rule.
   Validation and test retain every stride-grid crop without balancing or the 80%
   filter. It uses exact-grid zero-padded `1024` crops at stride `512` and writes
-  a pad-then-resize `1024` whole-image companion for every crop.
+  one pad-then-resize `1024` whole-image asset per source mammogram. Every crop
+  from that source references the same asset.
+- **Default Research Dataset (v1)** (`default-research`; compatibility aliases
+  `simple-crop` and `dual-whole`)
+  crops to the breast, masks outside tissue, mirrors right breasts
+  to a canonical orientation, applies per-image percentile normalization at
+  `0.5-99.5` and whole-image CLAHE, and replicates the same signal into R/G/B.
+  A clipped Mass annotation is included in saved YOLO/COCO labels when at least
+  5% of its original area is visible in the square crop. The similarly named
+  positive-crop threshold in the GUI is explicitly preview-only.
+  Training retains every Mass-positive crop and streams approximately the same
+  number of empty crops from Mass-negative breasts. Validation/test use a loose
+  5% retained-breast-mask threshold for background crops, while every eligible
+  Mass-positive window bypasses that filter. By default it writes stride-`128`
+  crops plus two whole-image variants:
+  unpadded original-size processed images and compact images padded to each
+  mammogram's own square before being resized to `1024 x 1024`. An independently
+  selectable, padded high-resolution whole-image variant remains available but
+  is disabled by this preset. Every enabled output type receives matched
+  annotations. The compact whole, crop, and stride are divisible by 16; this
+  preset deliberately does not run DINOv3.
+  It also enables an annotation-geometry report under
+  `visualizations/annotation_geometry/`. The report saves per-Mass box data,
+  width/height/area histograms, a width-versus-height plot, and fit/cannot-fit
+  counts for the 1024×1024 crop. This fit check intentionally ignores box and
+  crop locations: a Mass can fit when its width and height are both at most
+  1024 pixels.
 
 ```bash
 vindr-mammo-export --config config/export_config.yaml --preset paper69
 vindr-mammo-export --config config/export_config.yaml --preset simple
+vindr-mammo-export --config config/export_config.yaml --preset default-research
 ```
+
+Every successful export now writes `<output_root>/README.md`. It describes the
+resolved pixel pipeline, directory layout, label formats, crop coordinate
+space, whole-image transforms, split counts, and debug/audit files for that
+specific run.
 
 The paired model-input layout is specified in
 [`docs/PAIRED_CROP_DATA_CONTRACT.md`](docs/PAIRED_CROP_DATA_CONTRACT.md), including
 the authoritative manifest fields, label semantics, tensor shapes, and loader
 rules.
+
+### Matching a crop to its one-per-source whole image
+
+Paired whole images are not duplicated per crop. For every source mammogram
+that produces at least one crop, the exporter writes at most:
+
+- one unpadded file in `square_crops/whole_images_original/<split>/` when
+  `paired_whole_images.save_original: true`;
+- one resized file in `square_crops/whole_images/<split>/`; and
+- one no-resize, canvas-padded file in
+  `square_crops/whole_images_high_resolution/<split>/` when
+  `paired_whole_images.save_high_resolution: true`.
+
+All crops from that source store the same explicit paths in
+`metadata/samples_metadata_flat.csv`, `metadata/crop_locations.csv`, and the
+COCO image records. Use those fields as the authoritative join:
+
+```python
+from pathlib import Path
+import pandas as pd
+
+root = Path("/path/to/export/square_crops")
+samples = pd.read_csv(root / "metadata" / "samples_metadata_flat.csv")
+
+row = samples.iloc[0]
+crop_path = root / row["training_image"]
+whole_original_path = root / row["paired_whole_original_image"]  # if enabled
+whole_resized_path = root / row["paired_whole_image"]
+whole_high_resolution_path = root / row["paired_whole_high_resolution_image"]  # if enabled
+source_key = row["paired_whole_key"]
+```
+
+The filenames also provide a convenient deterministic fallback. A crop is
+named as follows:
+
+```text
+<source key>__crop__<split>_<crop number>_x<X>_y<Y>_w<W>_h<H>.png
+```
+
+All enabled whole-image variants use `<source key>.png` in their respective split
+directories. In other words, remove the final `__crop__...` portion from the
+crop stem and add `.png`. For example:
+
+```text
+crop:          images/train/studyA__imageB__crop__train_0003_x512_y0_w1024_h1024.png
+original whole: whole_images_original/train/studyA__imageB.png
+resized whole: whole_images/train/studyA__imageB.png
+high-res whole: whole_images_high_resolution/train/studyA__imageB.png
+```
+
+“High resolution” here means the fixed-preprocessed mammogram is not resized
+after its configured padding. This optional branch is disabled in Default
+Research Dataset v1; if enabled manually, it can use either a user-configured
+shared canvas or a per-image square, with padding only on the right and bottom.
+It is not a byte-for-byte raw DICOM image. The resized file is always made
+independently from a per-image square. The resized and high-resolution files
+share the same source key, and many crop rows intentionally point
+to the same path. Loaders should cache by `paired_whole_key` or path if repeated
+image decoding is undesirable.
+
+Each whole variant has its own YOLO label, rich per-image JSON annotation, and
+aggregate COCO dataset. See `whole_labels_<variant>/`,
+`whole_annotations_<variant>/`, and
+`mmdetection/whole_<variant>/annotations/`. The exact cross-variant box audit is
+stored in `metadata/whole_image_annotations.csv`; visual overlays, comparison
+frames, GIFs, and geometry plots are under `review/whole_variant_*`.
 
 The Paper 22 version status, distinct loader semantics, and source-coordinate
 evaluation contract are in the
@@ -1430,8 +1616,8 @@ The Dash GUI includes a **Dataset visualizations** mode for viewing visualizatio
 The GUI export panel now reports elapsed time and estimated remaining time during dataset export. It also supports split-specific deterministic crop selection modes: `mass_only`, `all`, `positive_ratio`, and `finding_images_all_windows`. In `positive_ratio` mode, all mass-positive deterministic windows are kept and non-mass windows are sampled to approach the requested positive crop ratio for train, validation, or test independently. In `finding_images_all_windows` mode, source images with no mass/finding are skipped, but every deterministic crop from source images with at least one mass/finding is kept, including crop windows that do not themselves contain the mass.
 
 Deterministic `positive_ratio` can also run as a streaming approximate sampler
-with `<split>_online_positive_ratio_selection_for_deterministic: true`. Simple
-Dataset v1 enables this only for train; validation/test use `all` and preserve
+with `<split>_online_positive_ratio_selection_for_deterministic: true`. Default
+Research Dataset v1 enables this only for train; validation/test use `all` and preserve
 their complete stride grids.
 
 
@@ -1619,13 +1805,24 @@ The contralateral source path is faster now. Instead of shifting the whole oppos
 
 ## Saved dataset viewer
 
-The Dash GUI includes a **Saved dataset viewer** mode for checking exported `square_crops` without reloading the original DICOM files. It reads the exported PNG crops, YOLO labels, `stats/samples.csv`, `debug_logs/crop_log.csv`, and `metadata/export_config_resolved.yaml`.
+The Dash and Streamlit GUIs include a **Saved dataset viewer** mode for checking exported `square_crops` without reloading the original DICOM files. It reads the exported PNG crops, YOLO labels, `stats/samples.csv`, `debug_logs/crop_log.csv`, `metadata/export_config_resolved.yaml`, and the optional `review/index.json` bundle.
+For paired exports, Dash shows the selected crop first, followed by the enabled
+original-size, resized, and optional padded high-resolution whole-mammogram
+companions and the full debug source.
 
 Features:
 
 - Manual scan with Previous, Next, and crop-number slider.
 - Automatic playback with a user-selected period in seconds.
 - Annotation boxes drawn from saved YOLO label files.
+- Every crop shown beside its deduplicated full fixed-preprocessed mammogram when the review bundle was enabled. Red boxes mark Mass annotations and a cyan box marks the selected crop window.
+- Review GIFs use three panels: raw stored DICOM pixels on the far left
+  (full-range display scaling and resize only), the fixed-preprocessed full
+  mammogram in the middle, and the exported crop or mask view on the right.
+- Optional exact retained-mask PNGs and red mask overlays.
+- Optional saved crop-review and mask-review GIFs, sampled independently from
+  train, validation, and test. Every composite GIF frame is also retained as a
+  PNG under `review/crop_frames/<split>/` or `review/mask_frames/<split>/`.
 - Source image index, image id, split, positivity, crop window, and file name shown on screen and in the side metadata panel.
 
 Run the GUI as usual:
@@ -1635,3 +1832,24 @@ vindr-mammo-gui --config config/export_config.yaml
 ```
 
 Then choose `Saved dataset viewer` from the Mode selector.
+
+To create the review files during export, open **Debug review bundle** in the
+export controls. The general default is 100 random crops and 100 random source
+masks per split; Custom Paper 22 enables the bundle and uses 200 by default.
+Raw-original previews, fixed-preprocessed previews, and masks are stored once
+per source image. The equivalent YAML section is:
+
+```yaml
+dataset_review:
+  enabled: true
+  save_original_previews: true
+  save_source_previews: true
+  save_masks: true
+  source_preview_max_side: 1200
+  samples_per_split: 100
+  seed: 123
+  create_crop_gifs: true
+  create_mask_gifs: true
+  gif_panel_size: 640
+  gif_frame_duration_ms: 700
+```

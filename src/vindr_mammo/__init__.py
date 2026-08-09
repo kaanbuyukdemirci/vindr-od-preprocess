@@ -1,10 +1,13 @@
 from .export import export_from_config, load_export_config
 from .visualize import create_visualizations_from_export, visualize_export_from_config
 from .presets import (
+    DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+    DUAL_WHOLE_PRESET_KEY,
     PAPER_22_IMPROVED_PRESET_KEY,
     PAPER_22_PRESET_KEY,
     PAPER_69_PRESET_KEY,
     SIMPLE_PRESET_KEY,
+    SIMPLE_CROP_PIPELINE_PRESET_KEY,
     STUDY_PRESETS,
     apply_study_preset,
 )
@@ -28,6 +31,7 @@ from .dataset import (
 __version__ = "0.35.0"
 
 __all__ = [
+    "DEFAULT_RESEARCH_DATASET_PRESET_KEY",
     "VindrMammoDataset",
     "vindr_mammo_collate",
     "SIZE_TINY",
@@ -43,6 +47,8 @@ __all__ = [
     "run_visualization_from_config_path",
     "export_main",
     "visualize_main",
+    "DUAL_WHOLE_PRESET_KEY",
+    "SIMPLE_CROP_PIPELINE_PRESET_KEY",
     "PAPER_22_PRESET_KEY",
     "PAPER_22_IMPROVED_PRESET_KEY",
     "PAPER_69_PRESET_KEY",

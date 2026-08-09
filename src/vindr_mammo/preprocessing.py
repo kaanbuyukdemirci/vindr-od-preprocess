@@ -33,6 +33,10 @@ DEFAULT_PREPROCESS_OPTIONS: dict[str, Any] = {
     "breast_mask_keep_largest_component": True,
     "min_component_area_fraction": 0.001,
     "min_box_visibility_after_crop": 0.30,
+    # Optional source-ground-truth safeguard. When enabled, the tissue-derived
+    # crop is expanded to include every Mass box before pixels or boxes are
+    # cropped, so a foreground heuristic cannot remove a labeled lesion.
+    "preserve_mass_boxes_after_breast_crop": False,
     # Keep the already-computed full-source mask on the in-memory target so a
     # patch exporter can reuse it. It is never written into metadata payloads.
     "retain_breast_mask_for_export": False,
@@ -159,7 +163,36 @@ def apply_geometry_preprocessing(
             min_component_area_fraction=float(opts.get("min_component_area_fraction", 0.001)),
             options=opts,
         )
+        if bool(opts.get("preserve_mass_boxes_after_breast_crop", False)) and mass_boxes.numel():
+            height, width = int(image.shape[-2]), int(image.shape[-1])
+            finite_boxes = mass_boxes.detach().cpu().to(torch.float32).reshape(-1, 4)
+            finite_boxes = finite_boxes[torch.isfinite(finite_boxes).all(dim=1)]
+            if finite_boxes.numel():
+                bx0 = max(0, int(torch.floor(finite_boxes[:, 0].min()).item()))
+                by0 = max(0, int(torch.floor(finite_boxes[:, 1].min()).item()))
+                bx1 = min(width, int(torch.ceil(finite_boxes[:, 2].max()).item()))
+                by1 = min(height, int(torch.ceil(finite_boxes[:, 3].max()).item()))
+                x0, y0, x1, y1 = crop_box
+                crop_box = (
+                    min(int(x0), bx0),
+                    min(int(y0), by0),
+                    max(int(x1), bx1),
+                    max(int(y1), by1),
+                )
+                info["breast_crop_expanded_to_preserve_mass_boxes"] = True
         mask = breast_mask(image, options=opts)
+        if bool(opts.get("preserve_mass_boxes_after_breast_crop", False)) and mass_boxes.numel():
+            height, width = mask.shape[:2]
+            for box in mass_boxes.detach().cpu().to(torch.float32).reshape(-1, 4):
+                if not bool(torch.isfinite(box).all()):
+                    continue
+                mx0 = max(0, min(width, int(torch.floor(box[0]).item())))
+                my0 = max(0, min(height, int(torch.floor(box[1]).item())))
+                mx1 = max(0, min(width, int(torch.ceil(box[2]).item())))
+                my1 = max(0, min(height, int(torch.ceil(box[3]).item())))
+                if mx1 > mx0 and my1 > my0:
+                    mask[my0:my1, mx0:mx1] = True
+            info["breast_mask_expanded_to_preserve_mass_box_pixels"] = True
         x0, y0, x1, y1 = crop_box
         image = image[:, y0:y1, x0:x1].contiguous()
         foreground_mask = np.asarray(mask[y0:y1, x0:x1], dtype=bool)

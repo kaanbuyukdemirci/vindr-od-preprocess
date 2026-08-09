@@ -179,9 +179,14 @@ Used only when an RGB channel source is `contralateral_same_view_crop`.
 | Delete output folder before export | `export.clean_output_root` | Removes the target export folder before writing. Use carefully. |
 | Sliding crop export (square_crops) | `export.save_square_crops` | Writes overlapping fixed-size crop images and labels. |
 | Whole-image export (baseline_uncropped) | `export.save_baseline_uncropped` | Writes one preprocessed image per mammogram without final square cropping. |
-| Save paired whole image for every crop | `paired_whole_images.enabled` | Writes `whole_images/<split>/<same crop basename>.png`; the simple preset pads to a square before resizing to 1024. |
-| Paired whole image size | `paired_whole_images.target_width`, `target_height` | Output dimensions of the context image. |
-| Deduplicate repeated whole images with hard links | `paired_whole_images.storage_mode` | Keeps one pathname per crop while repeated companions from the same mammogram share disk blocks when supported. |
+| Save paired whole image for every crop | `paired_whole_images.enabled` | Writes one `whole_images/<split>/<source-key>.png` per source mammogram; all of its crops reference that path. |
+| Save original-size processed whole image | `paired_whole_images.save_original` | Writes an unpadded, unresized fixed-preprocessed whole plus matched YOLO/JSON/COCO annotations. |
+| Save square-padded resized whole image | `paired_whole_images.save_resized` | Pads each source to its own square, resizes to the configured target, and writes matched annotations using that per-image scale. |
+| Also save high-resolution whole image | `paired_whole_images.save_high_resolution` | Writes one `whole_images_high_resolution/<split>/<source-key>.png` per source without resizing. |
+| Pad every high-resolution whole to the same canvas | `paired_whole_images.high_resolution_canvas_mode` | `fixed` uses one dataset-wide canvas; `per_image_square` pads each image only to its own square. |
+| Paired whole image size | `paired_whole_images.target_width`, `target_height` | Output dimensions of the compact context image. It is independently padded to its own square before resizing. |
+| High-resolution canvas width/height | `paired_whole_images.high_resolution_canvas_width`, `high_resolution_canvas_height`, `size_divisor` | Optional user-configured common canvas, with bottom/right padding and divisor validation. Default Research Dataset v1 leaves this output and its fixed dimensions disabled. |
+| Whole-image storage mode | `paired_whole_images.storage_mode` | `single_file_per_source`: one canonical file per source and resolution, with shared paths in crop metadata. |
 | Split policy | `splits.strategy` | Chooses a seeded random study-fraction validation set, original VinDr train/test only, or an exact validation study count. The official test set always remains test. |
 | Validation fraction | `splits.val_fraction_from_training` | Fraction of official training studies reserved for validation in `random_study_fraction` mode. |
 | Validation study/image counts | `splits.validation_study_count`, `validation_image_count` | Exact-count mode. Image count `0` in the GUI means unconstrained. |
@@ -189,11 +194,34 @@ Used only when an RGB channel source is `contralateral_same_view_crop`.
 | Stratify by BI-RADS | `splits.stratify_by_birads` | Samples validation studies proportionally across study-level BI-RADS strata. |
 | Vendor mode / selected vendors | `vendor_filter` | Exports all vendors or only selected vendors. |
 | Train/val/test crop mode | `square_crops.<split>_crop_mode` | Per-split deterministic, random, or bbox-safe random export mode. |
-| Train/val/test mass/empty selection | `square_crops.<split>_deterministic_selection_mode` | Exports mass only, all eligible windows, finding-image windows, all mass plus sampled non-mass, or train-only source-breast balancing. Source-breast mode classifies breasts by `(study_id, laterality)`, expands only selected training patients, and keeps all validation/test windows that pass their breast-mask rule. |
+| Train/val/test mass/empty selection | `square_crops.<split>_deterministic_selection_mode` | Includes `crop_label_ratio`, which streams every Mass-containing crop plus empty crops from randomly ordered breasts that contain no Mass in either view, toward an approximate target without global planning. The legacy `source_breast_ratio` exact-planning option remains available, along with mass-only, all-window, finding-image, and general positive-ratio modes. |
 | Train/val/test target mass-positive crop ratio | `square_crops.<split>_positive_fraction` and related fields | Target positive fraction for deterministic sampling or random crop requests. |
 | BBox-safe export parameters | `square_crops.bbox_safe_*` | Reuses the crop-preview bbox-safe controls for export. |
 | Show simple timing breakdown during export | `runtime.simple_profiler_enabled` | Enables coarse timing buckets during export. |
 | Profiler GUI update frequency | `runtime.simple_profiler_emit_every` | Reduces UI overhead by updating timing every N progress events. |
+| Create exact reproducibility metadata bundle | `reproducibility_bundle.enabled` | Writes exact source membership, crop export order and coordinates, annotations, output paths, resolved settings, seeds, provenance, and an exporter source snapshot under `reproducibility/`. Enabled by default in Default Research Dataset v1. |
+| Write SHA-256 checksums for reproducibility metadata | `reproducibility_bundle.write_metadata_sha256` | Hashes the compact replay-bundle files. Whole DICOM/PNG hashing is separately configurable and off by default to avoid another large disk pass. |
+
+## Lazy Crop Manifests
+
+| GUI label | Resolved lazy-crop key | Meaning |
+|---|---|---|
+| Dataset root or square_crops folder | `paths.dataset_root` | Existing paired whole-image export whose CSV dimensions, paths, and source Mass boxes are reused. |
+| Window size / Stride | `geometry.window_size`, `geometry.stride` | Regular padded virtual-crop grid. Default Research Dataset v1 uses 1024 and 128. |
+| Minimum visible Mass-box fraction | `annotations.min_box_visibility` | Retains a clipped crop-local label when intersection area divided by source-box area reaches this value. |
+| Train minimum source extent | `filters.min_source_extent_fraction_by_split.train` | Strict geometry-only in-bounds-source threshold for empty train windows; default 0.10. |
+| Validation/test minimum source extent | `filters.min_source_extent_fraction_by_split.val/test` | Strict geometry-only threshold for evaluation windows; default 0.05. |
+| Keep eligible Mass-positive windows below threshold | `filters.preserve_positive_windows_below_threshold` | Prevents the metadata-only edge/background proxy from removing an eligible positive window. |
+| Target Mass-positive crop fraction | `sampling.train_positive_fraction` | Keeps all eligible positive train windows and samples the required empty count without replacement. |
+| Draw empty train crops only from Mass-negative breasts | `sampling.train_require_mass_negative_breasts` | Reuses saved patient/study-laterality breast status so a locally empty window from a Mass-positive breast is not selected as a training negative. |
+| Sampling seed | `sampling.seed` | Makes negative selection repeatable. |
+| Manifest output folder | `paths.output_root` | Defaults to `lazy_crop_manifests/window<window>_stride<stride>`. |
+| Replace existing known manifest files | `runtime.overwrite` | Atomically replaces only the defined CSV/YAML/JSON/README files; it does not clean unrelated files or source data. |
+
+This tool decodes zero images and writes zero crop images. The source-extent
+filter is explicitly not described as a pixel-derived breast-mask fraction; see
+`docs/LAZY_CROP_MANIFESTS.md` for the complete source, coordinate, annotation,
+sampling, and loader contract.
 
 ## Storage And Export Queue
 

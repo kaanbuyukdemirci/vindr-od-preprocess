@@ -6,6 +6,8 @@ from pprint import pprint
 
 from .export import export_from_config, load_export_config
 from .presets import (
+    DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+    DUAL_WHOLE_PRESET_KEY,
     PAPER_22_IMPROVED_PRESET_KEY,
     PAPER_22_PRESET_KEY,
     PAPER_69_PRESET_KEY,
@@ -45,12 +47,15 @@ def _build_parser(description: str, *, include_preset: bool = True) -> argparse.
                 "paper69",
                 "custom",
                 "simple",
+                "default-research",
+                "simple-crop",
+                "dual-whole",
                 *STUDY_PRESETS.keys(),
             ],
             default=None,
             help=(
                 "Apply a study preset after loading YAML. Clear aliases are paper22, "
-                "custom-paper22, paper69, and custom; paper22-improved and simple remain "
+                "custom-paper22, paper69, custom, and default-research; paper22-improved, simple, simple-crop, and dual-whole remain "
                 "supported for backward compatibility."
             ),
         )
@@ -71,6 +76,9 @@ def run_export_from_config_path(config_path: str | Path, *, preset_key: str | No
             "paper69": PAPER_69_PRESET_KEY,
             "custom": SIMPLE_PRESET_KEY,
             "simple": SIMPLE_PRESET_KEY,
+            "default-research": DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+            "simple-crop": DUAL_WHOLE_PRESET_KEY,
+            "dual-whole": DUAL_WHOLE_PRESET_KEY,
         }
         resolved_key = aliases.get(str(preset_key), str(preset_key))
         cfg = apply_study_preset(cfg, resolved_key)
@@ -91,6 +99,9 @@ def run_visualization_from_config_path(config_path: str | Path, *, preset_key: s
             "paper69": PAPER_69_PRESET_KEY,
             "custom": SIMPLE_PRESET_KEY,
             "simple": SIMPLE_PRESET_KEY,
+            "default-research": DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+            "simple-crop": DUAL_WHOLE_PRESET_KEY,
+            "dual-whole": DUAL_WHOLE_PRESET_KEY,
         }
         resolved_key = aliases.get(str(preset_key), str(preset_key))
         cfg = apply_study_preset(cfg, resolved_key)
