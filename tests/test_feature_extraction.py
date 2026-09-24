@@ -13,6 +13,8 @@ import vindr_mammo.export as export_module
 import vindr_mammo.features as feature_module
 from vindr_mammo.export import (
     _apply_custom_channel_operation_float_preserving,
+    _float_rgb_to_uint8,
+    _make_rgb_image,
     _save_export_images,
     _save_paired_whole_image_for_crop,
 )
@@ -29,10 +31,14 @@ from vindr_mammo.features import (
     default_selected_variants,
     estimate_dataset_channel_stats,
     extract_features_from_config,
+    feature_output_folder,
+    native_resized_variant_input_sizes,
     scan_dataset_image_variants,
 )
 from vindr_mammo.presets import (
     DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+    DEFAULT_RESEARCH_HE_RGB_PRESET_KEY,
+    STUDY_PRESETS,
     apply_study_preset,
 )
 from vindr_mammo.storage import estimate_export_space
@@ -129,6 +135,237 @@ def test_float32_clahe_does_not_call_integer_opencv_interface(monkeypatch) -> No
     assert float(result.max()) <= 1.0
 
 
+@pytest.mark.parametrize("preset_key", list(STUDY_PRESETS))
+def test_every_study_preset_quantizes_only_the_completed_float32_result(
+    preset_key,
+    monkeypatch,
+) -> None:
+    config = apply_study_preset(
+        {"paths": {"data_root": "/data", "output_root": "/exports/custom"}},
+        preset_key,
+    )
+    if export_module.cv2 is not None:
+        monkeypatch.setattr(
+            export_module.cv2,
+            "createCLAHE",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("integer OpenCV CLAHE must not be called")
+            ),
+        )
+        monkeypatch.setattr(
+            export_module.cv2,
+            "equalizeHist",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("integer OpenCV histogram equalization must not be called")
+            ),
+        )
+    generator = np.random.default_rng(31)
+    image = generator.random((32, 32), dtype=np.float32)
+
+    png, png_meta = _make_rgb_image(image, config)
+    processed, float_meta = _make_rgb_image(image, config, return_float=True)
+
+    assert processed.dtype == np.float32
+    assert png.dtype == np.uint8
+    assert np.array_equal(png, _float_rgb_to_uint8(processed))
+    assert png_meta["pipeline_processing_dtype"] == "float32"
+    assert png_meta["pipeline_final_encoding"] == "uint8_png"
+    assert float_meta["pipeline_processing_dtype"] == "float32"
+    assert float_meta["pipeline_final_encoding"] == "float32"
+
+
+@pytest.mark.parametrize(
+    "image_export",
+    [
+        {"rgb_scheme": "grayscale_rgb", "single_window": [0.0, 100.0]},
+        {"rgb_scheme": "equalized_rgb", "single_window": [0.0, 100.0]},
+        {"rgb_scheme": "paper69_mammoclip_uint8"},
+        {"rgb_scheme": "intensity_equalized_gradient"},
+        {"rgb_scheme": "raw_clahe_detail"},
+        {"rgb_scheme": "raw_replicated"},
+        {"rgb_scheme": "raw_clahe_masked_raw"},
+        {"rgb_scheme": "raw_clahe_tophat"},
+        {
+            "rgb_scheme": "custom_channel_pipeline",
+            "custom_channel_pipeline": {
+                channel: {
+                    "source": "current_crop",
+                    "steps": [
+                        {"op": "percentile_normalize", "params": {"percentiles": [0.0, 100.0]}},
+                        {"op": "hist_equalize", "params": {}},
+                    ],
+                }
+                for channel in "RGB"
+            },
+        },
+        {"rgb_scheme": "bitpack16"},
+        {
+            "rgb_scheme": "multi_window",
+            "multi_window_percentiles": [[0.0, 100.0], [1.0, 99.0], [2.0, 98.0]],
+        },
+    ],
+    ids=lambda config: config["rgb_scheme"],
+)
+def test_every_rgb_scheme_quantizes_only_after_its_float32_recipe(image_export) -> None:
+    generator = np.random.default_rng(43)
+    image = generator.random((32, 32), dtype=np.float32)
+    config = {
+        "image_export": image_export,
+        "histogram_equalization": {"enabled": False},
+        "preserved_16bit": {"percentile_range": [0.0, 100.0]},
+    }
+
+    png, png_meta = _make_rgb_image(image, config)
+    processed, float_meta = _make_rgb_image(image, config, return_float=True)
+
+    assert processed.dtype == np.float32
+    assert png.dtype == np.uint8
+    assert np.array_equal(png, _float_rgb_to_uint8(processed))
+    assert png_meta["pipeline_processing_dtype"] == "float32"
+    assert float_meta["pipeline_processing_dtype"] == "float32"
+
+
+@pytest.mark.parametrize(
+    ("operation", "params"),
+    [
+        ("percentile_normalize", {"percentiles": [0.0, 100.0]}),
+        ("percentile_clip_only", {"percentiles": [1.0, 99.0]}),
+        ("zscore_clip", {"z_limit": 3.0}),
+        ("standardize_to_target", {"target_mean": 0.5, "target_std": 0.2}),
+        ("aggressive_upper_percentile_normalize", {"percentiles": [70.0, 100.0]}),
+        ("hist_equalize", {}),
+        ("clahe", {"clip_limit": 2.0, "tile_grid_size": 4}),
+        ("mask_outside_breast", {}),
+        ("artifact_cleanup", {}),
+        ("gaussian_blur", {"ksize": 3, "sigma": 1.0}),
+        ("median_blur", {"ksize": 3}),
+        ("bilateral_filter", {"diameter": 3, "sigma_color": 0.05, "sigma_space": 3.0}),
+        ("wiener_filter", {"ksize": 3}),
+        ("local_detail", {"sigma": 1.0}),
+        ("sharpen", {"amount": 0.5}),
+        ("unsharp_mask", {"amount": 0.5, "sigma": 1.0}),
+        ("sobel_gradient", {"ksize": 3}),
+        ("laplacian", {"ksize": 3}),
+        ("white_tophat", {"kernel_size": 3}),
+        ("blackhat", {"kernel_size": 3}),
+        ("morphological_open", {"kernel_size": 3}),
+        ("morphological_close", {"kernel_size": 3}),
+        ("pectoral_suppression", {}),
+        ("gamma", {"gamma": 1.2}),
+        ("log", {"gain": 5.0}),
+        ("invert", {}),
+    ],
+)
+def test_every_custom_operation_accepts_and_returns_float32_without_quantizing(
+    operation,
+    params,
+    monkeypatch,
+) -> None:
+    generator = np.random.default_rng(47)
+    image = generator.random((32, 32), dtype=np.float32)
+    mask = np.ones(image.shape, dtype=bool)
+    monkeypatch.setattr(
+        export_module,
+        "_float_to_uint8_custom",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("intermediate uint8 conversion is forbidden")
+        ),
+    )
+    if export_module.cv2 is not None:
+        monkeypatch.setattr(
+            export_module.cv2,
+            "createCLAHE",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("integer OpenCV CLAHE must not be called")
+            ),
+        )
+
+    result = _apply_custom_channel_operation_float_preserving(
+        image,
+        operation,
+        params,
+        mask,
+    )
+
+    assert result.dtype == np.float32
+    assert result.shape == image.shape
+    assert np.isfinite(result).all()
+
+
+def test_default_research_clahe_is_float32_before_png_encoding(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config = apply_study_preset(
+        {"paths": {"data_root": "/data", "output_root": "/exports/custom"}},
+        DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+    )
+    if export_module.cv2 is not None:
+        monkeypatch.setattr(
+            export_module.cv2,
+            "createCLAHE",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("research v2 must not use integer OpenCV CLAHE")
+            ),
+        )
+    generator = torch.Generator().manual_seed(23)
+    image = torch.rand((1, 64, 64), generator=generator, dtype=torch.float32)
+
+    info = _save_export_images(
+        image,
+        tmp_path,
+        tmp_path.joinpath("images/train/research-v2.png").relative_to(tmp_path),
+        config,
+        float32_variant="resized_whole",
+    )
+
+    saved = torch.load(tmp_path / info["float32_image_path"], map_location="cpu")
+    png = np.asarray(Image.open(tmp_path / info["image_path"]))
+    quantized_float = (
+        torch.round(saved.permute(1, 2, 0).clip(0.0, 1.0) * 255.0)
+        .to(torch.uint8)
+        .numpy()
+    )
+
+    assert saved.dtype == torch.float32
+    assert torch.unique(saved[0]).numel() > 256
+    assert np.array_equal(png, quantized_float)
+    assert info["custom_channel_pipeline_processing_dtype"] == "float32"
+
+
+def test_he_rgb_png_is_quantized_only_after_float32_histogram_equalization(
+    tmp_path,
+) -> None:
+    config = apply_study_preset(
+        {"paths": {"data_root": "/data", "output_root": "/exports/custom"}},
+        DEFAULT_RESEARCH_HE_RGB_PRESET_KEY,
+    )
+    generator = torch.Generator().manual_seed(29)
+    image = torch.rand((1, 64, 64), generator=generator, dtype=torch.float32)
+
+    info = _save_export_images(
+        image,
+        tmp_path,
+        tmp_path.joinpath("images/train/he-rgb.png").relative_to(tmp_path),
+        config,
+        float32_variant="resized_whole",
+    )
+
+    saved = torch.load(tmp_path / info["float32_image_path"], map_location="cpu")
+    png = np.asarray(Image.open(tmp_path / info["image_path"]))
+    quantized_float = (
+        torch.round(saved.permute(1, 2, 0).clip(0.0, 1.0) * 255.0)
+        .to(torch.uint8)
+        .numpy()
+    )
+
+    assert saved.dtype == torch.float32
+    assert torch.unique(saved[0]).numel() > 256
+    assert np.array_equal(png, quantized_float)
+    assert info["custom_channel_pipeline_processing_dtype"] == "float32"
+    assert info["custom_channel_pipeline_final_encoding"] == "uint8_png"
+
+
 def test_paired_whole_float32_paths_mirror_png_variants(tmp_path) -> None:
     image = torch.linspace(0.0, 1.0, 24, dtype=torch.float32).reshape(1, 4, 6)
     paired = {
@@ -162,6 +399,57 @@ def test_paired_whole_float32_paths_mirror_png_variants(tmp_path) -> None:
     assert resized.shape == (3, 16, 16)
     assert (tmp_path / info["paired_whole_original_image_path"]).exists()
     assert (tmp_path / info["paired_whole_image_path"]).exists()
+
+
+def test_float32_pipeline_quantizes_paired_whole_pngs_only_after_resize(tmp_path) -> None:
+    config = _pipeline_config()
+    config["image_export"]["custom_channel_pipeline_dtype"] = "float32"
+    for channel in "RGB":
+        config["image_export"]["custom_channel_pipeline"][channel]["steps"] = [
+            {
+                "op": "percentile_normalize",
+                "params": {"percentiles": [0.0, 100.0]},
+            },
+            {"op": "hist_equalize", "params": {}},
+        ]
+    generator = torch.Generator().manual_seed(41)
+    image = torch.rand((1, 24, 40), generator=generator, dtype=torch.float32)
+    info = _save_paired_whole_image_for_crop(
+        source_image=image,
+        crop_root=tmp_path,
+        split_name="train",
+        filename="study__image__crop__x0_0_y0_0.png",
+        source_image_id="image",
+        config=config,
+        paired_cfg={
+            "enabled": True,
+            "save_original": True,
+            "save_resized": True,
+            "save_high_resolution": False,
+            "target_width": 32,
+            "target_height": 32,
+            "resized_canvas_mode": "per_image_square",
+            "pad_value": 0.0,
+            "pad_anchor": "left_top",
+        },
+        source_path_cache={},
+    )
+
+    for png_key, float_key in [
+        (
+            "paired_whole_original_image_path",
+            "paired_whole_original_float32_image_path",
+        ),
+        ("paired_whole_image_path", "paired_whole_float32_image_path"),
+    ]:
+        png = np.asarray(Image.open(tmp_path / info[png_key]))
+        saved = torch.load(tmp_path / info[float_key], map_location="cpu")
+        quantized_float = (
+            torch.round(saved.permute(1, 2, 0).clip(0.0, 1.0) * 255.0)
+            .to(torch.uint8)
+            .numpy()
+        )
+        assert np.array_equal(png, quantized_float)
 
 
 def test_float32_variant_selection_skips_original_and_keeps_resized(tmp_path) -> None:
@@ -265,10 +553,27 @@ def test_grouped_dataset_scan_exposes_each_resized_resolution(tmp_path) -> None:
         "resized_whole_640x640",
     }
     assert default_selected_variants(scan) == [
-        "resized_whole_1024x1024",
         "resized_whole_640x640",
+        "resized_whole_1024x1024",
     ]
     assert scan["variants"]["resized_whole_640x640"]["float32_count"] == 1
+
+
+def test_he_rgb_variant_is_detected_as_default_research_dataset(tmp_path) -> None:
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({
+            "config_snapshot": {
+                "study_preset_provenance": {
+                    "preset_key": DEFAULT_RESEARCH_HE_RGB_PRESET_KEY
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    scan = scan_dataset_image_variants(tmp_path)
+
+    assert scan["is_default_research_dataset"] is True
 
 
 def test_research_preset_enables_lossless_float32_image_export() -> None:
@@ -433,6 +738,87 @@ def test_feature_extractor_prefers_float_and_warns_on_png_fallback(tmp_path) -> 
     assert lossless["features"]["cls_token"].shape == (8,)
     assert (extraction_root / "README.md").exists()
     assert (extraction_root / "features_manifest.jsonl").exists()
+
+
+def test_feature_extractor_processes_640_and_1024_variants_at_native_sizes_in_one_run(
+    tmp_path,
+) -> None:
+    variants = {
+        "resized_whole_640x640": 16,
+        "resized_whole_1024x1024": 32,
+    }
+    for variant, size in variants.items():
+        resolution = variant.removeprefix("resized_whole_")
+        image_path = tmp_path / "images" / "resized" / resolution / "train" / "sample.png"
+        float_path = (
+            tmp_path
+            / "images"
+            / "float32"
+            / "resized"
+            / resolution
+            / "train"
+            / "sample.pt"
+        )
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        float_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(np.zeros((size, size, 3), dtype=np.uint8)).save(image_path)
+        torch.save(torch.rand((3, size, size), dtype=torch.float32), float_path)
+
+    config = {
+        "paths": {"dataset_root": str(tmp_path)},
+        "variants": list(variants),
+        "splits": ["all"],
+        "model": {
+            "model_id": "facebook/dinov3-vits16-pretrain-lvd1689m",
+            "device": "cpu",
+            "compute_dtype": "float32",
+        },
+        "input": {
+            "resize_mode": "exact",
+            "width": 32,
+            "height": 32,
+            "variant_input_sizes": {
+                "resized_whole_640x640": {"width": 16, "height": 16},
+                "resized_whole_1024x1024": {"width": 32, "height": 32},
+            },
+            "mean": "0.485,0.456,0.406",
+            "std": "0.229,0.224,0.225",
+        },
+        "extraction": {
+            "layer": -1,
+            "outputs": ["patch_tokens", "cls_token"],
+            "batch_size": 2,
+            "save_dtype": "float32",
+            "prefer_float32_sources": True,
+            "overwrite": False,
+        },
+    }
+
+    summary = extract_features_from_config(
+        config,
+        model_loader=lambda _cfg, _device: _FakeDino(),
+    )
+    output_root = feature_output_folder(config)
+    small = torch.load(output_root / "resized_whole_640x640" / "train" / "sample.pt")
+    large = torch.load(output_root / "resized_whole_1024x1024" / "train" / "sample.pt")
+
+    assert summary["requested_images"] == 2
+    assert summary["saved_features"] == 2
+    assert summary["png_fallback_count"] == 0
+    assert "multires-16x16-32x32" in output_root.name
+    assert small["input"]["shape_chw"] == [3, 16, 16]
+    assert large["input"]["shape_chw"] == [3, 32, 32]
+    assert small["features"]["patch_tokens"].shape == (8, 1, 1)
+    assert large["features"]["patch_tokens"].shape == (8, 2, 2)
+
+
+def test_native_resized_variant_sizes_are_inferred_for_both_research_branches() -> None:
+    assert native_resized_variant_input_sizes(
+        ["resized_whole_640x640", "resized_whole_1024x1024", "original_whole"]
+    ) == {
+        "resized_whole_640x640": {"width": 640, "height": 640},
+        "resized_whole_1024x1024": {"width": 1024, "height": 1024},
+    }
 
 
 def test_high_accuracy_feature_defaults_target_research_dataset(tmp_path) -> None:

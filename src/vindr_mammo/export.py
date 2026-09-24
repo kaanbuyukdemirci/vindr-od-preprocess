@@ -4529,24 +4529,7 @@ def _save_paired_whole_image_for_crop(
         nonlocal whole_rgb
         if whole_rgb is not None:
             return whole_rgb
-        full_arr = _tensor_to_float2d(source_image)
-        src_h, src_w = full_arr.shape
-        whole_rgb, _encoding_meta = _make_rgb_image(
-            full_arr,
-            config,
-            source_arrays={"current_crop": full_arr},
-            full_source_arrays={"current_crop": full_arr},
-            full_source_masks=(
-                {"current_crop": np.asarray(source_foreground_mask, dtype=bool)}
-                if source_foreground_mask is not None
-                else None
-            ),
-            crop_window=(0, 0, int(src_w), int(src_h)),
-            crop_pad_value=float(paired_cfg.get("pad_value", 0.0)),
-            whole_stage_cache=whole_stage_cache,
-            cache_namespace=cache_namespace,
-            return_float=False,
-        )
+        whole_rgb = _float_rgb_to_uint8(encoded_whole_float())
         return whole_rgb
 
     def save_variant(
@@ -4574,6 +4557,18 @@ def _save_paired_whole_image_for_crop(
         Image.fromarray(make_pixels(), mode="RGB").save(out_path)
         source_path_cache[source_key] = out_path
         return "written"
+
+    def resized_png(current_cfg: dict[str, Any]) -> np.ndarray:
+        resized_float, _geometry = _pad_then_resize_float_rgb(
+            encoded_whole_float(), current_cfg
+        )
+        return _float_rgb_to_uint8(resized_float)
+
+    def high_resolution_png(current_cfg: dict[str, Any]) -> np.ndarray:
+        padded_float, _geometry = _pad_float_rgb_to_canvas(
+            encoded_whole_float(), current_cfg
+        )
+        return _float_rgb_to_uint8(padded_float)
 
     def save_float_variant(
         *,
@@ -4723,9 +4718,7 @@ def _save_paired_whole_image_for_crop(
             resized_write_status = save_variant(
                 rel_path=resized_rel_path,
                 variant=variant_id,
-                make_pixels=lambda current_cfg=resized_cfg: _pad_then_resize_rgb(
-                    encoded_whole_rgb(), current_cfg
-                )[0],
+                make_pixels=lambda current_cfg=resized_cfg: resized_png(current_cfg),
             )
             resized_float_path = ""
             resized_float_status = "disabled"
@@ -4847,7 +4840,7 @@ def _save_paired_whole_image_for_crop(
         high_write_status = save_variant(
             rel_path=high_rel_path,
             variant="high_resolution",
-            make_pixels=lambda: _pad_rgb_to_canvas(encoded_whole_rgb(), high_cfg)[0],
+            make_pixels=lambda: high_resolution_png(high_cfg),
         )
         high_float_path = ""
         high_float_status = "disabled"
@@ -5157,7 +5150,7 @@ def _save_export_images(
     train_path.parent.mkdir(parents=True, exist_ok=True)
 
     arr = _tensor_to_float2d(image)
-    rgb, rgb_meta = _make_rgb_image(
+    processed_float, float_meta = _make_rgb_image(
         arr,
         config,
         source_arrays=source_arrays,
@@ -5168,26 +5161,15 @@ def _save_export_images(
         crop_pad_value=crop_pad_value,
         whole_stage_cache=whole_stage_cache,
         cache_namespace=cache_namespace,
-        return_float=False,
+        return_float=True,
     )
-    rgb = np.asarray(rgb, dtype=np.uint8)
-    if save_float32:
-        rgb_float, _float_meta = _make_rgb_image(
-            arr,
-            config,
-            source_arrays=source_arrays,
-            full_source_arrays=full_source_arrays,
-            full_source_masks=full_source_masks,
-            source_windows=source_windows,
-            crop_window=crop_window,
-            crop_pad_value=crop_pad_value,
-            whole_stage_cache=whole_stage_cache,
-            cache_namespace=f"{cache_namespace}:float32",
-            return_float=True,
-        )
-        rgb_float = np.asarray(rgb_float, dtype=np.float32)
-    else:
-        rgb_float = None
+    processed_float = np.asarray(processed_float, dtype=np.float32)
+    rgb = _float_rgb_to_uint8(processed_float)
+    rgb_meta = dict(float_meta)
+    rgb_meta["pipeline_final_encoding"] = "uint8_png"
+    if "custom_channel_pipeline_final_encoding" in rgb_meta:
+        rgb_meta["custom_channel_pipeline_final_encoding"] = "uint8_png"
+    rgb_float = processed_float if save_float32 else None
     output_signal_fraction = float(np.any(rgb != 0, axis=-1).mean())
     if bool(reject_blank_output) and output_signal_fraction < max(
         float(min_output_signal_fraction),
@@ -5217,7 +5199,7 @@ def _save_export_images(
         **rgb_meta,
     }
 
-    if rgb_float is not None:
+    if save_float32 and rgb_float is not None:
         float_rel = Path("float32") / rel_img_path.with_suffix(".pt")
         float_path = root / float_rel
         _save_float32_rgb_tensor(rgb_float, float_path)
@@ -5270,9 +5252,31 @@ def _make_rgb_image(
 
     Recommended default: ``multi_window``. It creates three visually meaningful
     mammography contrast windows instead of duplicating one grayscale window.
-    With ``return_float=True``, the returned HWC array is float32 in [0, 1]
-    before the final PNG encoding quantization.
+    Every preprocessing recipe is evaluated as float32. With
+    ``return_float=False``, the completed float32 result is quantized exactly
+    once for final PNG encoding.
     """
+    if not return_float:
+        float_rgb, float_meta = _make_rgb_image(
+            arr,
+            config,
+            source_arrays=source_arrays,
+            full_source_arrays=full_source_arrays,
+            full_source_masks=full_source_masks,
+            source_windows=source_windows,
+            crop_window=crop_window,
+            crop_pad_value=crop_pad_value,
+            whole_stage_cache=whole_stage_cache,
+            cache_namespace=cache_namespace,
+            return_float=True,
+        )
+        meta = dict(float_meta)
+        meta["pipeline_processing_dtype"] = "float32"
+        meta["pipeline_final_encoding"] = "uint8_png"
+        if "custom_channel_pipeline_final_encoding" in meta:
+            meta["custom_channel_pipeline_final_encoding"] = "uint8_png"
+        return _float_rgb_to_uint8(float_rgb), meta
+
     img_cfg = config.get("image_export", {})
     eq_cfg = config.get("histogram_equalization", {})
     scheme = str(img_cfg.get("rgb_scheme", "multi_window")).casefold().strip()
@@ -5421,6 +5425,8 @@ def _make_rgb_image(
             rgb = np.stack(channels, axis=-1).astype(np.float32, copy=False) / 255.0
     else:
         rgb = np.stack(channels, axis=-1).astype(np.uint8, copy=False)
+    meta["pipeline_processing_dtype"] = "float32"
+    meta["pipeline_final_encoding"] = "float32"
     return rgb, meta
 
 
@@ -5564,10 +5570,17 @@ def _make_custom_channel_pipeline_rgb(
     fixed-preprocessed grayscale crop and applies its own ordered operation list.
     """
     pipeline = img_cfg.get("custom_channel_pipeline", {}) or {}
+    use_float_operations = True
     channels: list[np.ndarray] = []
     meta: dict[str, Any] = {
         "rgb_scheme": "custom_channel_pipeline",
         "custom_channel_pipeline": pipeline,
+        "custom_channel_pipeline_processing_dtype": (
+            "float32" if use_float_operations else "legacy_mixed"
+        ),
+        "custom_channel_pipeline_final_encoding": (
+            "float32" if return_float else "uint8_png"
+        ),
         "rgb_channel_0": "custom_R_pipeline",
         "rgb_channel_1": "custom_G_pipeline",
         "rgb_channel_2": "custom_B_pipeline",
@@ -5610,7 +5623,7 @@ def _make_custom_channel_pipeline_rgb(
                 _apply_custom_channel_operation_float_preserving(
                     work_arr, op, params, work_mask
                 )
-                if return_float
+                if use_float_operations
                 else _apply_custom_channel_operation(
                     work_arr, op, params, work_mask
                 )
@@ -5666,15 +5679,13 @@ def _apply_custom_channel_operation(
         lo, hi = _safe_percentile(arr, params.get("percentiles", [70.0, 100.0]), mask)
         return ((np.clip(arr, lo, hi) - lo) / max(hi - lo, 1e-12)).astype(np.float32)
     if op == "hist_equalize":
-        return _equalize_uint8(_float_to_uint8_custom(arr), mask=mask, params=params).astype(np.float32) / 255.0
+        return _apply_custom_channel_operation_float_preserving(
+            arr, op, params, mask
+        )
     if op == "clahe":
-        img = _float_to_uint8_custom(arr)
-        if cv2 is None:
-            return _equalize_uint8(img, mask=mask, params=params).astype(np.float32) / 255.0
-        clip_limit = float(params.get("clip_limit", 2.0))
-        tile = int(params.get("tile_grid_size", 8))
-        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile, tile))
-        return clahe.apply(img).astype(np.float32) / 255.0
+        return _apply_custom_channel_operation_float_preserving(
+            arr, op, params, mask
+        )
     if op in {"mask_outside_breast", "artifact_cleanup"}:
         if mask is None or mask.shape != arr.shape:
             mask = _foreground_mask(arr)
@@ -5693,7 +5704,7 @@ def _apply_custom_channel_operation(
             return scipy_ndimage.median_filter(arr.astype(np.float32), size=k).astype(np.float32)
         if cv2 is None:
             return arr
-        return cv2.medianBlur(_float_to_uint8_custom(arr), k).astype(np.float32) / 255.0
+        return cv2.medianBlur(arr.astype(np.float32), k).astype(np.float32)
     if op == "bilateral_filter":
         if cv2 is None:
             sigma = float(params.get("sigma_space", 5.0))
@@ -9663,7 +9674,7 @@ Whole images are padded before any optional resize, so the mammogram aspect rati
 - Selected image types: `{', '.join(float32_selected_variants) or 'none'}`.
 - Each tensor is saved with `torch.save` as contiguous `torch.float32` in CHW layout and normalized to the closed interval `[0, 1]`.
 - Tensor paths mirror PNG paths under the nearest `float32/` directory and use the same stem, for example `{float_example}`.
-- The float32 branch does not convert image pixels through uint8 or uint16. Preprocessing operations such as percentile clipping or CLAHE remain intentional image transforms, but they run directly on floating-point values; only the separate PNG branch is quantized to 0–255.
+- Every image-export recipe is evaluated once in float32. Preprocessing operations such as percentile clipping, histogram equalization, CLAHE, padding, and resizing do not convert the image through uint8 or uint16. The tensor stores that result directly; the matching PNG is derived from the same result and quantized to 0–255 only at final encoding.
 - The Feature Extraction window prefers these tensors automatically and warns before falling back to PNG.
 
 Each source mammogram is written exactly once in each enabled whole-image resolution. All crops from that mammogram share the same `paired_whole_image` path and, when enabled, the same `paired_whole_high_resolution_image` path. No hard links or copied aliases are created.

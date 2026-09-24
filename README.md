@@ -124,21 +124,24 @@ vindr-mammo-streamlit-gui --config config/export_config.yaml
 Save Data has a global float32 switch plus a separate image-type checklist for
 crops, resized wholes, original-size wholes, high-resolution wholes, and
 baseline wholes. The files are contiguous CHW `torch.float32` tensors
-normalized to `[0, 1]` and mirror PNG stems under `float32/`. Their preprocessing
-branch never converts pixels through uint8 or uint16; only the independent PNG
-branch is quantized to 0–255. The Default Research Dataset preset enables
+normalized to `[0, 1]` and mirror PNG stems under `float32/`. Every image-export
+recipe is evaluated in float32 once. The tensor stores that result directly;
+the matching PNG is derived from the same result and quantized to 0–255 only at
+the final encoder boundary. The Default Research Dataset preset enables
 float32 for crops and resized wholes only.
 
 The Feature Extraction window scans an already exported dataset, detects every
 available crop/whole-image type, and extracts frozen pretrained DINOv3 features.
-It opens on `/mnt/t9/vindr-data/preprocessed-vindr-default-research-dataset-v1`
-by default and selects its 1024 crops and resized 1024 whole images while
-leaving variable-size original wholes unselected. The high-accuracy defaults
-are DINOv3 ViT-L/16, 1024 x 1024 input, batch size 1, and float32 model compute,
-source tensors, and saved features. It prefers the float32 images and displays a
-warning/count when it must fall back to PNG. Feature files retain the source
-split and stem, and each feature folder includes a JSONL source index, resolved
-YAML, summary, and README.
+It opens on `/mnt/t9/vindr-data/preprocessed-vindr-default-research-dataset-v2`
+by default. The Default Research Dataset preset exposes explicit 640×640 and
+1024×1024 checkboxes and selects both. One extraction run keeps each branch at
+its native resolution, producing 40×40 and 64×64 patch-token maps in separate
+variant subfolders while leaving variable-size original wholes unselected. The
+high-accuracy defaults are DINOv3 ViT-L/16, batch size 1, and float32 model
+compute, source tensors, and saved features. It prefers the float32 images and
+displays a warning/count when it must fall back to PNG. Feature files retain the
+source split and stem, and each feature folder includes a JSONL source index,
+resolved YAML, summary, and README.
 
 The float32 mammograms stay in `[0,1]` and use identical R/G/B copies of the
 grayscale signal. Frozen LVD-1689M DINOv3 extraction then applies the checkpoint's
@@ -1412,11 +1415,14 @@ Three additional presets are available:
   filter. It uses exact-grid zero-padded `1024` crops at stride `512` and writes
   one pad-then-resize `1024` whole-image asset per source mammogram. Every crop
   from that source references the same asset.
-- **Default Research Dataset (v1)** (`default-research`; compatibility aliases
+- **Default Research Dataset (v2)** (`default-research`; compatibility aliases
   `simple-crop` and `dual-whole`)
   crops to the breast, masks outside tissue, mirrors right breasts
   to a canonical orientation, applies per-image percentile normalization at
   `0.5-99.5` and whole-image CLAHE, and replicates the same signal into R/G/B.
+  The intensity pipeline, CLAHE, padding, and resizing run in float32 for both
+  output branches; PNG is quantized to 0–255 only after preprocessing, while
+  the saved float32 tensors remain unquantized.
   A clipped Mass annotation is included in saved YOLO/COCO labels when at least
   5% of its original area is visible in the square crop. The similarly named
   positive-crop threshold in the GUI is explicitly preview-only.
@@ -1437,11 +1443,24 @@ Three additional presets are available:
   counts for the 1024×1024 crop. This fit check intentionally ignores box and
   crop locations: a Mass can fit when its width and height are both at most
   1024 pixels.
+- **Default Research Dataset (v2) — HE+RGB** (`default-research-he-rgb`) keeps
+  the v2 source membership, breast geometry, annotations, original-size whole,
+  independently letterboxed `1024×1024` and `640×640` whole-image variants,
+  float32 outputs, and lazy window grids unchanged. It replaces the v2
+  `0.5–99.5` normalization and CLAHE recipe: DICOM-loader normalization is
+  disabled, so all channels genuinely start with whole-image `0–100` percentile
+  normalization and histogram equalization; R stops there, G adds `50–100`
+  percentile normalization, and B adds `75–100` percentile normalization. All
+  operations run in float32; the PNG branch is quantized to 0–255 only after
+  preprocessing is complete, while the float32 tensors remain unquantized. Its
+  output folder is
+  `preprocessed-vindr-default-research-dataset-v2-he-rgb`.
 
 ```bash
 vindr-mammo-export --config config/export_config.yaml --preset paper69
 vindr-mammo-export --config config/export_config.yaml --preset simple
 vindr-mammo-export --config config/export_config.yaml --preset default-research
+vindr-mammo-export --config config/export_config.yaml --preset default-research-he-rgb
 ```
 
 Every successful export now writes `<output_root>/README.md`. It describes the

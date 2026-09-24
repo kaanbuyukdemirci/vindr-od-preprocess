@@ -1,0 +1,230 @@
+\section{Dataset}
+\label{sec:dataset}
+
+\subsection{Source Cohort and Annotation Protocol}
+\label{sec:dataset_source}
+
+We use VinDr-Mammo version 1.0.0, a credentialed open-access collection of
+full-field digital mammography distributed through PhysioNet
+\cite{nguyen2023vindr,pham2022vindrphysionet}.  The release contains 5,000
+examinations and 20,000 DICOM images.  Each examination comprises the standard
+left and right craniocaudal (CC) and mediolateral oblique (MLO) views.  Images
+were acquired retrospectively at Hospital 108 and Hanoi Medical University
+Hospital in Vietnam between 2018 and 2020.  Random sampling from the two
+hospitals' archives yielded a mixture of screening and diagnostic examinations
+acquired on Siemens, IMS, and Planmed systems.  Source image heights and widths
+vary substantially, with dataset-wide maxima of 3,580 and 2,812 pixels,
+respectively.  Thus, the common practice of forcing a mammogram into a
+$640\!\times\!640$ square would retain only about one-fifth of the samples
+along each axis and change the image aspect ratio before feature extraction.
+
+Every examination was independently interpreted by two radiologists with at
+least ten years of experience; disagreements were resolved by a third reader.
+The release provides breast-level density and BI-RADS assessment as well as
+lesion-level bounding boxes.  Finding labels include mass, calcification,
+asymmetry subtypes, architectural distortion, suspicious lymph node, and
+associated skin or nipple changes.  Boxes were drawn for findings assessed as
+BI-RADS 3--5; BI-RADS 2 findings were intentionally not localized.  The
+annotation file contains 1,226 mass boxes on 1,113 distinct mammograms.  We use
+these boxes as radiologist-defined localization targets, not as
+pathology-confirmed cancer labels: the release does not include biopsy results
+and should not be interpreted as a direct cancer-diagnosis endpoint
+\cite{nguyen2023vindr}.
+
+\subsection{Task Definition and Partitions}
+\label{sec:dataset_task}
+
+Our endpoint is class-agnostic mass localization.  We retain a finding when
+\texttt{Mass} occurs in its released category list and map every retained box
+to a single detector class.  A mammogram without a retained mass is therefore
+mass-negative even when it contains another annotated finding.  Unlike the
+positive-heavy subsets reviewed in Sec.~\ref{sec:background_vindr_models}, we
+retain all 20,000 mammograms.  This preserves the original prevalence of normal
+and non-mass images and makes false-positive performance part of the task.
+
+VinDr-Mammo supplies an official examination-level partition of 4,000 training
+examinations and 1,000 test examinations, created to preserve breast-level
+assessment, density, and finding distributions \cite{nguyen2023vindr}.  We
+leave its 1,000-examination test set untouched.  For checkpoint selection, we
+reserve 15\% of the official training examinations as validation using seed
+123.  Sampling is stratified by the sorted set of breast-level BI-RADS values
+present among the four views of each examination; all four views then inherit
+the same assignment.  The resulting identifiers are persisted and reused for
+every resolution.  This protocol connects directly to the comparability issue
+identified in Sec.~\ref{sec:background_vindr_models}: neither correlated views,
+negative-case policy, nor test membership changes between experiments.
+
+\begin{table}[t]
+\centering
+\caption{Analysis cohort after selecting Mass annotations. A mass-negative
+image may contain a different VinDr finding.}
+\label{tab:dataset_split_counts}
+\scriptsize
+\setlength{\tabcolsep}{3.2pt}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Split & Exams & Images & Mass-neg. & Mass-pos. & Boxes \\
+\midrule
+Train & 3,400 & 13,600 & 12,857 & 743 & 829 \\
+Validation & 600 & 2,400 & 2,249 & 151 & 160 \\
+Test & 1,000 & 4,000 & 3,781 & 219 & 237 \\
+\midrule
+Total & 5,000 & 20,000 & 18,887 & 1,113 & 1,226 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{DICOM Conversion and Breast Standardization}
+\label{sec:dataset_preprocessing}
+
+We materialize the cohort with our Default Research Dataset v2 pipeline,
+summarized in Fig.~\ref{fig:dataset_pipeline}.  DICOM pixels are decoded with
+pydicom 3.0.2.  The modality LUT and, when available, the DICOM VOI LUT or
+window are applied in that order; VOI processing is non-strict, so a malformed
+or absent optional transform falls back to the modality-corrected pixels and is
+recorded in the export metadata.  A \texttt{MONOCHROME1} image is then inverted
+to the common bright-tissue-on-black convention.  Finally, values below the
+per-image 0.5th percentile and above the 99.5th percentile are clipped, and the
+remaining interval is mapped linearly to $[0,1]$ in float32.
+
+We next estimate breast tissue with a robust largest-connected-component mask.
+Its automatic threshold is derived from border intensity statistics and the
+image dynamic range; the binary mask is morphologically opened and closed with
+$7\!\times\!7$ and $21\!\times\!21$ elliptical kernels, respectively, reduced
+to its largest component, and hole-filled.  The image is cropped to the mask's
+bounding rectangle with 3\% padding relative to the larger breast dimension,
+bounded to 32--128 pixels.  To prevent a tissue heuristic from deleting ground
+truth, this rectangle and its retained mask are expanded whenever necessary to
+contain every Mass box.  Pixels outside the final mask are set to zero.  Breasts
+whose chest wall is detected on the right are horizontally mirrored, together
+with their boxes and masks, giving a canonical chest-wall-left orientation.
+
+This geometry follows the background evidence that removing excess air and
+artifacts can increase effective lesion scale without using an unavailable
+lesion-centred oracle crop \cite{ozic2023scenarios}.  In contrast to the earlier
+draft, v2 also applies CLAHE: after breast cropping, masking, and mirroring, a
+float32, mask-aware CLAHE transform with clip limit 2.0 and an
+$8\!\times\!8$ tile grid is evaluated once on the complete processed breast.
+The resulting grayscale signal is copied identically into R, G, and B before
+the whole-image and window branches diverge.  Applying the same enhancement to
+all branches holds the photometric recipe fixed while resolution and context
+change.  No global histogram equalization, median or bilateral denoising,
+geometric augmentation, or hard-negative mining is performed during image
+materialization.  PNGs are quantized to 8-bit only at final encoding; the
+compact PyTorch tensors retain the unquantized three-channel CHW float32 signal
+in $[0,1]$.
+
+\begin{figure}[t]
+\centering
+\setlength{\fboxsep}{5pt}
+\fbox{\parbox{0.94\linewidth}{\centering\small
+DICOM $\rightarrow$ modality/VOI processing $\rightarrow$ polarity correction
+$\rightarrow$ 0.5--99.5 percentile normalization\\[2pt]
+$\downarrow$\\[-1pt]
+breast mask $\rightarrow$ padded breast crop $\rightarrow$ outside-mask zeroing
+$\rightarrow$ canonical mirroring\\[2pt]
+$\downarrow$\\[-1pt]
+whole-breast float32 CLAHE $\rightarrow$ identical R/G/B channels\\[2pt]
+$\downarrow$\\[-1pt]
+original-size whole $+$ 1024/640 compact wholes $+$ source-resolution windows
+}}
+\caption{Default Research Dataset v2 pipeline.  Photometric and breast
+standardization are shared before the data branch into global and local
+representations.}
+\label{fig:dataset_pipeline}
+\end{figure}
+
+\subsection{Multiresolution Whole Images and Virtual Windows}
+\label{sec:dataset_representations}
+
+V2 exports three annotated whole-image representations for every one of the
+20,000 mammograms (Table~\ref{tab:dataset_resolution_ladder}).  The first is the
+fixed-preprocessed breast at its variable, unpadded height and width.  For each
+compact representation, that breast is independently placed at the top-left of
+its own square canvas, with zero padding only on the right or bottom, and the
+complete square is resized to either $1024\!\times\!1024$ or
+$640\!\times\!640$.  OpenCV 4.10.0 area interpolation is used for downsampling
+and linear interpolation if upsampling is required.  Per-image square
+letterboxing preserves the breast aspect ratio and therefore removes the
+geometric warping that is coupled to direct square resizing in many of the
+protocols reviewed in Sec.~\ref{sec:background_resolution}.  The median
+processed-breast long side is 2,728.5 pixels; the corresponding median linear
+scale is 0.375 at 1,024 and 0.235 at 640.  Thus, both variants are lossy, but the
+640 arm deliberately removes substantially more fine spatial evidence.  The two
+compact variants are saved both as RGB PNGs and as float32 tensors; the
+variable-size original is saved as an RGB PNG and provides the
+source-coordinate image for virtual windows.
+
+\begin{table}[t]
+\centering
+\caption{Representations in the Default Research Dataset v2 export.  Windows
+are metadata-only and are extracted from the processed original at load time.}
+\label{tab:dataset_resolution_ladder}
+\scriptsize
+\setlength{\tabcolsep}{3.2pt}
+\begin{tabularx}{\columnwidth}{@{}llXl@{}}
+\toprule
+Representation & Output & Construction & Storage \\
+\midrule
+Processed whole & Variable H$\times$W & No pad or resize & RGB PNG \\
+Compact whole & $1024^2$ & Per-image square, resize & PNG + float32 \\
+Compact whole & $640^2$ & Per-image square, resize & PNG + float32 \\
+Virtual windows & $1024^2$ & Strides 128/256/512 & Metadata \\
+Virtual windows & $640^2$ & Stride 160 & Metadata \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The virtual-window families retain source-resolution processed pixels rather
+than rescaling the entire breast.  Window origins begin at zero and advance on
+a regular grid; a window extending beyond the right or bottom edge is completed
+with zeros rather than shifted back to the boundary.  The default families are
+1,024-pixel windows at strides 128, 256, and 512, and 640-pixel windows at
+stride 160.  Because only their locations, padding, and labels are stored, the
+windows can be extracted on demand without duplicating highly overlapping
+pixels.  This design exposes the scale--context trade-off discussed in
+Sec.~\ref{sec:background_resolution}: compact wholes retain global anatomy but
+shrink lesions, whereas windows retain local sampling density at the cost of
+breast-level context.
+
+For experiments using the optional window manifests, training retains every
+eligible Mass-positive window and samples clean negative windows from breasts
+with no Mass in either view toward a 1:1 positive/negative ratio using seed 123.
+Validation and test retain every eligible grid window and are not balanced.  A
+geometric source-extent filter rejects windows with less than 10\% in-bounds
+source area in training or 5\% in validation/test; it is an edge-padding proxy,
+not a second pixel-derived breast mask.  A positive window bypasses this filter
+so a labeled lesion is not lost.
+
+Mass boxes undergo exactly the same crop and mirror operations as their source
+image.  Whole-image boxes remain in the fixed-preprocessed coordinate system.
+For a compact whole, a coordinate is first translated by its letterbox offset
+and then multiplied by that image's recorded square-to-output scale.  For a
+virtual window, a box is intersected with the window and translated to local
+coordinates; it is retained when at least 5\% of its original area remains
+visible.  The exported manifest records every crop origin, padding amount,
+mirror flag, scale, and source annotation identifier.  Whole-image annotations
+are written in normalized YOLO and COCO form; virtual-window boxes are stored
+in a crop-keyed annotation table for direct loading.  Dataset construction
+performs no cross-window or cross-view box fusion; any such model-side operation
+and its inverse mapping are specified in Sec.~\ref{sec:methods}.
+
+\subsection{Dataset Limitations}
+\label{sec:dataset_limitations}
+
+Four limitations shape the interpretation of the experiments.  First, the
+targets reflect radiologist consensus without pathology, so performance
+measures agreement with localized findings rather than cancer detection.
+Second, BI-RADS 2 findings are not boxed; some apparent false positives may
+therefore correspond to benign findings outside the annotation policy.  Third,
+per-image percentile normalization and CLAHE remove absolute intensity
+comparability, while the heuristic tissue mask, crop, and canonical mirroring
+change the acquisition presentation.  Mass-preserving crop expansion protects
+the labeled targets, but these remain controlled engineering choices rather
+than claims of optimal clinical display processing.  Finally, all examinations
+come from two hospitals in one country, and the vendor mix, density
+distribution, mixture of screening and diagnostic cases, and clinical reading
+protocol may not represent another screening program.  The official held-out
+test set supports reproducible within-dataset comparison, but external
+validation is still required before making claims about cross-site or clinical
+generalization.

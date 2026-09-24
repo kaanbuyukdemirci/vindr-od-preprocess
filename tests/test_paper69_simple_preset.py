@@ -156,7 +156,7 @@ def test_paper69_preset_preserves_full_resolution_and_adds_practical_validation(
     assert config["image"]["use_voi_lut"] is False
     pp = config["preprocess"]
     assert pp["trim_border_px"] == 5
-    assert pp["intensity_scale_before_geometry"] == "minmax_uint8"
+    assert pp["intensity_scale_before_geometry"] == "minmax_0_255_float32"
     assert pp["crop_breast"] is True
     assert pp["crop_padding"] == 0
     assert pp["breast_mask_method"] == "mammo_clip_contiguous_variance"
@@ -235,6 +235,9 @@ def test_paper69_mammoclip_background_crop_updates_boxes() -> None:
     assert tuple(result.image.shape) == (1, 70, 80)
     assert result.info["trim_box_xyxy"] == (5, 5, 115, 95)
     assert result.info["crop_box_xyxy"] == (20, 15, 100, 85)
+    assert result.info["intensity_scale_before_geometry"] == "minmax_0_255_float32"
+    assert result.info["intensity_scale_processing_dtype"] == "float32"
+    assert torch.any(result.image != torch.round(result.image))
     assert torch.equal(result.boxes, torch.tensor([[10.0, 15.0, 30.0, 35.0]]))
     assert result.box_keep.tolist() == [True]
 
@@ -393,7 +396,7 @@ def test_simple_positive_ratio_selection_keeps_all_positives_and_one_negative_ea
     assert all(item[2]["is_clean_negative_window"] == 1 for item in selected_negatives)
 
 
-def test_paper69_rgb_is_exact_replicated_uint8() -> None:
+def test_paper69_rgb_is_replicated_with_final_only_uint8_quantization() -> None:
     arr = np.asarray([[0.0, 1.0], [127.9, 255.0]], dtype=np.float32)
     rgb, meta = _make_rgb_image(
         arr,
@@ -402,7 +405,7 @@ def test_paper69_rgb_is_exact_replicated_uint8() -> None:
             "histogram_equalization": {"enabled": False},
         },
     )
-    assert rgb[..., 0].tolist() == [[0, 1], [127, 255]]
+    assert rgb[..., 0].tolist() == [[0, 1], [128, 255]]
     assert np.array_equal(rgb[..., 0], rgb[..., 1])
     assert np.array_equal(rgb[..., 1], rgb[..., 2])
     assert meta["paper69_mammoclip_uint8_replicated"] is True

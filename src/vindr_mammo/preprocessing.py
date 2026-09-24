@@ -122,22 +122,28 @@ def apply_geometry_preprocessing(
             info["trim_box_xyxy"] = trim_box
 
     intensity_scale = str(opts.get("intensity_scale_before_geometry", "none") or "none").casefold().strip()
-    if intensity_scale in {"minmax_uint8", "uint8_minmax", "mammo_clip_uint8"}:
+    if intensity_scale in {
+        "minmax_0_255_float32",
+        "minmax_uint8",
+        "uint8_minmax",
+        "mammo_clip_uint8",
+    }:
         arr = _image_to_numpy(image)
         finite = arr[np.isfinite(arr)]
         if finite.size:
             lo = float(finite.min())
             hi = float(finite.max())
             if hi > lo:
-                scaled = ((arr - lo) / (hi - lo) * 255.0).astype(np.uint8)
+                scaled = ((arr - lo) / (hi - lo) * 255.0).astype(np.float32)
             else:
-                scaled = np.zeros(arr.shape, dtype=np.uint8)
+                scaled = np.zeros(arr.shape, dtype=np.float32)
         else:
-            scaled = np.zeros(arr.shape, dtype=np.uint8)
+            scaled = np.zeros(arr.shape, dtype=np.float32)
         image = torch.as_tensor(
             np.ascontiguousarray(scaled), dtype=torch.float32, device=image.device
         ).unsqueeze(0)
-        info["intensity_scale_before_geometry"] = "minmax_uint8"
+        info["intensity_scale_before_geometry"] = "minmax_0_255_float32"
+        info["intensity_scale_processing_dtype"] = "float32"
 
     foreground_mask: np.ndarray | None = None
     if opts.get("mask_outside_breast") and not opts["crop_breast"]:
@@ -452,9 +458,9 @@ def _mammo_clip_background_crop_box(arr: np.ndarray) -> tuple[int, int, int, int
     lo = float(src.min())
     hi = float(src.max())
     if hi > lo:
-        img = ((src - lo) / (hi - lo) * 255.0).astype(np.uint8)
+        img = ((src - lo) / (hi - lo) * 255.0).astype(np.float32)
     else:
-        img = np.zeros(src.shape, dtype=np.uint8)
+        img = np.zeros(src.shape, dtype=np.float32)
     detect = np.where(img <= 40, 0, img)
 
     y_a = height // 2 + int(height * 0.4)

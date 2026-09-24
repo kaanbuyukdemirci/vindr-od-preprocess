@@ -69,16 +69,16 @@ Offline image transformation, in order:
    so breast tissue is bright on a dark background.
 2. Remove five pixels from every image edge and translate/clip annotations into
    that coordinate system.
-3. Linearly map the finite per-image minimum and maximum to `[0, 255]`, then
-   convert to unsigned 8-bit values.
+3. Linearly map the finite per-image minimum and maximum to `[0, 255]` in
+   float32. No integer conversion occurs at this stage.
 4. Detect the breast extent with the closest public MammoCLIP-style crop:
    values at or below 40 are background; within the central 80% of image height,
    select the longest contiguous run of nonconstant columns; within the central
    80% of that width, select the longest contiguous run of nonconstant rows.
 5. Crop to those row and column extents with zero additional margin and
    translate/clip boxes again.
-6. Save the native-size cropped breast as an 8-bit RGB PNG by copying the same
-   grayscale values into R, G, and B.
+6. Copy the same float32 grayscale values into R, G, and B, then quantize once
+   when saving the final native-size 8-bit RGB PNG.
 
 There is no offline resize, padding, histogram equalization, tissue masking,
 left/right mirroring, sliding-window crop export, or paired whole-image export

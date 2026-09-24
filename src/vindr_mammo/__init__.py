@@ -1,6 +1,7 @@
 from .export import export_from_config, load_export_config
 from .visualize import create_visualizations_from_export, visualize_export_from_config
 from .presets import (
+    DEFAULT_RESEARCH_HE_RGB_PRESET_KEY,
     DEFAULT_RESEARCH_DATASET_PRESET_KEY,
     DUAL_WHOLE_PRESET_KEY,
     PAPER_22_IMPROVED_PRESET_KEY,
@@ -31,6 +32,7 @@ from .dataset import (
 __version__ = "0.35.0"
 
 __all__ = [
+    "DEFAULT_RESEARCH_HE_RGB_PRESET_KEY",
     "DEFAULT_RESEARCH_DATASET_PRESET_KEY",
     "VindrMammoDataset",
     "vindr_mammo_collate",

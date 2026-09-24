@@ -50,17 +50,29 @@ from .features import (
     DEFAULT_DINO_V3_COMPUTE_DTYPE,
     DEFAULT_DINO_V3_INPUT_SIZE,
     DEFAULT_DINO_V3_MODEL_ID,
+    DEFAULT_RESEARCH_FEATURE_VARIANTS,
     DINO_V3_LVD_MEAN,
     DINO_V3_LVD_STD,
     DINO_V3_MODELS,
-    VARIANT_SPECS,
     default_feature_dataset_root,
     default_selected_variants,
     estimate_dataset_channel_stats,
     extract_features_from_config,
     feature_output_folder,
     feature_shape_summary,
+    native_resized_variant_input_sizes,
+    resolved_variant_input_config,
     scan_dataset_image_variants,
+)
+from .global_pad_gui import (
+    DEFAULT_DATA_ROOT as GLOBAL_PAD_DEFAULT_DATA_ROOT,
+    DEFAULT_OUTPUT_ROOT as GLOBAL_PAD_DEFAULT_OUTPUT_ROOT,
+    DEFAULT_SPLIT_ASSIGNMENTS as GLOBAL_PAD_DEFAULT_SPLIT_ASSIGNMENTS,
+    OPTIONAL_TARGET_HEIGHTS as GLOBAL_PAD_TARGET_HEIGHTS,
+    command_preview as global_pad_command_preview,
+    estimate_selected_payload as estimate_global_pad_payload,
+    launch_global_pad_export,
+    read_global_pad_status,
 )
 from .lazy_crops import (
     default_lazy_crop_config,
@@ -847,6 +859,7 @@ def _layout(config_path: Path, cfg: dict[str, Any]) -> html.Div:
             dcc.Interval(id="job-poll", interval=1200, disabled=True),
             dcc.Interval(id="feature-poll", interval=1200, disabled=True),
             dcc.Interval(id="lazy-crop-poll", interval=1200, disabled=True),
+            dcc.Interval(id="global-pad-poll", interval=5000, disabled=False),
             # Keep queue/disk monitoring live in a separately opened browser
             # window even though that client did not click a queue action.
             dcc.Interval(id="queue-poll", interval=1200, disabled=False),
@@ -920,6 +933,7 @@ def _layout(config_path: Path, cfg: dict[str, Any]) -> html.Div:
                                     dcc.Tab(label="Final View", value="crops", children=html.Div(_crop_controls_dash(cfg), className="controls-body")),
                                     dcc.Tab(label="Save Data", value="export", children=html.Div(_export_controls_dash(cfg), className="controls-body")),
                                     dcc.Tab(label="Storage & Queue", value="queue", children=html.Div(_queue_controls_dash(cfg), className="controls-body")),
+                                    dcc.Tab(label="Global Multi-Res", value="global-pad", children=html.Div(_global_pad_controls_dash(), className="controls-body")),
                                     dcc.Tab(label="Saved Viewer", value="saved", children=html.Div(_saved_controls_dash(cfg), className="controls-body")),
                                     dcc.Tab(label="Feature Extraction", value="features", children=html.Div(_feature_controls_dash(cfg), className="controls-body")),
                                     dcc.Tab(label="Lazy Crop Manifests", value="lazy-crops", children=html.Div(_lazy_crop_controls_dash(cfg), className="controls-body")),
@@ -1741,6 +1755,135 @@ def _register_callbacks(app: Dash) -> None:
             return html.Div(f"Could not read disk capacity for {output_root}: {exc}", className="error note")
 
     @app.callback(
+        Output("global-pad-command-preview", "children"),
+        Output("global-pad-selection-estimate", "children"),
+        Input("global-pad-data-root", "value"),
+        Input("global-pad-output-root", "value"),
+        Input("global-pad-split-assignments", "value"),
+        Input("global-pad-target-heights", "value"),
+        Input("global-pad-workers", "value"),
+        Input("global-pad-overwrite", "value"),
+        Input("global-pad-rescan", "value"),
+        Input("global-pad-allow-low-space", "value"),
+        prevent_initial_call=False,
+    )
+    def _preview_global_pad_command(
+        data_root: str,
+        output_root: str,
+        split_assignments: str,
+        target_heights: list[int],
+        workers: int,
+        overwrite: list[str],
+        rescan: list[str],
+        allow_low_space: list[str],
+    ) -> tuple[Any, Any]:
+        try:
+            selected = list(target_heights or [])
+            preview = global_pad_command_preview(
+                data_root=str(data_root or ""),
+                output_root=str(output_root or ""),
+                split_assignments=str(split_assignments or "").strip() or None,
+                target_heights=selected,
+                workers=int(workers or 1),
+                overwrite="on" in (overwrite or []),
+                rescan="on" in (rescan or []),
+                allow_low_space="on" in (allow_low_space or []),
+            )
+            estimate = estimate_global_pad_payload(str(output_root or ""), selected)
+            estimate_children = _global_pad_selection_estimate_children(estimate)
+            return preview, estimate_children
+        except Exception as exc:
+            return "", html.Div(f"Invalid export settings: {exc}", className="error note")
+
+    @app.callback(
+        Output("global-pad-live-status", "children"),
+        Output("global-pad-log-tail", "children"),
+        Output("global-pad-start-button", "disabled"),
+        Input("global-pad-poll", "n_intervals"),
+        Input("global-pad-refresh-button", "n_clicks"),
+        Input("global-pad-output-root", "value"),
+        Input("global-pad-confirm", "value"),
+        prevent_initial_call=False,
+    )
+    def _poll_global_pad_export(
+        _tick: int,
+        _refresh: int,
+        output_root: str,
+        confirm: list[str],
+    ) -> tuple[Any, str, bool]:
+        try:
+            snapshot = read_global_pad_status(str(output_root or ""))
+            log_tail = str(snapshot.get("log_tail") or "")
+            if not log_tail:
+                log_tail = (
+                    "No GUI launch log exists. This is expected when the active export "
+                    "was started in a terminal."
+                )
+            disabled = bool(snapshot.get("active")) or "on" not in (confirm or [])
+            return _global_pad_status_children(snapshot), log_tail, disabled
+        except Exception as exc:
+            return (
+                html.Div(f"Could not read export status: {exc}", className="error note"),
+                "",
+                True,
+            )
+
+    @app.callback(
+        Output("global-pad-action-status", "children"),
+        Input("global-pad-start-button", "n_clicks"),
+        State("global-pad-data-root", "value"),
+        State("global-pad-output-root", "value"),
+        State("global-pad-split-assignments", "value"),
+        State("global-pad-target-heights", "value"),
+        State("global-pad-workers", "value"),
+        State("global-pad-overwrite", "value"),
+        State("global-pad-rescan", "value"),
+        State("global-pad-allow-low-space", "value"),
+        State("global-pad-confirm", "value"),
+        prevent_initial_call=True,
+    )
+    def _start_global_pad_export(
+        _clicks: int,
+        data_root: str,
+        output_root: str,
+        split_assignments: str,
+        target_heights: list[int],
+        workers: int,
+        overwrite: list[str],
+        rescan: list[str],
+        allow_low_space: list[str],
+        confirm: list[str],
+    ) -> Any:
+        if "on" not in (confirm or []):
+            return html.Div(
+                "Confirm the destination before starting or resuming.",
+                className="warning note",
+            )
+        try:
+            launched = launch_global_pad_export(
+                data_root=str(data_root or ""),
+                output_root=str(output_root or ""),
+                split_assignments=str(split_assignments or "").strip() or None,
+                target_heights=list(target_heights or []),
+                workers=int(workers or 1),
+                overwrite="on" in (overwrite or []),
+                rescan="on" in (rescan or []),
+                allow_low_space="on" in (allow_low_space or []),
+            )
+        except Exception as exc:
+            return html.Div(f"Could not start export: {exc}", className="error note")
+        return html.Div(
+            [
+                html.Div(
+                    f"Exporter launched as PID {launched['pid']}. The GUI can be closed "
+                    "without stopping it."
+                ),
+                html.Div([html.Strong("Log: "), str(launched["log_path"])]),
+            ],
+            className="note",
+        )
+
+    @app.callback(
         Output("space-estimate-store", "data"),
         Output("space-estimate-status", "children"),
         Input("estimate-space-button", "n_clicks"),
@@ -1865,16 +2008,31 @@ def _register_callbacks(app: Dash) -> None:
                 f"Could not scan dataset: {exc}", className="error note"
             )
         variants = dict(scan.get("variants", {}) or {})
-        options = [
-            {
-                "label": (
-                    f"{item.get('label', key)} — {int(item.get('count', 0)):,} "
-                    f"({int(item.get('float32_count', 0)):,} float32)"
-                ),
-                "value": key,
-            }
-            for key, item in variants.items()
-        ]
+
+        def variant_order(item: tuple[str, dict[str, Any]]) -> tuple[int, int, str]:
+            key = str(item[0])
+            resolution = re.fullmatch(r"resized_whole_(\d+)x(\d+)", key)
+            if resolution is not None:
+                return (0, int(resolution.group(1)), key)
+            return (1, 0, key)
+
+        options = []
+        for key, item in sorted(variants.items(), key=variant_order):
+            resolution = re.fullmatch(r"resized_whole_(\d+)x(\d+)", str(key))
+            if resolution is not None:
+                width, height = resolution.groups()
+                label = f"{width} × {height} tokens — native {width} × {height} DINOv3 input"
+            else:
+                label = str(item.get("label", key))
+            options.append(
+                {
+                    "label": (
+                        f"{label} — {int(item.get('count', 0)):,} images "
+                        f"({int(item.get('float32_count', 0)):,} float32)"
+                    ),
+                    "value": key,
+                }
+            )
         selected = default_selected_variants(scan)
         split_names = sorted(
             {
@@ -2014,44 +2172,76 @@ def _register_callbacks(app: Dash) -> None:
     @app.callback(
         Output("feature-shape-summary", "children"),
         Input("feature-model-id", "value"),
+        Input("feature-model-path", "value"),
+        Input("feature-compute-dtype", "value"),
         Input("feature-resize-mode", "value"),
         Input("feature-input-width", "value"),
         Input("feature-input-height", "value"),
+        Input("feature-pad-value", "value"),
+        Input("feature-mean", "value"),
+        Input("feature-std", "value"),
         Input("feature-batch-size", "value"),
+        Input("feature-save-dtype", "value"),
         Input("feature-outputs", "value"),
         Input("feature-layer", "value"),
         Input("feature-dataset-root", "value"),
+        Input("feature-variants", "value"),
         prevent_initial_call=False,
     )
     def _feature_shapes(
         model_id: str,
+        model_path: str,
+        compute_dtype: str,
         resize_mode: str,
         width: int,
         height: int,
+        pad_value: float,
+        mean: str,
+        std: str,
         batch_size: int,
+        save_dtype: str,
         outputs: list[str],
         layer: int,
         dataset_root: str,
+        variants: list[str],
     ) -> Any:
-        summary = feature_shape_summary(
-            str(model_id),
-            input_width=int(width or 1024),
-            input_height=int(height or 1024),
-            resize_mode=str(resize_mode or "exact"),
-            outputs=outputs or [],
-            batch_size=int(batch_size or 1),
-        )
+        selected_variants = list(variants or [])
+        variant_sizes = native_resized_variant_input_sizes(selected_variants)
+        base_input = {
+            "resize_mode": str(resize_mode or "exact"),
+            "width": int(width or 1024),
+            "height": int(height or 1024),
+            "pad_value": float(pad_value or 0.0),
+            "mean": str(mean or ",".join(str(value) for value in DINO_V3_LVD_MEAN)),
+            "std": str(std or ",".join(str(value) for value in DINO_V3_LVD_STD)),
+            "variant_input_sizes": variant_sizes,
+        }
+        shape_variants = selected_variants or ["selected input"]
+        shape_summaries: dict[str, dict[str, Any]] = {}
+        for variant in shape_variants:
+            resolved_input = resolved_variant_input_config(base_input, variant)
+            shape_summaries[variant] = feature_shape_summary(
+                str(model_id),
+                input_width=int(resolved_input.get("width", width or 1024)),
+                input_height=int(resolved_input.get("height", height or 1024)),
+                resize_mode=str(resolved_input.get("resize_mode", resize_mode or "exact")),
+                outputs=outputs or [],
+                batch_size=int(batch_size or 1),
+            )
+        summary = next(iter(shape_summaries.values()))
         provisional = {
             "paths": {"dataset_root": str(dataset_root or ".")},
-            "model": {"model_id": str(model_id)},
-            "input": {
-                "resize_mode": str(resize_mode or "exact"),
-                "width": int(width or 1024),
-                "height": int(height or 1024),
+            "model": {
+                "model_id": str(model_id),
+                "model_path": str(model_path or "").strip() or None,
+                "compute_dtype": str(compute_dtype or "float32"),
             },
+            "variants": selected_variants,
+            "input": base_input,
             "extraction": {
                 "outputs": outputs or [],
                 "layer": int(layer if layer is not None else -1),
+                "save_dtype": str(save_dtype or "float32"),
             },
         }
         return html.Div(
@@ -2064,15 +2254,38 @@ def _register_callbacks(app: Dash) -> None:
                             f"{summary.get('layers')} layers / {summary.get('hidden_size')} dim / "
                             f"patch {summary.get('patch_size')} / {summary.get('register_tokens')} registers",
                         ),
-                        _metric("Input", str(summary.get("input"))),
-                        _metric("Patch grid", str(summary.get("patch_grid"))),
                         _metric(
-                            "Token sequence",
-                            str(summary.get("token_sequence", "variable")),
+                            "Inputs",
+                            "; ".join(
+                                f"{variant}: {item.get('input')}"
+                                for variant, item in shape_summaries.items()
+                            ),
+                        ),
+                        _metric(
+                            "Patch grids",
+                            "; ".join(
+                                f"{variant}: {item.get('patch_grid')}"
+                                for variant, item in shape_summaries.items()
+                            ),
+                        ),
+                        _metric(
+                            "Token sequences",
+                            "; ".join(
+                                f"{variant}: {item.get('token_sequence', 'variable')}"
+                                for variant, item in shape_summaries.items()
+                            ),
                         ),
                     ],
                 ),
-                html.Pre(json.dumps(summary.get("saved_shapes"), indent=2)),
+                html.Pre(
+                    json.dumps(
+                        {
+                            variant: item.get("saved_shapes")
+                            for variant, item in shape_summaries.items()
+                        },
+                        indent=2,
+                    )
+                ),
                 html.Div(
                     [html.Strong("Output folder: "), str(feature_output_folder(provisional))],
                     className="note",
@@ -2136,6 +2349,7 @@ def _register_callbacks(app: Dash) -> None:
             return html.Div("Select at least one detected image type.", className="warning note"), True, no_update
         if not outputs:
             return html.Div("Select at least one DINOv3 output tensor.", className="warning note"), True, no_update
+        variant_input_sizes = native_resized_variant_input_sizes(variants)
         feature_cfg: dict[str, Any] = {
             "paths": {"dataset_root": str(dataset_root or "")},
             "network": str(network or "dinov3"),
@@ -2161,6 +2375,7 @@ def _register_callbacks(app: Dash) -> None:
                 "std": str(
                     std or ",".join(str(value) for value in DINO_V3_LVD_STD)
                 ),
+                "variant_input_sizes": variant_input_sizes,
             },
             "extraction": {
                 "layer": int(layer if layer is not None else -1),
@@ -3517,7 +3732,7 @@ def _export_controls_dash(cfg: dict[str, Any]) -> Any:
                     ),
                 ),
                 html.Div(
-                    "Float32 tensors use CHW layout and mirror PNG stems under a float32/ folder. Their preprocessing stays in floating point—there is no intermediate uint8/uint16 encoding—and only the separate PNG branch is quantized to 0–255. The Default Research Dataset selects crops and resized whole images only.",
+                    "Float32 tensors use CHW layout and mirror PNG stems under a float32/ folder. Every image recipe is processed once in float32; the tensor stores that result directly and the matching PNG is quantized to 0–255 only at final encoding. The Default Research Dataset selects crops and resized whole images only.",
                     className="note",
                 ),
                 html.Div(id="export-mode-summary", className="note"),
@@ -3833,6 +4048,136 @@ def _export_controls_dash(cfg: dict[str, Any]) -> Any:
     )
 
 
+def _global_pad_controls_dash() -> Any:
+    resolution_options = [
+        {
+            "label": f"{height}px target height"
+            + (" (optional; add later)" if height == 2048 else ""),
+            "value": height,
+        }
+        for height in GLOBAL_PAD_TARGET_HEIGHTS
+    ]
+    return html.Div(
+        [
+            html.Details(open=True, children=[
+                html.Summary("Source and destination"),
+                _field(
+                    "Original VinDr root",
+                    dcc.Input(
+                        id="global-pad-data-root",
+                        value=str(GLOBAL_PAD_DEFAULT_DATA_ROOT),
+                        type="text",
+                        debounce=True,
+                    ),
+                    None,
+                ),
+                _field(
+                    "Saved train/validation/test assignments",
+                    dcc.Input(
+                        id="global-pad-split-assignments",
+                        value=str(GLOBAL_PAD_DEFAULT_SPLIT_ASSIGNMENTS),
+                        type="text",
+                        debounce=True,
+                        placeholder="Leave empty to use the official source split",
+                    ),
+                    None,
+                ),
+                _field(
+                    "Output root",
+                    dcc.Input(
+                        id="global-pad-output-root",
+                        value=str(GLOBAL_PAD_DEFAULT_OUTPUT_ROOT),
+                        type="text",
+                        debounce=True,
+                    ),
+                    None,
+                ),
+                html.Div(
+                    "The original DICOM directory is read-only input. Monitoring reads status, "
+                    "manifest, log, and procfs files; it never signals or stops an exporter.",
+                    className="note",
+                ),
+            ]),
+            html.Details(open=True, children=[
+                html.Summary("Float32 output family"),
+                _field(
+                    "Compact target heights",
+                    dcc.Checklist(
+                        id="global-pad-target-heights",
+                        options=resolution_options,
+                        value=list(GLOBAL_PAD_TARGET_HEIGHTS[:-1]),
+                    ),
+                    None,
+                ),
+                html.Div(
+                    "The common stride-32 padded original is always included. Every output is a "
+                    "single-channel CHW float32 tensor normalized to [0,1]. No PNG and no "
+                    "unpadded copy is saved. 2048 stays unchecked by default and can be added "
+                    "later by resuming into the same output root.",
+                    className="note",
+                ),
+                _field(
+                    "Parallel DICOM workers",
+                    _number("global-pad-workers", 8, min_=1, max_=64, step=1),
+                    None,
+                ),
+                _check(
+                    "global-pad-overwrite",
+                    "Regenerate existing tensors instead of resuming",
+                    False,
+                ),
+                _check(
+                    "global-pad-rescan",
+                    "Rescan all DICOM headers instead of using cached geometry",
+                    False,
+                ),
+                _check(
+                    "global-pad-allow-low-space",
+                    "Allow start when the full-run estimate exceeds current free space",
+                    False,
+                ),
+                html.Div(id="global-pad-selection-estimate", className="summary-box"),
+                html.Details(children=[
+                    html.Summary("Equivalent terminal command"),
+                    html.Pre(id="global-pad-command-preview"),
+                ]),
+            ]),
+            html.Details(open=True, children=[
+                html.Summary("Run and live progress"),
+                _check(
+                    "global-pad-confirm",
+                    "I checked the destination and want to start or resume",
+                    False,
+                ),
+                html.Div(className="config-actions", children=[
+                    html.Button(
+                        "Start / resume export",
+                        id="global-pad-start-button",
+                        n_clicks=0,
+                        className="primary",
+                    ),
+                    html.Button(
+                        "Refresh status",
+                        id="global-pad-refresh-button",
+                        n_clicks=0,
+                    ),
+                ]),
+                html.Div(id="global-pad-action-status"),
+                html.Div(id="global-pad-live-status", className="summary-box"),
+                html.Details(children=[
+                    html.Summary("GUI-launched process log"),
+                    html.Pre(id="global-pad-log-tail"),
+                ]),
+                html.Div(
+                    "There is intentionally no Stop button here. Closing or restarting the GUI "
+                    "does not stop a running export; reopen this tab to monitor it.",
+                    className="note",
+                ),
+            ]),
+        ]
+    )
+
+
 def _queue_controls_dash(cfg: dict[str, Any]) -> Any:
     output_root = Path(str(cfg.get("paths", {}).get("output_root", ".")))
     return html.Div(
@@ -3895,7 +4240,23 @@ def _saved_controls_dash(cfg: dict[str, Any]) -> Any:
 
 def _feature_controls_dash(cfg: dict[str, Any]) -> Any:
     default_root = str(default_feature_dataset_root(cfg))
-    default_model = DEFAULT_DINO_V3_MODEL_ID
+    research_cfg = apply_study_preset(cfg or {}, DEFAULT_RESEARCH_DATASET_PRESET_KEY)
+    feature_defaults = dict(research_cfg.get("feature_extraction", {}) or {})
+    feature_model_defaults = dict(feature_defaults.get("model", {}) or {})
+    feature_input_defaults = dict(feature_defaults.get("input", {}) or {})
+    feature_run_defaults = dict(feature_defaults.get("extraction", {}) or {})
+    default_variants = list(
+        feature_defaults.get("variants", DEFAULT_RESEARCH_FEATURE_VARIANTS)
+        or DEFAULT_RESEARCH_FEATURE_VARIANTS
+    )
+    default_model = str(feature_model_defaults.get("model_id", DEFAULT_DINO_V3_MODEL_ID))
+    default_resize_mode = str(feature_input_defaults.get("resize_mode", "exact"))
+    default_width = int(feature_input_defaults.get("width", DEFAULT_DINO_V3_INPUT_SIZE))
+    default_height = int(feature_input_defaults.get("height", DEFAULT_DINO_V3_INPUT_SIZE))
+    default_outputs = list(
+        feature_run_defaults.get("outputs", ["patch_tokens", "cls_token"])
+        or ["patch_tokens", "cls_token"]
+    )
     default_mean = ",".join(str(value) for value in DINO_V3_LVD_MEAN)
     default_std = ",".join(str(value) for value in DINO_V3_LVD_STD)
     model_options = [
@@ -3923,20 +4284,27 @@ def _feature_controls_dash(cfg: dict[str, Any]) -> Any:
                 ),
                 html.Div(id="feature-scan-summary", className="summary-box"),
                 _field(
-                    "Image types to extract",
+                    "Resolution branches to extract",
                     dcc.Checklist(
                         id="feature-variants",
                         options=[
-                            {"label": spec["label"], "value": key}
-                            for key, spec in VARIANT_SPECS.items()
+                            {
+                                "label": "640 × 640 tokens — native 640 × 640 input",
+                                "value": "resized_whole_640x640",
+                            },
+                            {
+                                "label": "1024 × 1024 tokens — native 1024 × 1024 input",
+                                "value": "resized_whole_1024x1024",
+                            },
                         ],
-                        value=["crops", "resized_whole"],
+                        value=default_variants,
                     ),
                     None,
                 ),
                 html.Div(
-                    "Every detected type is selected by default. For "
-                    f"`{DEFAULT_RESEARCH_DATASET_PRESET_KEY}`, original-size wholes are deliberately left off.",
+                    "The CLAHE research preset selects both resolution checkboxes by default. One "
+                    "Start click extracts each branch at its own native size and stores the 640 and "
+                    "1024 feature files in separate variant subfolders. Original-size wholes remain off.",
                     className="note",
                 ),
                 _field(
@@ -4022,16 +4390,16 @@ def _feature_controls_dash(cfg: dict[str, Any]) -> Any:
                             {"label": "Fit + top-left pad", "value": "fit_pad"},
                             {"label": "Keep native size", "value": "none"},
                         ],
-                        value="exact",
+                        value=default_resize_mode,
                         clearable=False,
                     ),
                     None,
                 ),
                 _field(
-                    "Input width",
+                    "Fallback input width",
                     _number(
                         "feature-input-width",
-                        DEFAULT_DINO_V3_INPUT_SIZE,
+                        default_width,
                         min_=16,
                         max_=8192,
                         step=16,
@@ -4039,10 +4407,10 @@ def _feature_controls_dash(cfg: dict[str, Any]) -> Any:
                     None,
                 ),
                 _field(
-                    "Input height",
+                    "Fallback input height",
                     _number(
                         "feature-input-height",
-                        DEFAULT_DINO_V3_INPUT_SIZE,
+                        default_height,
                         min_=16,
                         max_=8192,
                         step=16,
@@ -4130,17 +4498,27 @@ def _feature_controls_dash(cfg: dict[str, Any]) -> Any:
                             {"label": "Mean patch token", "value": "mean_patch_token"},
                             {"label": "Register tokens", "value": "register_tokens"},
                         ],
-                        value=["patch_tokens", "cls_token"],
+                        value=default_outputs,
                     ),
                     None,
                 ),
-                _field("Batch size", _number("feature-batch-size", 1, min_=1, max_=256, step=1), None),
+                _field(
+                    "Batch size",
+                    _number(
+                        "feature-batch-size",
+                        int(feature_run_defaults.get("batch_size", 1) or 1),
+                        min_=1,
+                        max_=256,
+                        step=1,
+                    ),
+                    None,
+                ),
                 _field(
                     "Saved feature dtype",
                     dcc.Dropdown(
                         id="feature-save-dtype",
                         options=["float32", "float16", "bfloat16"],
-                        value="float32",
+                        value=str(feature_run_defaults.get("save_dtype", "float32")),
                         clearable=False,
                     ),
                     None,
@@ -6399,6 +6777,141 @@ def _lazy_crop_config_from_controls(
         clean_negative_breasts
     )
     return cfg
+
+
+def _format_global_pad_duration(seconds: Any) -> str:
+    if seconds is None:
+        return "—"
+    total = max(0, int(float(seconds)))
+    days, remainder = divmod(total, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if days:
+        return f"{days}d {hours:02d}h {minutes:02d}m"
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    return f"{minutes}m {secs:02d}s"
+
+
+def _global_pad_selection_estimate_children(estimate: dict[str, Any]) -> Any:
+    if not estimate:
+        return html.Div(
+            "A dense-payload estimate will appear after this output root has scanned "
+            "source geometry. The exporter performs its own allocation/free-space check "
+            "before decoding mammogram pixels.",
+            className="note",
+        )
+    variants = list(estimate.get("variants", []) or [])
+    dimensions = ", ".join(
+        f"{item.get('height')}×{item.get('width')}"
+        for item in variants
+    )
+    return html.Div(
+        [
+            html.Div(
+                f"Selected dense float32 payload: "
+                f"{format_bytes(int(estimate.get('payload_bytes') or 0))} for "
+                f"{int(estimate.get('image_count') or 0):,} images."
+            ),
+            html.Div(f"Outputs H×W (padded original first): {dimensions}."),
+            html.Div(
+                "Filesystem allocation, labels, and metadata add overhead; the launch-time "
+                "exporter check uses the fuller estimate.",
+                className="note",
+            ),
+        ]
+    )
+
+
+def _global_pad_status_children(snapshot: dict[str, Any]) -> Any:
+    status = str(snapshot.get("status") or "unknown")
+    active = bool(snapshot.get("active"))
+    pid = snapshot.get("pid")
+    image_count = int(snapshot.get("image_count") or 0)
+    processed_images = int(snapshot.get("processed_images") or 0)
+    manifest_rows = int(snapshot.get("manifest_rows") or 0)
+    expected_rows = int(snapshot.get("expected_rows") or 0)
+    progress = snapshot.get("progress")
+    variants = list(snapshot.get("variants", []) or [])
+    free_bytes = snapshot.get("free_bytes")
+    total_bytes = snapshot.get("total_bytes")
+    estimate_bytes = snapshot.get("estimated_allocated_output_bytes")
+
+    if status == "failed":
+        css_class = "error note"
+    elif status in {"interrupted", "completed_with_errors"}:
+        css_class = "warning note"
+    else:
+        css_class = "note"
+
+    status_lines: list[Any] = [
+        html.Div(
+            [
+                html.Strong("Status: "),
+                status.replace("_", " "),
+                (
+                    f" · PID {pid} is active (read-only monitoring)"
+                    if active and pid is not None
+                    else " · no exporter process is active"
+                ),
+            ]
+        )
+    ]
+    if progress is not None:
+        percentage = 100.0 * float(progress)
+        status_lines.extend(
+            [
+                html.Progress(
+                    value=float(progress),
+                    max=1.0,
+                    style={"width": "100%"},
+                ),
+                html.Div(
+                    f"{processed_images:,} / {image_count:,} images observed in the "
+                    f"manifest ({manifest_rows:,} / {expected_rows:,} variant rows; "
+                    f"{percentage:.1f}%)."
+                ),
+                html.Div(
+                    f"Elapsed {_format_global_pad_duration(snapshot.get('elapsed_seconds'))} · "
+                    f"ETA {_format_global_pad_duration(snapshot.get('eta_seconds'))}."
+                ),
+            ]
+        )
+    elif active:
+        status_lines.append(
+            html.Div(
+                "The process is starting or scanning DICOM headers. Image progress and ETA "
+                "appear when pixel export begins."
+            )
+        )
+    if variants:
+        status_lines.append(
+            html.Div(
+                "Active outputs H×W: "
+                + ", ".join(
+                    f"{int(item.get('output_height') or 0)}×"
+                    f"{int(item.get('output_width') or 0)}"
+                    for item in variants
+                )
+            )
+        )
+    if free_bytes is not None and total_bytes is not None:
+        status_lines.append(
+            html.Div(
+                f"Destination filesystem free: {format_bytes(int(free_bytes))} of "
+                f"{format_bytes(int(total_bytes))}."
+            )
+        )
+    if estimate_bytes is not None:
+        status_lines.append(
+            html.Div(
+                "Recorded full-run allocation estimate: "
+                f"{format_bytes(int(estimate_bytes))}."
+            )
+        )
+    if snapshot.get("error"):
+        status_lines.append(html.Pre(str(snapshot["error"])))
+    return html.Div(status_lines, className=css_class)
 
 
 def _queue_table_children(snapshot: dict[str, Any]) -> Any:

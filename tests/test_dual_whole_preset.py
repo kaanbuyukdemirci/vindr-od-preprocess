@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +40,7 @@ from vindr_mammo.export import (
 )
 from vindr_mammo.presets import (
     DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+    DEFAULT_RESEARCH_HE_RGB_PRESET_KEY,
     apply_study_preset,
 )
 from vindr_mammo.preprocessing import apply_geometry_preprocessing
@@ -50,6 +52,13 @@ def _preset() -> dict:
     return apply_study_preset(
         {"paths": {"data_root": "/data/vindr", "output_root": "/exports/old"}},
         DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+    )
+
+
+def _he_rgb_preset() -> dict:
+    return apply_study_preset(
+        {"paths": {"data_root": "/data/vindr", "output_root": "/exports/old"}},
+        DEFAULT_RESEARCH_HE_RGB_PRESET_KEY,
     )
 
 
@@ -86,6 +95,7 @@ def test_default_research_preset_matches_requested_pixel_and_geometry_contract()
         assert crop[f"{split}_min_breast_fraction_for_all_crops"] == 0.05
 
     channels = config["image_export"]["custom_channel_pipeline"]
+    assert config["image_export"]["custom_channel_pipeline_dtype"] == "float32"
     assert channels["R"] == channels["G"] == channels["B"]
     assert channels["R"]["steps"] == [{
         "op": "clahe",
@@ -111,6 +121,18 @@ def test_default_research_preset_matches_requested_pixel_and_geometry_contract()
         {"window_size": 1024, "stride": 256},
         {"window_size": 1024, "stride": 512},
         {"window_size": 640, "stride": 160},
+    ]
+    assert config["feature_extraction"]["variants"] == [
+        "resized_whole_640x640",
+        "resized_whole_1024x1024",
+    ]
+    assert config["feature_extraction"]["input"]["variant_input_sizes"] == {
+        "resized_whole_640x640": {"width": 640, "height": 640},
+        "resized_whole_1024x1024": {"width": 1024, "height": 1024},
+    }
+    assert config["feature_extraction"]["extraction"]["outputs"] == [
+        "patch_tokens",
+        "cls_token",
     ]
     assert config["paired_whole_images"]["resized_canvas_mode"] == "per_image_square"
     assert config["paired_whole_images"]["high_resolution_canvas_mode"] == "per_image_square"
@@ -149,6 +171,74 @@ def test_default_research_preset_matches_requested_pixel_and_geometry_contract()
         "include_source_dicom_sha256": False,
         "include_exported_image_sha256": False,
     }
+
+
+def test_default_research_he_rgb_changes_only_identity_provenance_and_channel_steps() -> None:
+    base = _preset()
+    variant = _he_rgb_preset()
+
+    assert variant["paths"] == {
+        "data_root": "/data/vindr",
+        "output_root": "/exports/preprocessed-vindr-default-research-dataset-v2-he-rgb",
+    }
+    assert variant["visualizations"]["output_dir"] == (
+        "/exports/preprocessed-vindr-default-research-dataset-v2-he-rgb/visualizations"
+    )
+    assert variant["study_preset_provenance"]["preset_key"] == (
+        DEFAULT_RESEARCH_HE_RGB_PRESET_KEY
+    )
+    assert variant["study_preset_provenance"]["preset_version"] == 2
+    assert variant["image"] == {
+        "normalize": "none",
+        "use_voi_lut": True,
+        "strict_voi_lut": False,
+    }
+
+    common_steps = [
+        {
+            "op": "percentile_normalize",
+            "apply_before_crop": True,
+            "params": {"percentiles": [0.0, 100.0]},
+        },
+        {"op": "hist_equalize", "apply_before_crop": True, "params": {}},
+    ]
+    channels = variant["image_export"]["custom_channel_pipeline"]
+    assert variant["image_export"]["custom_channel_pipeline_dtype"] == "float32"
+    assert channels["R"] == {
+        "source": "current_crop",
+        "steps": common_steps,
+    }
+    assert channels["G"] == {
+        "source": "current_crop",
+        "steps": common_steps + [{
+            "op": "percentile_normalize",
+            "apply_before_crop": True,
+            "params": {"percentiles": [50.0, 100.0]},
+        }],
+    }
+    assert channels["B"] == {
+        "source": "current_crop",
+        "steps": common_steps + [{
+            "op": "percentile_normalize",
+            "apply_before_crop": True,
+            "params": {"percentiles": [75.0, 100.0]},
+        }],
+    }
+
+    base_contract = copy.deepcopy(base)
+    variant_contract = copy.deepcopy(variant)
+    for section in {
+        "paths",
+        "visualizations",
+        "study_preset_provenance",
+        "image",
+        "image_export",
+    }:
+        base_contract.pop(section)
+        variant_contract.pop(section)
+    assert variant_contract == base_contract
+    assert variant["paired_whole_images"] == base["paired_whole_images"]
+    assert variant["lazy_crop_grids"] == base["lazy_crop_grids"]
 
 
 def test_default_research_dinov3_inputs_are_divisible_by_patch_size() -> None:

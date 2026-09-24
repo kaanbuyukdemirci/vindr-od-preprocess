@@ -12,6 +12,7 @@ from vindr_mammo.dataset_layout import parse_window_grids, window_grid_configs
 from vindr_mammo.lazy_crops import extract_complete_lazy_crop_family
 from vindr_mammo.presets import (
     DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+    DEFAULT_RESEARCH_HE_RGB_PRESET_KEY,
     apply_study_preset,
 )
 
@@ -36,6 +37,12 @@ def main() -> None:
     )
     parser.add_argument("--config", type=Path, default=Path("config/export_config.yaml"))
     parser.add_argument(
+        "--preset",
+        choices=["default-research", "default-research-he-rgb"],
+        default="default-research",
+        help="Research-v2 photometric preset to export.",
+    )
+    parser.add_argument(
         "--grid",
         action="append",
         default=[],
@@ -47,9 +54,11 @@ def main() -> None:
     parser.add_argument("--strides", type=int, nargs="+")
     args = parser.parse_args()
 
-    config = apply_study_preset(
-        load_export_config(args.config), DEFAULT_RESEARCH_DATASET_PRESET_KEY
-    )
+    preset_key = {
+        "default-research": DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+        "default-research-he-rgb": DEFAULT_RESEARCH_HE_RGB_PRESET_KEY,
+    }[args.preset]
+    config = apply_study_preset(load_export_config(args.config), preset_key)
     output_root = Path(config["paths"]["output_root"])
     if args.grid:
         grids = parse_window_grids(",".join(args.grid))
@@ -65,11 +74,17 @@ def main() -> None:
         })
     else:
         grids = window_grid_configs(config)
-    status_path = output_root.parent / "default-research-v2-extraction-status.json"
+    status_name = (
+        "default-research-v2-he-rgb-extraction-status.json"
+        if preset_key == DEFAULT_RESEARCH_HE_RGB_PRESET_KEY
+        else "default-research-v2-extraction-status.json"
+    )
+    status_path = output_root.parent / status_name
     status: dict[str, Any] = {
         "status": "running",
         "pid": int(os.getpid()),
         "started_at": _now(),
+        "preset_key": preset_key,
         "output_root": str(output_root),
         "grids": grids,
     }

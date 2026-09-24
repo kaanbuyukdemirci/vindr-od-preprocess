@@ -6,6 +6,7 @@ from pprint import pprint
 
 from .export import export_from_config, load_export_config
 from .presets import (
+    DEFAULT_RESEARCH_HE_RGB_PRESET_KEY,
     DEFAULT_RESEARCH_DATASET_PRESET_KEY,
     DUAL_WHOLE_PRESET_KEY,
     PAPER_22_IMPROVED_PRESET_KEY,
@@ -48,6 +49,7 @@ def _build_parser(description: str, *, include_preset: bool = True) -> argparse.
                 "custom",
                 "simple",
                 "default-research",
+                "default-research-he-rgb",
                 "simple-crop",
                 "dual-whole",
                 *STUDY_PRESETS.keys(),
@@ -55,8 +57,9 @@ def _build_parser(description: str, *, include_preset: bool = True) -> argparse.
             default=None,
             help=(
                 "Apply a study preset after loading YAML. Clear aliases are paper22, "
-                "custom-paper22, paper69, custom, and default-research; paper22-improved, simple, simple-crop, and dual-whole remain "
-                "supported for backward compatibility."
+                "custom-paper22, paper69, custom, default-research, and "
+                "default-research-he-rgb; paper22-improved, simple, simple-crop, and "
+                "dual-whole remain supported for backward compatibility."
             ),
         )
     return parser
@@ -77,6 +80,7 @@ def run_export_from_config_path(config_path: str | Path, *, preset_key: str | No
             "custom": SIMPLE_PRESET_KEY,
             "simple": SIMPLE_PRESET_KEY,
             "default-research": DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+            "default-research-he-rgb": DEFAULT_RESEARCH_HE_RGB_PRESET_KEY,
             "simple-crop": DUAL_WHOLE_PRESET_KEY,
             "dual-whole": DUAL_WHOLE_PRESET_KEY,
         }
@@ -100,6 +104,7 @@ def run_visualization_from_config_path(config_path: str | Path, *, preset_key: s
             "custom": SIMPLE_PRESET_KEY,
             "simple": SIMPLE_PRESET_KEY,
             "default-research": DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+            "default-research-he-rgb": DEFAULT_RESEARCH_HE_RGB_PRESET_KEY,
             "simple-crop": DUAL_WHOLE_PRESET_KEY,
             "dual-whole": DUAL_WHOLE_PRESET_KEY,
         }

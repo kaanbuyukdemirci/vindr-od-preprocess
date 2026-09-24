@@ -14,6 +14,7 @@ from vindr_mammo.export import (
 from vindr_mammo.dash_app import _config_control_outputs, _config_control_values
 from vindr_mammo.presets import (
     DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+    DEFAULT_RESEARCH_HE_RGB_PRESET_KEY,
     DUAL_WHOLE_PRESET_KEY,
     PAPER_22_IMPROVED_PRESET_KEY,
     PAPER_22_PRESET_KEY,
@@ -38,6 +39,9 @@ def test_default_config_and_all_presets_use_vindr_data_parent() -> None:
         PAPER_69_PRESET_KEY: "preprocessed-vindr-paper69-em-detr-v3",
         SIMPLE_PRESET_KEY: "preprocessed-vindr-simple-preset-v1",
         DUAL_WHOLE_PRESET_KEY: "preprocessed-vindr-default-research-dataset-v2",
+        DEFAULT_RESEARCH_HE_RGB_PRESET_KEY: (
+            "preprocessed-vindr-default-research-dataset-v2-he-rgb"
+        ),
     }
     for preset_key, folder in expected_folders.items():
         preset = apply_study_preset(config, preset_key)
@@ -61,6 +65,9 @@ def test_user_facing_preset_names_identify_paper_or_custom_status() -> None:
     )
     assert STUDY_PRESETS[DUAL_WHOLE_PRESET_KEY]["label"] == (
         "Default Research Dataset (v2 — multi-resolution wholes + windows)"
+    )
+    assert STUDY_PRESETS[DEFAULT_RESEARCH_HE_RGB_PRESET_KEY]["label"] == (
+        "Default Research Dataset (v2 — multi-resolution wholes + windows) — HE+RGB"
     )
     assert DEFAULT_RESEARCH_DATASET_PRESET_KEY == DUAL_WHOLE_PRESET_KEY
 

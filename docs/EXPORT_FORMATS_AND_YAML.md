@@ -340,7 +340,7 @@ The exporter now writes both model-ready RGB PNGs and optional preserved 16-bit 
 
 ### Default RGB scheme: `intensity_equalized_gradient`
 
-Mammograms are originally high-bit-depth grayscale images. Most YOLO/MMDetection pipelines expect normal 8-bit, 3-channel images. No 8-bit RGB scheme can truly keep the full DICOM pixel depth, so the exporter still saves a separate preserved 16-bit PNG. The RGB image is only the model input representation.
+Mammograms are originally high-bit-depth grayscale images. Most YOLO/MMDetection pipelines expect normal 8-bit, 3-channel images. Every recipe below runs in float32; quantization occurs only once when the completed RGB result is encoded as PNG. No 8-bit RGB file can truly keep the full DICOM pixel depth, so the exporter can also save a non-quantized float32 tensor and a separate preserved 16-bit PNG. The RGB PNG is only the model input representation.
 
 The current default is:
 
@@ -359,7 +359,7 @@ This creates:
 ```text
 R = normal robust intensity window
 G = histogram-equalized version of the same intensity window
-B = Sobel gradient magnitude, robustly rescaled to 8-bit
+B = Sobel gradient magnitude, robustly rescaled in float32
 ```
 
 This is useful when `multi_window` still looks visually close to grayscale. The channels are more complementary: one stable intensity channel, one contrast-enhanced channel, and one edge/texture channel.

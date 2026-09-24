@@ -1,0 +1,562 @@
+\section{Background}
+\label{sec:background}
+
+% Required packages in the main manuscript preamble:
+% \usepackage{booktabs,tabularx,array,threeparttable,caption}
+% The continued table panels use table* so that they span both columns in a
+% two-column paper. The caption package supplies \ContinuedFloat.
+
+\subsection{Mammography Cancer Detection Datasets}
+\label{sec:mammography_datasets}
+
+An object detector must learn not only whether an abnormality is present, but
+also where it is. We therefore call a dataset detection-compatible only when it
+provides a reusable lesion location: a bounding box, contour, segmentation
+mask, circle, point, or exact synthetic location. Contours and masks can be
+converted to axis-aligned boxes. Table~\ref{tab:mammography_detection_datasets}
+lists the clinical and synthetic datasets with such labels that we identified
+through August 2026.
+
+Several useful mammography datasets are absent from the table because they do
+not release lesion locations. CMMD \cite{cai2023cmmd} provides image-level
+diagnoses and molecular-subtype information. The RSNA Screening Mammography
+challenge dataset \cite{rsna2022smbc} provides breast-cancer labels for
+screening examinations. TN-Mammo \cite{nguyen2025tnmammo} provides breast
+density labels, while Mammo-MX \cite{murilloortiz2025mammomx} provides BI-RADS
+and density labels. NL-Breast-Screening \cite{kendall2025nlbreast} identifies
+normal, false-positive, and biopsy-confirmed cancer examinations.
+LAMIS-DMDB \cite{otmani2024lamis} and KAUH-BCMD
+\cite{almnayyis2025kauh} provide diagnostic categories rather than reusable
+lesion coordinates. These datasets can support classification, but their public
+labels cannot directly train or evaluate a model that predicts lesion boxes.
+
+The earliest public detection resources came from scanned screen-film rather
+than native digital mammography. MIAS \cite{suckling1994mias} marks an
+abnormality with a center point and radius. DDSM \cite{heath2001ddsm} provides
+expert lesion contours. CBIS-DDSM \cite{lee2017cbisddsm} is not a new patient
+cohort: it selects cases from DDSM, stores them in DICOM, revises the ROI masks,
+and defines standard training and test partitions. Mini-DDSM
+\cite{lekamlage2020miniddsm} also reuses DDSM cases, but distributes smaller,
+lower-resolution images. Thus, DDSM, CBIS-DDSM, and Mini-DDSM are three
+versions of overlapping source data. They are useful historical benchmarks,
+but pooling them does not create three independent patient populations, and
+their scanned-film appearance differs from modern full-field digital
+mammography (FFDM).
+
+Native-digital datasets avoid the scanned-film mismatch, but many are small or
+specialized. INbreast \cite{moreira2012inbreast} has precise expert contours,
+but only 410 images from 115 cases. CSAW-S \cite{matsoukas2020csaws} supplies
+cancer and anatomy masks for 338 images. The sequential microcalcification
+dataset \cite{loizidou2021microcalc} contains 400 temporal mammograms with
+microcalcification marks, and the sequential mass dataset
+\cite{loizidou2024masses} contains 400 temporal mammograms with mass contours.
+DMID \cite{oza2024dmid} provides mass masks for a 510-image collection.
+MEXBreast \cite{luna2025mexbreast} focuses on microcalcification-cluster boxes,
+whereas MDCMI-BC \cite{alhejri2026mdcmi} supplies lesion contours for 266
+images. These resources are valuable for their intended tasks, but none offers
+the same combination of scale, lesion diversity, and fixed evaluation protocol
+as VinDr-Mammo.
+
+Some larger resources have different limitations. KAU-BCMD
+\cite{alsolami2021kau} contains 5,662 mammograms, but its released localization
+information does not define a reproducible detector split or report the number
+of mass-positive images. EMBED \cite{jeong2023embed} and OPTIMAM
+\cite{optimam2026} contain much larger clinical cohorts and lesion-level
+information, but access is controlled and the complete cohorts are not packaged
+as single, fixed detection benchmarks. OMAMA-DB \cite{kanamarlapudi2026omama} is
+large and public, but its released lesion boxes were produced by a model rather
+than drawn manually by radiologists.
+
+Other datasets use a different imaging modality or are synthetic. CDD-CESM
+\cite{khaled2022cddcesm} contains contrast-enhanced spectral mammography.
+BCS-DBT \cite{buda2021bcsdbt} and DBT-2026 \cite{wu2026dbt} contain digital
+breast tomosynthesis volumes. Results on those modalities should not be treated
+as direct 2-D FFDM results. VICTRE \cite{badano2018victre}, M-SYNTH
+\cite{sizikova2024msynth}, and T-SYNTH \cite{wiedeman2025tsynth} provide exact
+synthetic lesion locations and controlled experimental factors. Their labels
+are precise, but models trained on simulated breasts still have to generalize
+to clinical images.
+
+We selected VinDr-Mammo \cite{nguyen2023vindr} as the primary dataset because
+it combines native FFDM, lesion boxes, four-view examinations, and a fixed test
+set at a useful scale. It contains 5,000 examinations and 20,000
+original-resolution DICOM images. Each examination contains CC and MLO views of
+both breasts. The images were acquired at two Vietnamese hospitals using
+systems from three vendors. Two experienced radiologists read every
+examination independently, and a third radiologist resolved disagreements.
+The readers assigned BI-RADS categories and drew boxes around suspicious or
+probably benign findings \cite{nguyen2023vindr}.
+
+The official release provides 4,000 training examinations and 1,000 held-out
+test examinations \cite{pham2022vindrphysionet}. The split preserves the
+distributions of BI-RADS assessment, breast density, and finding type. The
+released annotations contain 1,226 mass boxes on 1,113 mammograms. This is a
+larger openly downloadable native-FFDM mass-localization cohort than the other
+expert-annotated 2-D datasets in
+Table~\ref{tab:mammography_detection_datasets}.
+
+VinDr-Mammo does not provide a pathology-confirmed cancer endpoint
+\cite{nguyen2023vindr}. It does not include biopsy results, BI-RADS~2 findings
+were intentionally not boxed, and several secondary finding categories are
+rare. We therefore use it to study \emph{radiologist-defined lesion
+localization}, with mass detection as the primary task. We do not interpret a
+detected box as direct proof of cancer. Within this narrower task, the native
+DICOM images, radiologist arbitration, public access, and official test set
+make VinDr-Mammo suitable for a controlled comparison of detector families and
+resolution-preserving inference strategies.
+
+\begin{table*}[t]
+\centering
+\caption{Mammography datasets with reusable spatial lesion annotations identified in the survey through August 2026. Counts refer to released source mammograms or DBT volumes, not ROI crops, masks, or annotated duplicate images. ``Mass-localized images'' counts distinct mammograms or DBT volumes with at least one spatial mass annotation. NR denotes not reliably reported. ``Derived'' identifies reuse of images from another named dataset.}
+\label{tab:mammography_detection_datasets}
+\scriptsize
+\setlength{\tabcolsep}{2.4pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{threeparttable}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{1.90cm}c>{\raggedright\arraybackslash}p{1.15cm}>{\raggedleft\arraybackslash}p{0.90cm}>{\raggedleft\arraybackslash}p{1.05cm}>{\raggedleft\arraybackslash}p{0.82cm}>{\raggedright\arraybackslash}p{2.25cm}>{\raggedright\arraybackslash}p{1.55cm}X@{}}
+\toprule
+Dataset & Year & Modality & Cases & Images / volumes & Mass images & Spatial lesion labels & Released matrix & Access and provenance \\
+\midrule
+\multicolumn{9}{@{}l}{\textit{Clinical 2-D mammography and derived 2-D collections}} \\
+MIAS / Mini-MIAS \cite{suckling1994mias} & 1994 & SFM scan & 161 & 322 & 55\tnote{h} & Abnormality centre and radius; mass and calcification types & Mini: $1024\!\times\!1024$ & Open; Mini-MIAS is downsampled from MIAS \\
+DDSM \cite{heath2001ddsm} & 2001 & SFM scan & 2,620 & $\sim$10,480 & 2,188\tnote{i} & Expert lesion contours; mass and calcification & Variable & Open legacy release; original \\
+BCDR-FM / BCDR-DM \cite{guevara2012bcdr} & 2012 & SFM scan / FFDM & 1,734 & 7,315 & NR & Expert lesion outlines and segmentations & $720\!\times\!1168$; $2560\!\times\!3328$ or $3328\!\times\!4084$ & Registered portal; original; complete image access should be verified \\
+INbreast \cite{moreira2012inbreast} & 2012 & FFDM & 115 & 410 & 107 & Expert contours for masses, calcifications, asymmetries, and distortions & $2560\!\times\!3328$ or $3328\!\times\!4084$ & Research redistribution; original \\
+SNUBH-MDB-$\mu$Ci \cite{shin2016microcalc} & 2016 & FFDM & NR & 49 & 0 & Individual microcalcification points and cluster boxes & $1914\!\times\!2294$ & Open; original \\
+CBIS-DDSM \cite{lee2017cbisddsm} & 2017 & SFM scan, DICOM & 1,566 & 3,103 & 1,592 & Revised mass/calcification masks and boxes & Variable & Open TCIA; \textbf{derived from DDSM} \\
+Mini-DDSM \cite{lekamlage2020miniddsm} & 2020 & SFM derivative & 2,414 & 9,684 & NR & Generic lesion masks; lesion type is not consistently retained & Variable, half-scale & Open; \textbf{derived from DDSM} \\
+SuReMaPP \cite{bruno2020suremapp} & 2020 & FFDM / CR & 145 & 343 & NR & Expert suspicious-region circles and lesion descriptors & $3584\!\times\!2816$ or $5928\!\times\!4728$ & Open repository; original \\
+CSAW-S \cite{matsoukas2020csaws} & 2020 & FFDM & 172 & 338 & NR & Expert cancer masks plus non-expert anatomy masks & NR & Request access; subset of the CSAW cohort \\
+Sequential microcalcifications \cite{loizidou2021microcalc} & 2021 & FFDM & 100 & 400 & 0 & Individual microcalcification marks by two radiologists & $4096\!\times\!3328$ & Open; original temporal cohort \\
+\bottomrule
+\end{tabularx}
+\begin{tablenotes}[flushleft]\scriptsize
+\item[h] MIAS labels 56 images as masses, but one mass record has no usable spatial coordinates; 55 images are therefore directly usable for detection.
+\item[i] DDSM does not publish an official distinct-image mass subtotal; 2,188 is the source-image count reported by the mass-image extraction of Lin and Huang \cite{lin2020massdataset}.
+\end{tablenotes}
+\end{threeparttable}
+\end{table*}
+
+\begin{table*}[t]
+\ContinuedFloat
+\centering
+\caption{Mammography datasets with reusable spatial lesion annotations (continued): clinical 2-D collections.}
+\scriptsize
+\setlength{\tabcolsep}{2.4pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{threeparttable}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{1.90cm}c>{\raggedright\arraybackslash}p{1.15cm}>{\raggedleft\arraybackslash}p{0.90cm}>{\raggedleft\arraybackslash}p{1.05cm}>{\raggedleft\arraybackslash}p{0.82cm}>{\raggedright\arraybackslash}p{2.25cm}>{\raggedright\arraybackslash}p{1.55cm}X@{}}
+\toprule
+Dataset & Year & Modality & Cases & Images / volumes & Mass images & Spatial lesion labels & Released matrix & Access and provenance \\
+\midrule
+\multicolumn{9}{@{}l}{\textit{Clinical 2-D mammography and derived 2-D collections (continued)}} \\
+KAU-BCMD \cite{alsolami2021kau} & 2021 & FFDM & 1,416 & 5,662 & NR & Radiologist-reviewed suspicious/tumour ROI masks and boxes & NR & Open; original \\
+CDD-CESM \cite{khaled2022cddcesm} & 2022 & CESM & 326 & 2,006 & 644 & Hand-drawn abnormality masks; boxes derivable & Mean $2355\!\times\!1315$ & Open TCIA; original \\
+Sequential masses v2 \cite{loizidou2024masses} & 2024 & FFDM & 100 & 400\tnote{a} & 200 & Mass contours by two radiologists; biopsy-confirmed malignant cases included & $4096\!\times\!3328$ & Open; original temporal cohort \\
+VinDr-Mammo \cite{nguyen2023vindr} & 2022/23 & FFDM & 5,000 & 20,000\tnote{b} & 1,113 & Native boxes for 14 finding categories; double read and arbitration & $2012\!\times\!2812$ to $2812\!\times\!3580$ & Credentialed open access; original; official 4,000/1,000-exam split \\
+DMID \cite{oza2024dmid} & 2023/24 & FFDM & 225 & 510\tnote{c} & 269 & Pixel annotations and mass masks & $4751\!\times\!6000$ & Open; original \\
+EMBED \cite{jeong2023embed} & 2023 & FFDM / C-view & 110k & 3.4M\tnote{d} & NR & Approximately 60,000 lesion ROIs linked to pathology and descriptors & Variable & Controlled AWS access; 20\% of 2-D/C-view cohort released \\
+MEXBreast \cite{luna2025mexbreast} & 2025 & FFDM PNG & NR & 620 & 0 & Native boxes for microcalcification clusters & Matrix NR; 50/70/100 $\mu$m & Open; original \\
+Annotated Mini-MIAS \cite{jeevan2025annotatedmias} & 2025 & SFM derivative & 161 source & 932 augmented & NR & Non-expert class boxes; not mass-specific & $640\!\times\!640$ & Open; \textbf{derived from Mini-MIAS}; not clinical ground truth \\
+MDCMI-BC / AISSLab \cite{alhejri2026mdcmi} & 2025/26 & FFDM-to-PNG & 133 & 266\tnote{e} & 166 & Expert benign/malignant lesion contours & $3540\!\times\!4740$ & Open; original \\
+OMAMA-DB \cite{kanamarlapudi2026omama} & 2026 & 2-D MG / DBT & NR & 231,080\tnote{f} & NR & Pathology labels plus automated DeepSight lesion boxes & $1024\!\times\!1024$ release & Open Harvard Dataverse; original images, machine-generated boxes \\
+OPTIMAM / OMI-DB \cite{optimam2026} & living & FFDM / DBT & $>$740k & $>$10M & NR & Expert ROIs with biopsy-linked clinical outcomes & Variable & Application and licence; original UK screening cohort \\
+\bottomrule
+\end{tabularx}
+\begin{tablenotes}[flushleft]\scriptsize
+\item[a] The release contains 400 source mammograms; 200 images carry mass contours.
+\item[b] The released VinDr-Mammo annotations contain 1,226 mass boxes on 1,113 distinct mammograms.
+\item[c] DMID contains 269 mass-localized mammograms; 241 corresponding ROI-mask files are supplied.
+\item[d] The figures describe the complete EMBED cohort; the public AWS release contains 20\% of the 2-D and C-view data.
+\item[e] MDCMI-BC contains 166 benign/malignant lesion images and 100 normal images.
+\item[f] OMAMA-DB reports 163,568 2-D images and 67,512 DBT volumes; the boxes are automated annotations and should not be treated as manual expert ground truth.
+\end{tablenotes}
+\end{threeparttable}
+\end{table*}
+
+\begin{table*}[t]
+\ContinuedFloat
+\centering
+\caption{Mammography datasets with reusable spatial lesion annotations (continued): clinical DBT and synthetic collections.}
+\scriptsize
+\setlength{\tabcolsep}{2.4pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{threeparttable}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{1.90cm}c>{\raggedright\arraybackslash}p{1.15cm}>{\raggedleft\arraybackslash}p{0.90cm}>{\raggedleft\arraybackslash}p{1.05cm}>{\raggedleft\arraybackslash}p{0.82cm}>{\raggedright\arraybackslash}p{2.25cm}>{\raggedright\arraybackslash}p{1.55cm}X@{}}
+\toprule
+Dataset & Year & Modality & Cases & Images / volumes & Mass images & Spatial lesion labels & Released matrix & Access and provenance \\
+\midrule
+\multicolumn{9}{@{}l}{\textit{Clinical DBT collections}} \\
+BCS-DBT \cite{buda2021bcsdbt} & 2021 & DBT & 5,060 & 22,032\tnote{g} & 309 & Radiologist 3-D boxes for masses and architectural distortions & $2457\!\times\!1890/1996$ per slice & Open TCIA; original; fixed challenge split \\
+DBT-2026 \cite{wu2026dbt} & 2026 & DBT & 558 & 558 exams & NR & Expert 3-D lesion segmentations with biopsy outcomes & NR & Application-based access; original \\
+\midrule
+\multicolumn{9}{@{}l}{\textit{Synthetic mammography collections}} \\
+VICTRE \cite{badano2018victre} & 2018/22 & Synthetic DM / DBT & 2,986 virtual & 217,913 files & NR & Exact inserted mass and microcalcification truth & Variable & Open TCIA; simulation-generated \\
+M-SYNTH \cite{sizikova2024msynth} & 2024 & Synthetic DM & --- & 45,000 & NR & Exact mass masks across density, size, conspicuity, and dose factors & NR & Open; generated with VICTRE tools \\
+T-SYNTH \cite{wiedeman2025tsynth} & 2025 & Synthetic DM / DBT & --- & 9,000 paired samples & NR & Exact mass masks and derived boxes; tissue segmentations & NR & Open; generated with VICTRE tools \\
+\bottomrule
+\end{tabularx}
+\begin{tablenotes}[flushleft]\scriptsize
+\item[g] BCS-DBT contains 336 mass boxes on 309 distinct DBT volumes in the released box files.
+\end{tablenotes}
+\end{threeparttable}
+\end{table*}
+
+\paragraph{Scope of the related-work review.}
+The applied review below focuses on papers that cite the original VinDr-Mammo
+publication \cite{nguyen2023vindr}. We screened 272 citing records, retained 49
+unique studies for full-text review, and identified 13 studies that directly
+performed mammographic object detection. Therefore, the reported patterns in
+resizing, preprocessing, data splitting, and evaluation describe the
+VinDr-Mammo citing literature, not all mammography research. We include a small
+number of earlier mammography systems and general object-detection papers only
+to explain the model families. Table~\ref{tab:mammography_detection_datasets}
+provides the broader dataset comparison.
+
+\subsection{Deep Learning for Mammographic Lesion Detection}
+\label{sec:background_mammo_detection}
+
+Screening mammograms are unusually demanding inputs for an object detector.
+They are high-resolution projections in which a lesion can occupy only a small
+fraction of the breast, local contrast is low, and normal fibroglandular tissue
+can resemble or obscure an abnormality.  The detector must therefore preserve
+fine evidence while retaining enough global anatomy to reject structured
+background.  It must also operate under severe foreground--background and
+between-class imbalance: a negative mammogram contains millions of background
+pixels, whereas masses, distortions, and calcification clusters are sparse and
+have markedly different sizes and appearances.
+
+Deep mammography systems have been developed under several supervision levels.
+Strongly supervised systems use lesion boxes or masks to learn an explicit
+localizer, as in early region-based lesion detection and classification work
+\cite{ribli2018lesions}. Weakly supervised systems use a label for the whole
+image, breast, or examination instead of a lesion box. Shen et al.
+\cite{shen2019screening} trained a screening classifier from image-level
+labels. GMIC \cite{shen2021gmic} combines a low-resolution global branch with
+high-resolution local patches. Lotter et al. \cite{lotter2021robust} used an
+annotation-efficient training scheme, and Sampaio and Cordeiro
+\cite{sampaio2023weak} compared several class-activation maps for weak mass
+localization. A reader study showed that a learned screening model can help
+radiologists make examination-level decisions \cite{wu2020radiologists}, but a
+correct examination label does not prove that the model found the lesion. The
+present work therefore evaluates the more explicit CADe task: every prediction
+must match a radiologist-annotated lesion box.
+
+VinDr-Mammo has become a common test bed for this setting, but the experiments
+do not use one common protocol. Mahoro and Akhloufi compared YOLOv7 with YOLOv8
+\cite{mahoro2023oneshot}, while Samadi et al. compared a modified YOLOv11n with
+earlier YOLO, EfficientDet, and Faster R-CNN models \cite{samadi2026yolo}.
+Figueiredo et al. used progressive cross-dataset fine-tuning
+\cite{figueiredo2026progressive}. \"{O}zi\c{c} et al. compared full-image,
+breast-ROI, and ground-truth mass-ROI inputs \cite{ozic2023scenarios}. Nguyen et
+al. studied adaptation between breast-density groups
+\cite{nguyen2023crossdensity}. Intasam et al. evaluated several detectors on
+embedded hardware \cite{intasam2025embedded}, whereas Zepeda-Reyes et al.
+combined several mammography datasets \cite{zepeda2026density}. Exemplar
+Med-DETR uses visual lesion examples \cite{bhat2025exemplar}, and MANGA-YOLO
+adds Mamba-inspired and grouped attention blocks \cite{trang2025manga}. These
+studies do not define a single leaderboard:
+several use only mass-positive images, add a selected set of negative images,
+or create random image-level splits, whereas others use the official
+examination-level test partition.  Reported mAP values are consequently not
+comparable without matching the lesion definition, negative-case policy,
+partition unit, input resolution, and evaluation code.
+
+\subsection{Models and Experimental Protocols in VinDr-Mammo Studies}
+\label{sec:background_vindr_models}
+
+The 13 direct detection studies in the review fall into four broad model
+families. One-stage YOLO detectors are the most common because they predict
+boxes in a single pass and are relatively inexpensive to train and run. The
+original YOLO paper introduced this single-pass formulation
+\cite{redmon2016yolo}, and YOLOv7 later improved the real-time design and
+training procedure \cite{wang2023yolov7}. In the VinDr literature, Mahoro and
+Akhloufi directly compare YOLOv7 and YOLOv8 \cite{mahoro2023oneshot}, while
+\"{O}zi\c{c} et al. test YOLOv8n under different crop conditions
+\cite{ozic2023scenarios}. Kebede et al. ensemble three YOLOv5 sizes
+\cite{kebede2024dualview}; Intasam et al. compare versions from YOLOv5 through
+YOLOv11 \cite{intasam2025embedded}.
+
+Other papers modify the detector itself. Figueiredo et al. replace the usual
+backbone with DenseNet-201 \cite{figueiredo2026progressive}. Samadi et al. add a
+heatmap-guided spatial-attention stage \cite{samadi2026yolo}. Bulatovi\'{c} et
+al. add a fine-resolution P2 head, CBAM attention, overlapping patches, and box
+fusion \cite{bulatovic2025patched}. Trang et al. add Mamba-inspired contextual
+attention and grouped spatial/channel attention \cite{trang2025manga}. A
+higher YOLO version number therefore does not isolate one architectural change:
+these papers also change the dataset subset, preprocessing, input size, head,
+and loss. Their headline scores should not be interpreted as a controlled
+ranking of YOLO versions.
+
+Second, two-stage region-based detectors are used when proposal-level features
+must support additional reasoning. Cross-density adaptation augments a
+ResNet-50 Faster R-CNN with domain discriminators, noise-aware training, and
+Fourier/CLAHE appearance transfer \cite{nguyen2023crossdensity}; TransReg uses
+weight-sharing Faster R-CNN branches with ResNet-50--FPN or Swin--FPN and a
+cross-transformer over paired CC/MLO RoIs \cite{nguyen2023transreg}. Third,
+query-based models appear both as baselines---RT-DETR is compared with YOLO,
+RTMDet, and Cascade R-CNN \cite{abdikenov2025transfer}---and as an
+exemplar-conditioned detector in which a Swin encoder and visual lesion
+examples replace an ambiguous text-only prompt \cite{bhat2025exemplar}.
+Finally, hybrid systems use the detector as one component of a larger decision
+pipeline: a YOLOv5 ensemble is paired with an EfficientNet-B3 dual-view
+classifier \cite{kebede2024dualview}, while a multi-dataset benchmark couples
+YOLO localization with VGG19, ResNet-50, DenseNet-121, and EfficientNet-B3
+classification \cite{zepeda2026density}. Table~\ref{tab:vindr_detection_protocols}
+records these model choices together with the data protocol that gives each
+reported result its meaning.
+
+\begin{table*}[t]
+\centering
+\caption{Models and experimental protocols in the 13 reviewed studies that directly perform object detection on VinDr-Mammo. Headline results identify the reported operating point; they are not a leaderboard because cohorts, classes, partition units, IoU rules, and metrics differ. NR denotes not reported clearly enough to reproduce from the paper.}
+\label{tab:vindr_detection_protocols}
+\scriptsize
+\setlength{\tabcolsep}{2.6pt}
+\renewcommand{\arraystretch}{1.13}
+\begin{threeparttable}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{2.05cm}>{\raggedright\arraybackslash}p{3.35cm}>{\raggedright\arraybackslash}p{2.55cm}>{\raggedright\arraybackslash}p{2.75cm}X@{}}
+\toprule
+Study & Detector and model components & VinDr cohort / task & Input and preprocessing & Partition and reported evaluation \\
+\midrule
+Mahoro and Akhloufi \cite{mahoro2023oneshot} & Pretrained YOLOv7 and YOLOv8; four independent enhancement conditions & Mass-positive images plus 200 selected no-mass images & DICOM-to-JPEG, $640\!\times\!640$; raw, CLAHE, median, or bilateral filtering & Random image split 75/22/3 (921/270/38). YOLOv8+median gives mAP$_{50}$ 0.65/mAP$_{50:95}$ 0.35; the maximum mAP$_{50:95}$ is 0.36 without enhancement. Only 38 test images. \\
+\"{O}zi\c{c} et al. \cite{ozic2023scenarios} & YOLOv8n under full-image, breast-ROI, and mass-ROI scenarios & Mass localization; scenario-specific mass cohorts & DICOM-to-8-bit PNG; Otsu breast crop or a $1.2\times$ ground-truth-box crop & 80/10/10; patient/exam grouping NR. Breast ROI mAP$_{50}$ 0.694; the 0.995 mass-ROI result uses the ground-truth location and is an oracle. \\
+Nguyen et al. (TransReg) \cite{nguyen2023transreg} & Siamese Faster R-CNN with ResNet-50--FPN or Swin--FPN; cross-transformer fuses paired-view RoIs & Masses in ipsilateral CC/MLO pairs & Histogram breast crop; VinDr resized to $500\!\times\!1200$; flips, Gaussian noise, and box scaling & Official 4,000/1,000-exam split. Swin model recall 0.797/0.852/0.895 at 0.5/1/2 FPPI; match IoU $>0.2$. \\
+Nguyen et al. (cross-density) \cite{nguyen2023crossdensity} & ResNet-50 Faster/DA-Faster R-CNN; NLTE noise handling and FALCE appearance adaptation & 1,499 dense-breast source and 181 fatty-breast target finding images; four abnormality classes & Breast mask, Fourier amplitude transfer, CLAHE; shorter side 640 pixels & Stratified target folds with a 60/40 target train/test ratio. FALCE target mAP 0.5796; a density-adaptation test, not the official full-cohort benchmark. \\
+Kebede et al. \cite{kebede2024dualview} & YOLOv5-s/m/l detector ensemble; separate EfficientNet-B3 dual-view classifier & VinDr plus Mini-DDSM and a local Ethiopian cohort & Laterality normalization for classification; detector preprocessing incompletely specified & Classifier: grouped five-fold CV by study with 20\% test holdout; detector split NR. Detector mAP increased from 0.57 to 0.67 after adding VinDr. \\
+Bulatovi\'{c} et al. \cite{bulatovic2025patched} & YOLOv8s with fine P2 head and CBAM; overlapping patches and Maximum Box Fusion & Masses and calcifications; VinDr plus INbreast & Photometric correction, VOI-LUT/windowing and artifact cleanup; overlapping $640\!\times\!640$ patches & Official VinDr test; remaining exams divided at patient level for train/validation. Calcification F1 0.651 (precision 0.634, recall 0.668). \\
+Intasam et al. \cite{intasam2025embedded} & YOLOv5 variants, YOLOv7/8/10/11, and RT-DETR-L; Jetson Nano deployment & Filtered 1,093-image VinDr cohort plus private Thai data & Thresholding and largest-contour breast crop; $640\!\times\!640$ & 70/20/10 on the VinDr subset; grouping unit NR. YOLOv5n mAP$_{50}$ 0.92 and mAP$_{50:95}$ 0.65; not an official-test result. \\
+\bottomrule
+\end{tabularx}
+\end{threeparttable}
+\end{table*}
+
+\begin{table*}[t]
+\ContinuedFloat
+\centering
+\caption{Models and experimental protocols in direct VinDr-Mammo detection studies (continued).}
+\scriptsize
+\setlength{\tabcolsep}{2.6pt}
+\renewcommand{\arraystretch}{1.13}
+\begin{threeparttable}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{2.05cm}>{\raggedright\arraybackslash}p{3.35cm}>{\raggedright\arraybackslash}p{2.55cm}>{\raggedright\arraybackslash}p{2.75cm}X@{}}
+\toprule
+Study & Detector and model components & VinDr cohort / task & Input and preprocessing & Partition and reported evaluation \\
+\midrule
+Bhat et al. \cite{bhat2025exemplar} & Exemplar Med-DETR with a Swin backbone; visual lesion prompts, random normal backgrounds, and hard false-positive memory & Mass and calcification detection; CMMD used for out-of-domain testing & Full-resolution mammograms with lesion-example and background crops; fixed network resize NR & MammoCLIP-style 16,000/4,000-image split. Test mAP$_{50}$: 0.70 mass and 0.55 calcification. \\
+Abdikenov et al. \cite{abdikenov2025transfer} & Cascade R-CNN, YOLOv12-S/L/X, RTMDet-X, and RT-DETR-X; primary model YOLOv12-L & VinDr, INbreast, CBIS-DDSM, and EMBED; mass and calcification transfer & CLAHE and breast crop at $640\!\times\!640$; minority-class flips, rotation, and scaling & 80/10/10 at examination level. VinDr-only mAP$_{50}$: 0.590 mass and 0.014 calcification; sequential transfer into VinDr reduced mass mAP$_{50}$ to 0.50. \\
+Trang et al. \cite{trang2025manga} & MANGA-YOLO based on YOLOv11; Mamba-inspired MACA plus spatial/channel group attention & Mass subsets of VinDr, INbreast, and CBIS-DDSM & DICOM-to-8-bit JPEG; $640\!\times\!640$ & Random image-level 80/20 split without patient grouping. VinDr mAP$_{50}$ 0.690 and mAP$_{50:95}$ 0.340. \\
+Figueiredo et al. \cite{figueiredo2026progressive} & YOLOv11s with DenseNet-201 backbone and P3--P5 heads; sequential CBIS-DDSM$\rightarrow$INbreast$\rightarrow$VinDr fine-tuning & Filtered 714-image VinDr subset & CLAHE/filtering and $640\!\times\!640$ inputs; external datasets include ROI crops & 571/143 train/validation; no held-out VinDr test. Validation mAP$_{50}$ 0.8055. \\
+Samadi et al. \cite{samadi2026yolo} & YOLOv11n in staged baseline, enhancement, and heatmap/spatial-attention variants; compares YOLOv5/8, EfficientDet-D0, and Faster R-CNN & VinDr abnormality detection & CLAHE plus bilateral filtering in the enhanced stages; input size NR & Train/validation/test sets stated, but ratio and grouping unit NR. Final mAP$_{50}$ 0.6828 and mAP$_{50:95}$ 0.4082. \\
+Zepeda-Reyes et al. \cite{zepeda2026density} & YOLOv5/8/11 localization; VGG19, ResNet-50, DenseNet-121, and EfficientNet-B3 classification & Mass-Bench combines VinDr, CBIS-DDSM, INbreast, and DMID & CLAHE at $768\!\times\!768$; flips, rotation, and $0.8$--$1.2\times$ scaling & Patient-level 70/20/10 and five-fold localization CV. Aggregate YOLOv11 mAP$_{50}$ 0.663 and mAP$_{50:95}$ 0.335; not VinDr-only. \\
+\bottomrule
+\end{tabularx}
+\end{threeparttable}
+\end{table*}
+
+Partition choice is at least as important as architecture choice. TransReg uses
+the official examination-level test set \cite{nguyen2023transreg}. The patched
+YOLO study also uses that test set and divides the remaining data by patient
+\cite{bulatovic2025patched}. Exemplar Med-DETR uses a MammoCLIP-style
+16,000/4,000-image partition \cite{bhat2025exemplar}. Abdikenov et al. split at
+the examination level \cite{abdikenov2025transfer}, and Zepeda-Reyes et al.
+split at the patient level \cite{zepeda2026density}. These grouping rules keep
+all correlated images from one examination or patient in the same partition.
+
+Several other studies do not provide the same protection. Mahoro and Akhloufi
+use a random image split with only 38 test images \cite{mahoro2023oneshot}.
+\"{O}zi\c{c} et al. report an 80/10/10 split but do not report patient or
+examination grouping \cite{ozic2023scenarios}. Intasam et al. report a 70/20/10
+split on a filtered subset but do not clearly state the grouping unit
+\cite{intasam2025embedded}. MANGA-YOLO explicitly uses a random image-level
+80/20 split \cite{trang2025manga}. In these settings, views from one examination
+may cross partitions. Filtering the data to a positive-heavy subset also
+changes the number and distribution of negative images. Such experiments can
+support an ablation, but their mAP does not measure the same test population as
+the original stratified VinDr-Mammo split.
+
+The evaluation targets also differ. The cross-density study measures adaptation
+between density groups \cite{nguyen2023crossdensity}. Abdikenov et al. measure
+cross-dataset transfer \cite{abdikenov2025transfer}. TransReg reports FROC
+recall with an IoU threshold of 0.2 \cite{nguyen2023transreg}, while the patched
+YOLO study highlights class-specific F1 \cite{bulatovic2025patched}. The
+present work therefore keeps the examination split, negative-case policy, IoU
+rule, and metric implementation fixed when comparing models and resolutions.
+
+The wider VinDr citing literature supports several components even when its
+primary endpoint is classification rather than supervised box detection.
+Weakly supervised systems include a ResNet-22 GMIC model evaluated with CAM,
+Grad-CAM, Grad-CAM++, XGrad-CAM, and Layer-CAM on a predefined 1,978/474-image
+split \cite{sampaio2023weak}, a two-level patch/image MIL model that accepts a
+variable number of examination views \cite{pathak2023caselevel}, and
+contralateral Siamese patch pretraining with patient-grouped 8/1/1 partitions
+\cite{vanvorst2024siamese}. ROI-first classifiers use YOLOv5 followed by
+EfficientNet-B2 on the official split \cite{tran2023transparency}, or YOLOX-s
+followed by EfficientNet-B7/ConvNeXt-101 with patient-wise 80/10/10 splitting
+\cite{huynh2023roi}. Resolution studies compare EfficientNet and ResNet
+classifiers under repeated patient-wise holdouts
+\cite{ferreira2026preprocessing}, or patch/direct ConvNeXt models on the
+official VinDr test set \cite{petrini2025resolution}. More recent foundation
+model pipelines use Grounding DINO \cite{liu2024groundingdino} to select
+full-resolution RoIs and DINOv2 \cite{oquab2024dinov2} to encode them
+\cite{sanghvi2026attend}. AEGIS \cite{waggener2026aegis} progressively
+fine-tunes ViTs, pretrained with the JEPA objective \cite{assran2023ijepa}, up
+to $2048\!\times\!1536$. Mammo-FM combines an
+EfficientNet-B5 image encoder with ModernBERT and a RetinaNet localization head
+\cite{ghosh2025mammofm}. These classification and representation studies do not
+report box AP under a common detector protocol. We use them only as evidence
+for pipeline choices: breast cropping, mammography-specific pretraining,
+multi-view aggregation, and preservation of small image details.
+
+\subsection{Resolution, Preprocessing, and Local Context}
+\label{sec:background_resolution}
+
+The most common practical baseline converts each DICOM image to an 8-bit display
+image and resizes the whole mammogram to $640\!\times\!640$. Mahoro and Akhloufi
+use this pipeline for YOLOv7 and YOLOv8 \cite{mahoro2023oneshot}. The progressive
+fine-tuning study also uses $640\!\times\!640$ \cite{figueiredo2026progressive},
+as do the embedded benchmark \cite{intasam2025embedded} and MANGA-YOLO
+\cite{trang2025manga}. This size makes pretrained detectors affordable, but it
+also distorts the breast to a square and represents every lesion with fewer
+pixels. The effect depends on lesion type. In one VinDr experiment, mass mAP
+remained usable while calcification mAP$_{50}$ was only 0.014
+\cite{abdikenov2025transfer}. A separate VinDr classification study found that
+reducing native digital resolution lowered AUC \cite{petrini2025resolution}. A
+controlled preprocessing study found improvement up to roughly 1024-pixel
+inputs in its classification setting, with little additional gain at 2048
+pixels \cite{ferreira2026preprocessing}. These classification results do not
+measure box AP, but they show that input resolution should be tested rather
+than treated as an unreported loader setting.
+
+Breast cropping is a low-cost way to increase effective lesion scale by
+discarding air, borders, and acquisition artifacts.  On VinDr-Mammo, a
+breast-region crop improved mass localization relative to an uncropped image,
+whereas a crop centered on the ground-truth mass produced an oracle-like and
+clinically unavailable upper bound \cite{ozic2023scenarios}.  ROI-first systems
+similarly use a detector or threshold-based fallback to restrict downstream
+analysis to breast tissue \cite{huynh2023roi}. Intensity operations are less
+predictable. VOI-LUT/windowing applies the display transform stored in the
+DICOM data. CLAHE increases local contrast, while median and bilateral filters
+reduce noise in different ways. Mahoro and Akhloufi obtained their best
+mAP$_{50}$ with median filtering \cite{mahoro2023oneshot}. Samadi et al.
+improved their baseline after adding CLAHE and bilateral filtering
+\cite{samadi2026yolo}. The cross-density study combined CLAHE with Fourier-based
+appearance transfer \cite{nguyen2023crossdensity}. However, a multi-equipment
+study found that the best preprocessing choice changed with scanner and dataset
+\cite{ferreira2026preprocessing}. We therefore should not assume that one
+enhancement sequence is universally best. Augmentations that preserve the
+lesion, such as the transparency method of Tran et al.
+\cite{tran2023transparency}, and crops that retain real breast tissue are safer
+starting points for controlled ablations.
+
+Resolution-preserving methods avoid forcing the entire field of view through a
+single low-resolution tensor.  Global--local models first identify suspicious
+regions on a coarse representation and then inspect high-resolution patches
+\cite{shen2021gmic}; two-stage multi-scale systems similarly separate global
+localization from detailed lesion delineation \cite{yan2021multiscale}.  In
+general computer vision, SNIPER samples scale-appropriate chips during
+multi-scale training \cite{singh2018sniper}, and SAHI maps detections from
+overlapping high-resolution slices back to the source image
+\cite{akyon2022sahi}. The most direct VinDr-Mammo example uses overlapping
+$640$-pixel patches, a fine-resolution P2 prediction head, and cross-patch box
+fusion \cite{bulatovic2025patched}. Its attention block follows the
+channel-and-spatial design of CBAM \cite{woo2018cbam}. Patch sampling can also
+support mammography-specific pretraining from normal and abnormal tissue
+\cite{vanvorst2024siamese}.
+
+Tiling also introduces costs and failure modes. The patched-YOLO study shows
+why overlap, background-patch filtering, and box fusion are needed
+\cite{bulatovic2025patched}. A small tile makes the lesion larger relative to
+the network input, but it removes breast-level context, can cut a lesion at a
+tile boundary, increases inference time, and can produce duplicate boxes in
+overlapping regions. Overlap reduces boundary failures, and a global-image
+branch can restore some context. Training must also include enough negative
+patches; otherwise, the detector mostly sees lesion-centered tiles. Exemplar
+Med-DETR addresses this problem by sampling normal background and later adding
+high-scoring false positives to a hard-background memory
+\cite{bhat2025exemplar}. A multiresolution pipeline should therefore evaluate
+tile size, overlap, context, negative sampling, and box fusion together.
+
+\subsection{Detection Backbones and Multi-Scale Heads}
+\label{sec:background_detectors}
+
+Modern detectors can be separated conceptually into a feature extractor, a
+multi-scale feature-fusion network, and a prediction head.  Two-stage Faster
+R-CNN uses a region-proposal network followed by proposal classification and
+box refinement \cite{ren2017fasterrcnn}.  One-stage dense heads predict over a
+feature grid; RetinaNet introduced focal loss to suppress the overwhelming
+contribution of easy background anchors \cite{lin2017retinanet}, a particularly
+relevant imbalance for mammograms.  FPN attaches semantically strong features
+to several spatial resolutions \cite{lin2017fpn}, while EfficientDet's BiFPN
+repeats weighted top-down and bottom-up fusion and jointly scales the backbone,
+neck, head, and input resolution \cite{tan2020efficientdet}.  These feature
+pyramids improve scale coverage, but cannot recover lesion evidence that was
+destroyed before the first convolution by whole-image downsampling.
+
+The backbones in Table~\ref{tab:vindr_detection_protocols} process image
+features in different ways. ResNet stabilizes deep optimization with residual shortcuts
+\cite{he2016resnet}, DenseNet concatenates earlier feature maps to encourage
+feature reuse \cite{huang2017densenet}, and EfficientNet jointly scales depth,
+width, and resolution \cite{tan2019efficientnet}. Swin builds a hierarchical
+transformer with shifted-window attention \cite{liu2021swin}, whereas ConvNeXt
+modernizes a convolutional network using design choices associated with vision
+transformers \cite{liu2022convnext}. YOLOX is an anchor-free YOLO variant with a
+decoupled head \cite{ge2021yolox}. Mamba introduced selective state-space
+modeling with linear sequence complexity \cite{gu2024mamba}; MANGA-YOLO adapts
+that idea for mammographic context modeling \cite{trang2025manga}. These
+mechanisms change optimization and feature aggregation, but none can recover
+small-lesion pixels that were removed during input resizing.
+
+Set-prediction detectors offer a different head design.  DETR replaces anchors
+and non-maximum suppression with object queries and bipartite matching
+\cite{carion2020detr}; Deformable DETR samples sparse locations across
+multi-scale feature maps, improving convergence and small-object performance
+\cite{zhu2021deformabledetr}, and RT-DETR redesigns this family for real-time
+inference \cite{zhao2024rtdetr}. Mammography studies now span these families:
+Faster R-CNN is used for cross-density adaptation
+\cite{nguyen2023crossdensity}; Siamese Faster R-CNN with ResNet-FPN or
+Swin-FPN supports paired-view detection \cite{nguyen2023transreg}; and
+Cascade R-CNN, RTMDet, RT-DETR, and YOLO variants have been compared under a
+shared mammography preprocessing protocol \cite{abdikenov2025transfer}.
+Exemplar Med-DETR further replaces ambiguous text-only prompts with visual
+lesion and background exemplars \cite{bhat2025exemplar}.  Because these papers
+also change data, resolution, and splits, they motivate controlled within-study
+backend comparisons rather than an architecture ranking assembled from their
+headline numbers.
+
+High-resolution prediction levels deserve separate attention from high input
+resolution.  Standard P3--P5 heads make predictions after at least three stages
+of spatial reduction; adding a P2 head supplies a finer grid for small
+calcifications and small masses \cite{bulatovic2025patched}.  Attention modules
+can then reweight spatial and channel evidence \cite{woo2018cbam}, while
+overlap-aware fusion resolves predictions made by adjacent tiles.  The central
+hypothesis behind this study is that preserving source evidence at the input
+and exposing it to an appropriately fine prediction head are complementary:
+neither a stronger backbone nor a finer head can, by itself, undo excessive
+resampling.
+
+\subsection{Multi-View Reasoning and Generalization}
+\label{sec:background_multiview}
+
+A routine examination contains CC and MLO views of each breast, and radiologists
+cross-reference the ipsilateral projections.  Dual-view classification and
+detection ensembles improve on treating each image independently
+\cite{kebede2024dualview}.  Detection-specific models go further: CL-Net learns
+pairwise lesion correspondences with cross-view object queries
+\cite{zhao2022checklink}, while TransReg applies a cross-transformer to RoIs
+from weight-sharing CC/MLO detector branches and learns an implicit
+registration \cite{nguyen2023transreg}.  Such reasoning can suppress a
+single-view false positive, but it must accommodate non-rigid projection
+differences and lesions visible in only one view.
+
+A detector must also work on images from new patients, scanners, and hospitals.
+Scanner vendor, intensity processing, patient population, breast density,
+annotation practice, and film-versus-digital acquisition can all change the
+image distribution. Density-aware adaptation improves transfer between fatty
+and dense VinDr subsets \cite{nguyen2023crossdensity}. However, sequential
+training on external datasets can reduce VinDr performance when the source and
+target data differ \cite{abdikenov2025transfer}. Scanner-stratified experiments
+also show that the best preprocessing choice can depend on the acquisition
+equipment \cite{ferreira2026preprocessing}. We therefore keep the VinDr task
+definition and official test set fixed while changing resolution handling.
+This prevents data-split changes or filtered cohorts from being mistaken for a
+resolution effect.

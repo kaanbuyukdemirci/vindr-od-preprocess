@@ -18,6 +18,11 @@ import torch.nn.functional as F
 import yaml
 from PIL import Image
 
+from .presets import (
+    DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+    DEFAULT_RESEARCH_HE_RGB_PRESET_KEY,
+)
+
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -26,6 +31,10 @@ DEFAULT_DINO_V3_MODEL_ID = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 DEFAULT_DINO_V3_COMPUTE_DTYPE = "float32"
 DEFAULT_DINO_V3_INPUT_SIZE = 1024
 DEFAULT_RESEARCH_DATASET_FOLDER = "preprocessed-vindr-default-research-dataset-v2"
+DEFAULT_RESEARCH_FEATURE_VARIANTS = (
+    "resized_whole_640x640",
+    "resized_whole_1024x1024",
+)
 DINO_V3_LVD_MEAN = (0.485, 0.456, 0.406)
 DINO_V3_LVD_STD = (0.229, 0.224, 0.225)
 
@@ -238,8 +247,51 @@ def default_selected_variants(scan: Mapping[str, Any]) -> list[str]:
 
     available = list(dict(scan.get("variants", {}) or {}))
     if bool(scan.get("is_default_research_dataset", False)):
-        return [key for key in available if key != "original_whole"]
+        preferred = [key for key in DEFAULT_RESEARCH_FEATURE_VARIANTS if key in available]
+        remaining = [
+            key for key in available if key != "original_whole" and key not in preferred
+        ]
+        return preferred + remaining
     return available
+
+
+def native_resized_variant_input_sizes(variants: Iterable[str]) -> dict[str, dict[str, int]]:
+    """Infer native DINOv3 input sizes from grouped resized-variant keys."""
+
+    sizes: dict[str, dict[str, int]] = {}
+    for raw_variant in variants:
+        variant = str(raw_variant)
+        match = re.fullmatch(r"resized_whole_(\d+)x(\d+)", variant)
+        if match is None:
+            continue
+        width, height = (int(value) for value in match.groups())
+        sizes[variant] = {"width": width, "height": height}
+    return sizes
+
+
+def resolved_variant_input_config(
+    input_config: Mapping[str, Any],
+    variant: str,
+) -> dict[str, Any]:
+    """Resolve the input geometry for one dataset variant."""
+
+    resolved = dict(input_config or {})
+    raw_sizes = resolved.pop("variant_input_sizes", {}) or {}
+    if not isinstance(raw_sizes, Mapping):
+        raise ValueError("input.variant_input_sizes must be a mapping of variant names to sizes.")
+    raw_size = raw_sizes.get(str(variant))
+    if raw_size is None:
+        return resolved
+    if not isinstance(raw_size, Mapping):
+        raise ValueError(f"Input size for variant {variant!r} must be a width/height mapping.")
+    try:
+        resolved["width"] = int(raw_size["width"])
+        resolved["height"] = int(raw_size["height"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Input size for variant {variant!r} requires integer width and height values."
+        ) from exc
+    return resolved
 
 
 def estimate_dataset_channel_stats(
@@ -414,7 +466,22 @@ def feature_output_folder(config: Mapping[str, Any]) -> Path:
     if resize_mode == "none":
         size_name = "native"
     else:
-        size_name = f"{int(input_cfg.get('height', 1024))}x{int(input_cfg.get('width', 1024))}"
+        variant_sizes = input_cfg.get("variant_input_sizes", {}) or {}
+        resolved_sizes: set[tuple[int, int]] = set()
+        if isinstance(variant_sizes, Mapping):
+            for raw_size in variant_sizes.values():
+                if not isinstance(raw_size, Mapping):
+                    continue
+                try:
+                    resolved_sizes.add((int(raw_size["width"]), int(raw_size["height"])))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        if resolved_sizes:
+            size_name = "multires-" + "-".join(
+                f"{width}x{height}" for width, height in sorted(resolved_sizes)
+            )
+        else:
+            size_name = f"{int(input_cfg.get('width', 1024))}x{int(input_cfg.get('height', 1024))}"
     output_names = "-".join(
         sorted(str(v) for v in extraction_cfg.get("outputs", ["patch_tokens", "cls_token"]))
     )
@@ -531,7 +598,8 @@ def extract_features_from_config(
                     fallback_png_count += 1
                 if warning:
                     warnings.append(warning)
-                tensor = _prepare_input(tensor, input_cfg)
+                resolved_input_cfg = resolved_variant_input_config(input_cfg, image.variant)
+                tensor = _prepare_input(tensor, resolved_input_cfg)
                 prepared.append((image, tensor, source_kind, warning))
             except Exception as exc:
                 failed += 1
@@ -591,8 +659,9 @@ def extract_features_from_config(
                             "layer": int(extraction_cfg.get("layer", -1)),
                         },
                         "input": {
+                            **resolved_variant_input_config(input_cfg, image.variant),
                             "shape_chw": list(input_tensor.shape),
-                            **input_cfg,
+                            "source_variant": image.variant,
                         },
                     }
                     torch.save(payload, destination)
@@ -606,6 +675,9 @@ def extract_features_from_config(
                         "loaded_source_path": source_path,
                         "loaded_source_format": source_kind,
                         "input_shape_chw": list(input_tensor.shape),
+                        "input_config": _json_safe(
+                            resolved_variant_input_config(input_cfg, image.variant)
+                        ),
                         "feature_shapes": {
                             key: list(value[index].shape) for key, value in feature_batches.items()
                         },
@@ -946,7 +1018,10 @@ def _is_default_research_dataset(dataset_root: Path) -> bool:
             key = ((payload.get("config_snapshot") or {}).get("study_preset_provenance") or {}).get(
                 "preset_key"
             )
-            if str(key) == "simple_crop_pipeline_v1":
+            if str(key) in {
+                DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+                DEFAULT_RESEARCH_HE_RGB_PRESET_KEY,
+            }:
                 return True
     except Exception:
         pass
@@ -955,7 +1030,10 @@ def _is_default_research_dataset(dataset_root: Path) -> bool:
         if resolved.exists():
             payload = yaml.safe_load(resolved.read_text(encoding="utf-8")) or {}
             key = (payload.get("study_preset_provenance") or {}).get("preset_key")
-            return str(key) == "simple_crop_pipeline_v1"
+            return str(key) in {
+                DEFAULT_RESEARCH_DATASET_PRESET_KEY,
+                DEFAULT_RESEARCH_HE_RGB_PRESET_KEY,
+            }
     except Exception:
         pass
     return "default-research-dataset" in dataset_root.name.casefold()

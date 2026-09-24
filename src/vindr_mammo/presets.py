@@ -11,9 +11,10 @@ PAPER_69_PRESET_KEY = "bhat_exemplar_med_detr_vindr"
 SIMPLE_PRESET_KEY = "simple-preset"
 SIMPLE_CROP_PIPELINE_PRESET_KEY = "simple_crop_pipeline_v1"
 # Stable internal key retained so old manifests and CLI invocations keep
-# working. The user-facing preset name is now Default Research Dataset v1.
+# working. The user-facing preset name is now Default Research Dataset v2.
 DEFAULT_RESEARCH_DATASET_PRESET_KEY = SIMPLE_CROP_PIPELINE_PRESET_KEY
 DUAL_WHOLE_PRESET_KEY = SIMPLE_CROP_PIPELINE_PRESET_KEY
+DEFAULT_RESEARCH_HE_RGB_PRESET_KEY = "default_research_dataset_v2_he_rgb"
 LEGACY_DUAL_WHOLE_PRESET_KEY = "crop1024_dual_whole_clahe_v2"
 
 
@@ -227,8 +228,8 @@ STUDY_PRESETS: dict[str, dict[str, Any]] = {
             "Paper 69 reproduction preset for the preprocessing disclosed for Exemplar Med-DETR: preserve the official "
             "VinDr test cohort, keep mammograms at full resolution, and crop only excess "
             "background outside the breast. The paper does not publish its crop code; this preset "
-            "uses the cited MammoCLIP public 5-pixel trim, MONOCHROME1 correction, per-image uint8 "
-            "scaling, threshold-40 longest-run crop, while deliberately omitting MammoCLIP's resize. "
+            "uses the cited MammoCLIP public 5-pixel trim, MONOCHROME1 correction, per-image float32 "
+            "0–255 scaling, threshold-40 longest-run crop, while deliberately omitting MammoCLIP's resize. "
             "For usable early stopping, 15% of official training studies are held out with seed 123; "
             "the GUI can switch back to strict official train/test membership with no validation. "
             "This is the closest available reproduction, not an exact copy, because the paper does "
@@ -265,9 +266,15 @@ STUDY_PRESETS: dict[str, dict[str, Any]] = {
                 "assumptions": {
                     "crop_algorithm": "closest public cited implementation: MammoCLIP ExtractBreast",
                     "trim_border_px": 5,
-                    "crop_detection_threshold_uint8": 40,
+                    "crop_detection_threshold_float_0_255": 40,
                     "crop_padding_px": 0,
-                    "rgb_encoding": "uint8 grayscale replicated into RGB",
+                    "rgb_encoding": (
+                        "float32 grayscale replicated into RGB, with uint8 quantization only at "
+                        "final PNG encoding"
+                    ),
+                    "photometric_precision": (
+                        "intensity scaling, crop detection, and RGB construction run in float32"
+                    ),
                     "validation_split": (
                         "training-oriented assumption: seeded 15% study-level BI-RADS-stratified holdout "
                         "from official training; the paper does not disclose validation IDs or policy"
@@ -289,7 +296,7 @@ STUDY_PRESETS: dict[str, dict[str, Any]] = {
             "preprocess": {
                 "invert_to_black_background": True,
                 "trim_border_px": 5,
-                "intensity_scale_before_geometry": "minmax_uint8",
+                "intensity_scale_before_geometry": "minmax_0_255_float32",
                 "crop_breast": True,
                 "mask_outside_breast": False,
                 "mirror_right_to_left": False,
@@ -733,6 +740,8 @@ if "dataset_layout" not in _dual_whole["replace_sections"]:
     _dual_whole["replace_sections"].append("dataset_layout")
 if "lazy_crop_grids" not in _dual_whole["replace_sections"]:
     _dual_whole["replace_sections"].append("lazy_crop_grids")
+if "feature_extraction" not in _dual_whole["replace_sections"]:
+    _dual_whole["replace_sections"].append("feature_extraction")
 _dual_whole.update({
     "label": "Default Research Dataset (v2 — multi-resolution wholes + windows)",
     "description": (
@@ -756,6 +765,10 @@ _dual_patch["study_preset_provenance"] = {
     "assumptions": {
         "source_coordinate_space": "fixed_preprocessed after breast bounding-box crop and canonical mirroring; original-DICOM transforms are exported",
         "photometric_pipeline": "per-image percentile normalization at 0.5 and 99.5, then CLAHE clip_limit=2.0 tile_grid_size=8 on the whole image before tiling",
+        "photometric_precision": (
+            "all custom-channel operations run in float32; PNG output is quantized to uint8 only "
+            "after the complete pipeline, while saved float32 tensors remain unquantized"
+        ),
         "rgb_encoding": "the same processed grayscale signal is replicated identically into R, G, and B",
         "materialized_crop_export": "disabled; crop selection cannot control whole-image membership",
         "lazy_crop_grids": "metadata-only regular-stride zero-padded edge windows: 1024x1024 at strides 128, 256, and 512; 640x640 at stride 160",
@@ -782,6 +795,30 @@ _dual_patch["lazy_crop_grids"] = [
     {"window_size": 1024, "stride": 512},
     {"window_size": 640, "stride": 160},
 ]
+_dual_patch["feature_extraction"] = {
+    "variants": ["resized_whole_640x640", "resized_whole_1024x1024"],
+    "model": {
+        "model_id": "facebook/dinov3-vitl16-pretrain-lvd1689m",
+        "compute_dtype": "float32",
+    },
+    "input": {
+        "resize_mode": "exact",
+        "width": 1024,
+        "height": 1024,
+        "variant_input_sizes": {
+            "resized_whole_640x640": {"width": 640, "height": 640},
+            "resized_whole_1024x1024": {"width": 1024, "height": 1024},
+        },
+    },
+    "extraction": {
+        "layer": -1,
+        "outputs": ["patch_tokens", "cls_token"],
+        "batch_size": 1,
+        "save_dtype": "float32",
+        "prefer_float32_sources": True,
+        "overwrite": False,
+    },
+}
 _dual_patch["image"] = {
     "normalize": "percentile",
     "percentile_range": [0.5, 99.5],
@@ -823,6 +860,7 @@ _dual_patch["crop_annotation_policy"] = {
 }
 _dual_patch["image_export"] = {
     "rgb_scheme": "custom_channel_pipeline",
+    "custom_channel_pipeline_dtype": "float32",
     "custom_channel_pipeline": {
         channel: {
             "source": "current_crop",
@@ -1001,8 +1039,86 @@ _dual_patch["whole_image_export_contract"] = {
     "expected_mass_annotations": {"train": 829, "val": 160, "test": 237},
 }
 
+
+# Keep this variant structurally identical to Default Research Dataset v2. Only
+# its output identity, provenance text, and photometric channel pipeline differ.
+_research_he_rgb = copy.deepcopy(_dual_whole)
+_research_he_rgb.update({
+    "label": (
+        "Default Research Dataset (v2 — multi-resolution wholes + windows) — HE+RGB"
+    ),
+    "description": (
+        "The Default Research Dataset v2 geometry, membership, annotations, multi-resolution "
+        "1024×1024 and 640×640 whole-image outputs, float32 tensors, and metadata-only window "
+        "manifests, with a whole-image HE+RGB photometric variant. Every channel starts with "
+        "0–100 percentile normalization and histogram equalization; R stops there, G adds "
+        "50–100 percentile normalization, and B adds 75–100 percentile normalization."
+    ),
+    "output_folder_name": "preprocessed-vindr-default-research-dataset-v2-he-rgb",
+})
+_research_he_rgb_patch = _research_he_rgb["config_patch"]
+_research_he_rgb_patch["study_preset_provenance"] = copy.deepcopy(
+    _dual_patch["study_preset_provenance"]
+)
+_research_he_rgb_patch["study_preset_provenance"].update({
+    "preset_key": DEFAULT_RESEARCH_HE_RGB_PRESET_KEY,
+    "variant": "HE+RGB",
+})
+_research_he_rgb_patch["study_preset_provenance"]["assumptions"].update({
+    "photometric_pipeline": (
+        "no DICOM-loader normalization, followed on the fixed-preprocessed whole image by "
+        "0-100 percentile normalization and histogram equalization shared by all channels"
+    ),
+    "rgb_encoding": (
+        "R is the shared histogram-equalized signal; G additionally applies 50-100 percentile "
+        "normalization; B additionally applies 75-100 percentile normalization"
+    ),
+    "photometric_precision": (
+        "all custom-channel operations run in float32; PNG output is quantized to uint8 only "
+        "after the complete pipeline, while saved float32 tensors remain unquantized"
+    ),
+})
+_research_he_rgb_patch["image"] = copy.deepcopy(_dual_patch["image"])
+_research_he_rgb_patch["image"]["normalize"] = "none"
+_research_he_rgb_patch["image"].pop("percentile_range", None)
+_shared_he_steps = [
+    {
+        "op": "percentile_normalize",
+        "apply_before_crop": True,
+        "params": {"percentiles": [0.0, 100.0]},
+    },
+    {"op": "hist_equalize", "apply_before_crop": True, "params": {}},
+]
+_research_he_rgb_patch["image_export"] = {
+    "rgb_scheme": "custom_channel_pipeline",
+    "custom_channel_pipeline_dtype": "float32",
+    "custom_channel_pipeline": {
+        "R": {
+            "source": "current_crop",
+            "steps": copy.deepcopy(_shared_he_steps),
+        },
+        "G": {
+            "source": "current_crop",
+            "steps": copy.deepcopy(_shared_he_steps) + [{
+                "op": "percentile_normalize",
+                "apply_before_crop": True,
+                "params": {"percentiles": [50.0, 100.0]},
+            }],
+        },
+        "B": {
+            "source": "current_crop",
+            "steps": copy.deepcopy(_shared_he_steps) + [{
+                "op": "percentile_normalize",
+                "apply_before_crop": True,
+                "params": {"percentiles": [75.0, 100.0]},
+            }],
+        },
+    },
+}
+
 # Preserve a predictable adjacent order in the GUI: old Paper 22, improved
-# Paper 22, Paper 69, the general-purpose simple preset, then the default research dataset.
+# Paper 22, Paper 69, the general-purpose simple preset, then both default
+# research dataset photometric variants.
 STUDY_PRESETS = {
     PAPER_22_PRESET_KEY: STUDY_PRESETS[PAPER_22_PRESET_KEY],
     PAPER_22_IMPROVED_PRESET_KEY: _paper22_improved,
@@ -1012,6 +1128,7 @@ STUDY_PRESETS = {
         if key != PAPER_22_PRESET_KEY
     },
     DUAL_WHOLE_PRESET_KEY: _dual_whole,
+    DEFAULT_RESEARCH_HE_RGB_PRESET_KEY: _research_he_rgb,
 }
 
 

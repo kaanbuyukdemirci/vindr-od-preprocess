@@ -46,7 +46,7 @@ from .crops import (
 from .dataset import VindrMammoDataset
 from .dataset_layout import parse_resized_sizes, resized_sizes_text
 from .export import (
-    _apply_custom_channel_operation as _export_apply_channel_operation,
+    _apply_custom_channel_operation_float_preserving as _export_apply_channel_operation,
     _custom_operation_should_preserve_background as _export_operation_should_preserve_background,
     _float_to_uint8_custom as _export_float_to_uint8,
     _foreground_mask as _export_foreground_mask,
